@@ -9,6 +9,7 @@ REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO))
 
 from qbar.logic import (  # noqa: E402
+    toggle_action,
     CalcError, Entry, History, SearchEngine, FileFinder, builtin_entries,
     format_calc, fuzzy_score, history_key, looks_like_url, parse_desktop_file,
     safe_calc, scan_desktop_files,
@@ -209,3 +210,17 @@ class TestSearchEngine(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+class ToggleActionTests(unittest.TestCase):
+    """Caps+Q 的切换决策：Wayland 没 keep-above，被盖住时窗口仍 visible 但没焦点。"""
+
+    def test_hidden_shows(self):
+        self.assertEqual(toggle_action(False, False), "show")
+        self.assertEqual(toggle_action(False, True), "show")
+
+    def test_visible_but_unfocused_raises(self):
+        self.assertEqual(toggle_action(True, False), "raise")
+
+    def test_visible_and_focused_hides(self):
+        self.assertEqual(toggle_action(True, True), "hide")

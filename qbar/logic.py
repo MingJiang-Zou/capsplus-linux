@@ -545,3 +545,22 @@ class SearchEngine:
             seen.add(key)
             uniq.append(entry)
         return uniq
+
+
+# ---------------------------------------------------------------------------
+# Qbar 显示切换决策（纯函数，便于单测）
+# ---------------------------------------------------------------------------
+def toggle_action(visible: bool, active: bool) -> str:
+    """Caps+Q（或 socket）被触发时该做什么。
+
+    Wayland 下没有 keep-above 协议：Qbar 被别的窗口盖住时它**仍然是 visible**，
+    只是没有键盘焦点。此时若按老逻辑"visible 就 hide"，用户看到的是"窗口没了、
+    再按一下还是没反应"。所以：
+
+    - 没显示        -> "show"（首次唤起）
+    - 显示但没焦点  -> "raise"（拉回前台并聚焦，而不是藏起来）
+    - 显示且有焦点  -> "hide"（用户就是想收起来）
+    """
+    if not visible:
+        return "show"
+    return "hide" if active else "raise"

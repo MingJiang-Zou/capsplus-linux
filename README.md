@@ -20,7 +20,7 @@ qbar/           GTK3 浮层启动器（capsplus-qbar）
   search_config.py  快速链接与网页搜索的 TOML 配置（同样不 import gi）
 bin/            capsplus / capsplus-tray / capsplus-qbar / keyd-qbar-cmd
 assets/         自画的两个托盘 SVG（启用/暂停）
-packaging/      应用菜单 .desktop（qbar / tray-app）、autostart .desktop、systemd --user unit
+packaging/      应用菜单 .desktop（只放 Qbar 一条）、autostart .desktop、systemd --user unit
 tests/          标准库 unittest（无 pytest 依赖）
 tools/gen-readme.py  由模板 + 映射数据生成 README
 ```

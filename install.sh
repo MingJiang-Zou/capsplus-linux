@@ -59,8 +59,9 @@ echo "== 安装应用菜单入口 =="
 # 每项是「仓内模板文件:安装后的文件名:要绑的 bin 名」；Exec/Icon 按本机重写，
 # 免得模板里写死 /home/zmj 的绝对路径，换个用户就跑不起来。
 mkdir -p "$APPS_DIR"
-for spec in "packaging/capsplus-qbar.desktop:capsplus-qbar.desktop:capsplus-qbar" \
-            "packaging/capsplus-tray-app.desktop:capsplus-tray-app.desktop:capsplus-tray"; do
+# 只装 Qbar 一个入口：托盘本来就开机自启，应用菜单里再放一条是冗余
+# （2026-10-15 明江反馈"应用里面有两个"）
+for spec in "packaging/capsplus-qbar.desktop:capsplus-qbar.desktop:capsplus-qbar"; do
   src="$REPO/${spec%%:*}"
   rest="${spec#*:}"
   dst="$APPS_DIR/${rest%%:*}"
@@ -71,7 +72,7 @@ for spec in "packaging/capsplus-qbar.desktop:capsplus-qbar.desktop:capsplus-qbar
   echo "  $dst"
 done
 if command -v desktop-file-validate >/dev/null 2>&1; then
-  if desktop-file-validate "$APPS_DIR/capsplus-qbar.desktop" "$APPS_DIR/capsplus-tray-app.desktop"; then
+  if desktop-file-validate "$APPS_DIR/capsplus-qbar.desktop"; then
     echo "  ✓ desktop-file-validate 通过"
   else
     echo "  ✗ desktop-file-validate 报错（上面那些行）" >&2

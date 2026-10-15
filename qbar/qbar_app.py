@@ -31,6 +31,7 @@ gi.require_version("Gdk", "3.0")
 from gi.repository import Gdk, Gio, GLib, Gtk  # noqa: E402
 
 from qbar.logic import (  # noqa: E402
+    toggle_action,
     Entry, FileFinder, History, SearchEngine, browser_search_url, history_key,
     scan_desktop_files,
 )
@@ -318,9 +319,15 @@ class QbarWindow(Gtk.Window):
 
     # ------------------------------------------------------------------
     def toggle(self):
-        if self.get_visible():
+        action = toggle_action(self.get_visible(), self.is_active)
+        if action == "hide":
             self.hide()
             log("hide")
+        elif action == "raise":
+            # 只是被别的窗口盖住了：拉回前台并重新抓焦点，别装死
+            self.present()
+            self.entry.grab_focus()
+            log("raise")
         else:
             # 每次打开都重读 qbar.toml：改完快速链接不用重启 Qbar
             self.engine.reload_config()
