@@ -291,8 +291,20 @@ def serve_socket(window: QbarWindow):
     threading.Thread(target=loop, daemon=True).start()
 
 
+def _install_signal_handlers():
+    """Ctrl+C / SIGTERM 也走正常退出路径，好把 socket 文件删掉（否则留个陈旧 socket）。"""
+    import signal
+
+    def quit_(_sig, _frame):
+        GLib.idle_add(Gtk.main_quit)
+
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        signal.signal(sig, quit_)
+
+
 def main(argv: list[str]) -> int:
     STATE_DIR.mkdir(parents=True, exist_ok=True)
+    _install_signal_handlers()
     if try_toggle_existing():
         return 0
     window = QbarWindow()

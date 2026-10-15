@@ -19,10 +19,17 @@ done
 echo "== 依赖检查 =="
 missing=0
 check_cmd() { if command -v "$1" >/dev/null 2>&1; then echo "  ✓ $1 -> $(command -v "$1")"; else echo "  ✗ 缺少 $1"; missing=1; fi; }
+# runuser 在 /usr/sbin，普通用户 PATH 里没有 —— 只有 root（keyd）调用时才用得到
+check_runuser() {
+  for c in "$(command -v runuser || true)" /usr/sbin/runuser /sbin/runuser; do
+    if [ -n "$c" ] && [ -x "$c" ]; then echo "  ✓ runuser -> $c（仅 root/keyd 侧使用）"; return; fi
+  done
+  echo "  ✗ 缺少 runuser（keyd 唤起 Qbar 需要它）"; missing=1
+}
 check_cmd python3
 check_cmd fdfind
 check_cmd keyd.rvaiya
-check_cmd runuser
+check_runuser
 
 python3 - <<'PY' || missing=1
 import sys
