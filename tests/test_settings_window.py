@@ -101,7 +101,7 @@ class TestSettingsWindow(unittest.TestCase):
                                                      overrides_path=self.overrides,
                                                      state_dir=self.state)
         self.window.show_all()
-        self.pump(0.8)
+        self.pump(0.8, until=self.window.get_mapped)
 
     def tearDown(self):
         self.window.destroy()
@@ -109,12 +109,17 @@ class TestSettingsWindow(unittest.TestCase):
             Gtk.main_iteration_do(False)
         self._tmp.cleanup()
 
-    def pump(self, seconds: float = 0.5) -> None:
-        """跑一会儿主循环：Wayland 下映射是异步的，不 pump 就读不到 mapped 状态。"""
+    def pump(self, seconds: float = 0.5, until=None) -> None:
+        """跑一会儿主循环：Wayland 下映射是异步的，不 pump 就读不到 mapped 状态。
+
+        给了 `until` 就一满足就返回（原来固定等满 0.8s，27 个用例 = 21 秒白等）。
+        """
         end = time.monotonic() + seconds
         while time.monotonic() < end:
             while Gtk.events_pending():
                 Gtk.main_iteration_do(False)
+            if until is not None and until():
+                break
             time.sleep(0.02)
 
     def status_text(self) -> str:
