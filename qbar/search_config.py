@@ -133,6 +133,8 @@ BUILTIN_LINKS = [
     SearchLink("gh", "GitHub", "https://github.com/search?q=" + QUOTED_PLACEHOLDER),
     SearchLink("zh", "知乎", "https://www.zhihu.com/search?type=content&q=" + QUOTED_PLACEHOLDER),
     SearchLink("bl", "B站", "https://search.bilibili.com/all?keyword=" + QUOTED_PLACEHOLDER),
+    SearchLink("tb", "淘宝", "https://s.taobao.com/search?q=" + QUOTED_PLACEHOLDER),
+    SearchLink("xy", "闲鱼", "https://www.goofish.com/search?q=" + QUOTED_PLACEHOLDER),
     SearchLink("tr", "翻译（有道）", "https://dict.youdao.com/search?q=" + QUOTED_PLACEHOLDER),
     SearchLink("ghcli", "GitHub CLI 仓库", "https://github.com/cli/" + RAW_PLACEHOLDER),
     SearchLink("ghp", "GitHub 我的仓库", "https://github.com/pulls"),
