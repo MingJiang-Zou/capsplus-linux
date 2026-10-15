@@ -4,6 +4,13 @@
 这在纯逻辑单测里证明不了 —— 这里跑的是同一条代码路径（`show_all()` 真映射上），
 顺带把"编辑→校验→写盘→恢复默认→试渲染"整条链在**临时目录**里走一遍，
 绝不碰 `~/.config/capsplus/`（两个路径参数 + state_dir 都指到 tmp）。
+
+2026-10-15 方案 A（表格只读 + 编辑条/表单条）之后，这个文件负责的是**行为级**判据：
+  ① 两页表格所有列的 renderer `get_property("editable")` 必须全 False；
+  ② 单击第 N 行 → 编辑条显示的键名 == 第 N 行的键名（截图那个 bug 的直接判据）；
+  ③ 双击行 → 焦点控件是编辑条的输入框，不是表格里的格子；
+  ④ 表格滚动之后编辑条一个字都不变（编辑控件不在滚动区域里，物理上不可能脱开）。
+源码级那一半（禁用 `CellRendererCombo` / `editable=True`）在 `tests/test_table_readonly.py`。
 """
 
 import ast
@@ -34,7 +41,9 @@ os.environ.setdefault("XDG_RUNTIME_DIR", "/run/user/1000")
 
 from capsplus import mapping_overrides as MO    # noqa: E402
 from capsplus.render import binding_rows        # noqa: E402
-from qbar.search_config import SearchLink, load_config, render_config_toml  # noqa: E402
+from qbar.search_config import (                # noqa: E402
+    LINK_TYPES, SearchLink, load_config, render_config_toml,
+)
 
 SAMPLE = """# capsplus Qbar 快速链接配置
 # 我自己加的说明，写回之后必须还在
@@ -158,48 +167,110 @@ class TestSettingsWindow(unittest.TestCase):
             self.assertEqual(proc.returncode, 0,
                              f"{entry} 退出码 {proc.returncode}：\n{err[-600:]}")
 
-    def _open_a_real_dropdown(self):
-        """真开一个下拉（独立 combo + 临时窗口）—— 判据要靠真窗口，不靠 mock。"""
-        model = Gtk.ListStore(str)
-        model.append(["甲"]); model.append(["乙"])
-        combo = Gtk.ComboBox.new_with_model(model)
-        cell = Gtk.CellRendererText()
-        combo.pack_start(cell, True)
-        combo.add_attribute(cell, "text", 0)
-        holder = Gtk.Window()
-        holder.add(combo)
-        holder.show_all()
-        self.pump(0.25)
-        combo.popup()                    # 没真实按键事件，GTK 会给一句 warning，无害
-        self.pump(0.25)
-        return holder, combo
+    # ------------------------------------------------------------------
+    # 只读表格 + 编辑条：2026-10-15 治本方案 A 的**行为级**判据
+    # ------------------------------------------------------------------
+    def all_renderers(self, view) -> list:
+        return [cell for column in view.get_columns() for cell in column.get_cells()]
 
-    def test_scroll_closes_floating_dropdown(self):
-        """明江实测的 bug：Wayland 下表格滚动，下拉悬浮在原处不跟着走。
-        修法是"滚动即结束该格的编辑会话"，这里用**真展开的下拉**验证计数真的加了。"""
-        view = self.window.links_page.view
-        self.assertEqual(view.dropdown_closes, 0)
-        holder, combo = self._open_a_real_dropdown()
-        try:
-            view.get_parent().get_vadjustment().emit("value-changed")
-            self.assertGreaterEqual(view.dropdown_closes, 1, "有悬浮下拉时滚动没收掉它")
-        finally:
-            combo.popdown(); holder.destroy(); self.pump(0.2)
+    def test_no_renderer_in_either_table_is_editable(self):
+        """行为级①：两页表格**所有列**的 renderer `get_property("editable")` 必须全是 False。
+        只要有一个 True，Wayland 下它就是一块不跟滚动走的悬浮编辑框（截图那个 bug 的根）。"""
+        for name, view in (("快速链接", self.window.links_page.view),
+                           ("按键映射", self.window.mapping_page.view)):
+            cells = self.all_renderers(view)
+            self.assertTrue(cells, f"{name} 的表格一列都没有")
+            bad = [f"{type(c).__name__}@{i}" for i, c in enumerate(cells)
+                   if c.get_property("editable")]
+            self.assertEqual(bad, [], f"{name} 表格里还有可编辑 renderer：{bad}")
 
-    def test_scroll_without_dropdown_does_not_disturb_text_cell(self):
-        """没有下拉展开时不许动编辑会话 —— 否则用户正在敲的普通文本格会被滚动打断。"""
-        view = self.window.links_page.view
-        other = self.window.mapping_page.view
-        view.get_parent().get_vadjustment().emit("value-changed")
-        self.assertEqual(view.dropdown_closes, 0)
-        self.assertEqual(other.dropdown_closes, 0)
+    def test_clicking_row_N_fills_editor_with_row_N(self):
+        """行为级② —— **截图那个 bug 的直接判据**：单击第 N 行，编辑条显示的键名必须
+        等于第 N 行的键名、框里的动作必须等于第 N 行的动作。逐行都试，错一行就红。"""
+        page = self.window.mapping_page
+        store = page.store
+        for index in (0, 1, len(store) // 2, self.row_index("capl", "t"), len(store) - 1):
+            row = store[index]
+            page.view.get_selection().select_path(Gtk.TreePath.new_from_indices([index]))
+            label = page.editor_target.get_text()
+            self.assertEqual(label, f"{row[0]} / {row[1]}",
+                             f"单击第 {index + 1} 行（{row[0]}/{row[1]}），"
+                             f"编辑条却写着「{label}」")
+            self.assertEqual(page.action_entry.get_text(), row[2],
+                             f"第 {index + 1} 行动作是「{row[2]}」，编辑条里却是"
+                             f"「{page.action_entry.get_text()}」")
+            self.assertEqual(page.selected_pair(), (row[0], row[1]))
+            self.assertEqual(page.editor_pair, (row[0], row[1]))
 
-    def test_both_tables_have_the_dropdown_guard_wired(self):
-        """两页表格都得挂上这个兜底（按键页的下拉是 has_entry=True，另一条代码路径）。"""
-        for page in (self.window.links_page, self.window.mapping_page):
-            self.assertTrue(hasattr(page.view, "dropdown_closes"),
-                            f"{type(page).__name__} 的表格没挂滚动收下拉的钩子")
+    def test_double_click_focuses_the_action_entry(self):
+        """双击行 → 焦点直接进动作输入框（不用再去摸表格里的格子）。"""
+        page = self.window.mapping_page
+        index = self.row_index("capl", "t")
+        page.view.get_selection().select_path(Gtk.TreePath.new_from_indices([index]))
+        page.view.emit("row-activated", Gtk.TreePath.new_from_indices([index]),
+                       page.view.get_column(2))
+        self.pump(0.3, until=lambda: self.window.get_focus() is page.action_entry)
+        self.assertIs(self.window.get_focus(), page.action_entry,
+                      "双击之后焦点不在编辑条的输入框上")
 
+    def test_enter_in_entry_is_the_same_as_the_button(self):
+        """输入框里按回车 == 点「改这一格」（立刻写覆盖层，不碰系统）。"""
+        page = self.window.mapping_page
+        index = self.row_index("capl", "e")
+        page.view.get_selection().select_path(Gtk.TreePath.new_from_indices([index]))
+        page.action_entry.set_text("pageup")
+        page.action_entry.emit("activate")
+        self.assertEqual(self.window.ov.get("capl", "e"), "pageup")
+        self.assertEqual(page.store[self.row_index("capl", "e")][4], "覆盖")
+        self.assertIn('e = "pageup"', self.overrides.read_text(encoding="utf-8"))
+
+    def test_scrolling_the_table_cannot_move_the_editor(self):
+        """截图那一步的等价复现：选中 `capl / t` → 把表格滚到底再滚回来 ——
+        编辑条**一个字都不该变**，因为表格里根本没有会脱开的编辑框。
+        （比上一轮"滚动即收下拉"强：那条只覆盖下拉，输入框照样脱开。）"""
+        page = self.window.mapping_page
+        index = self.row_index("capl", "t")
+        page.view.get_selection().select_path(Gtk.TreePath.new_from_indices([index]))
+        before = (page.editor_target.get_text(), page.action_entry.get_text())
+        self.assertEqual(before[0], "capl / t", "用例前提：先选中 capl/t")
+        adjustment = page.view.get_parent().get_vadjustment()
+        adjustment.set_value(adjustment.get_upper())        # 真滚到底
+        self.pump(0.2, until=lambda: adjustment.get_value() >= adjustment.get_upper() - 1)
+        adjustment.set_value(adjustment.get_lower())        # 再滚回顶
+        self.pump(0.2)
+        self.assertEqual((page.editor_target.get_text(), page.action_entry.get_text()), before,
+                         "滚动之后编辑条换了行 —— 这正是被治本方案 A 消灭的那类 bug")
+        self.assertEqual(page.selected_pair(), ("capl", "t"))
+        self.assertEqual(page.editor_pair, ("capl", "t"))
+
+    def test_editor_and_table_disagreement_is_refused(self):
+        """防写错键的保险丝：编辑条认的格子 != 表格选中的格子 → 红字拦住，一格都不写。"""
+        page = self.window.mapping_page
+        page.view.get_selection().select_path(
+            Gtk.TreePath.new_from_indices([self.row_index("capl", "t")]))
+        page.editor_pair = ("capl", "k")        # 人为制造"脱开"（老 bug 的形状）
+        page.action_entry.set_text("pageup")
+        page.on_commit(None)
+        self.assertEqual(self.status_color(), "red")
+        self.assertIn("capl / t", self.status_text())
+        self.assertIn("capl / k", self.status_text())
+        self.assertIsNone(self.window.ov.get("capl", "t"), "拦住了还写了 t = 判据失败")
+        self.assertIsNone(self.window.ov.get("capl", "k"), "拦住了还写了 k = 静默改错键")
+        self.assertFalse(self.overrides.exists(), "拦住之后不该有覆盖层文件")
+
+    def edit_action(self, section: str, key: str, action: str):
+        """新交互的等价写法：单击那一行 → 编辑条里打字 → 点「改这一格」。
+        （旧写法 `page._on_action_edited(renderer, path, text)` 是 in-cell 编辑，已废除。）"""
+        page = self.window.mapping_page
+        page.view.get_selection().select_path(
+            Gtk.TreePath.new_from_indices([self.row_index(section, key)]))
+        page.action_entry.set_text(action)
+        page.on_commit(page.commit_button)
+        return page
+
+    # ------------------------------------------------------------------
+    # 真起窗
+    # ------------------------------------------------------------------
     def test_window_is_really_mapped(self):
         display = Gtk.Window.get_display(self.window) if hasattr(Gtk.Window, "get_display") else None
         from gi.repository import Gdk
@@ -226,8 +297,68 @@ class TestSettingsWindow(unittest.TestCase):
         self.assertEqual(len(store), 3)
         self.assertEqual([row[0] for row in store], ["b", "ghp", "no"])
         self.assertEqual([row[3] for row in store], ["网站内搜索", "固定网址", "文件或目录"])
-        # 表格列数 = trigger/名称/类型/目标
-        self.assertEqual(len(self.window.links_page.view.get_columns()), 4)
+        # 列：前缀 / 名称 / 类型 / 目标 / 备注（表格只读，备注列显示现算的校验结果）
+        titles = [c.get_title() for c in self.window.links_page.view.get_columns()]
+        self.assertEqual(titles, ["前缀", "名称", "类型", "目标", "备注"])
+
+    def test_selecting_row_fills_the_form_with_that_row(self):
+        """行为级（链接页版）：选中第 N 行 → 表单四个框就是第 N 行的四个值，错一行就红。"""
+        page = self.window.links_page
+        for index in range(len(page.store)):
+            row = page.store[index]
+            page.view.get_selection().select_path(Gtk.TreePath.new_from_indices([index]))
+            self.assertEqual(page.form_values(), (row[0], row[1], row[2], row[4]),
+                             f"选中第 {index + 1} 行，表单填的却是 {page.form_values()}")
+            self.assertEqual(page.form_index, index)
+        page.view.get_selection().unselect_all()
+        self.assertEqual(page.form_values(), ("", "", "", ""), "没选中就该清空，别留残影")
+        self.assertIsNone(page.form_index)
+
+    def test_double_click_focuses_the_clicked_field(self):
+        """双击不同列 → 焦点落到对应的表单框（并且**一定不在表格里面**）。"""
+        page = self.window.links_page
+        columns = page.view.get_columns()
+        for position, expect in ((0, page.f_trigger), (1, page.f_name),
+                                 (3, page.f_target), (4, page.f_target)):
+            page.view.get_selection().select_path(Gtk.TreePath.new_from_indices([1]))
+            page.view.emit("row-activated", Gtk.TreePath.new_from_indices([1]), columns[position])
+            self.pump(0.3, until=lambda w=expect: self.window.get_focus() is w)
+            self.assertIs(self.window.get_focus(), expect,
+                          f"双击第 {position + 1} 列（{columns[position].get_title()}）"
+                          f"之后焦点不在预期输入框")
+
+    def test_form_typing_updates_preview_live(self):
+        """实时预览跟着**表单条**走：改目标/换类型立刻重算，不用先保存。"""
+        page = self.window.links_page
+        page.view.get_selection().select_path(Gtk.TreePath.new_from_indices([0]))
+        page.sample.set_text("keyd")
+        self.assertIn("bing.com/search?q=keyd", page.preview_label.get_text())
+        page.f_target.set_text("https://example.com/s?x={q}")
+        self.assertIn("example.com/s?x=keyd", page.preview_label.get_text())
+        page.f_type.set_active(LINK_TYPES.index("url"))     # url 不许带 {q} → 预览当场说哪儿错
+        self.assertIn("固定网址不许带", page.preview_label.get_text())
+
+    def test_duplicate_prefix_in_form_blocks_save(self):
+        """前缀和别的行撞了 → 红字拦下，**不许写盘**（文件一个字节都不该变）。"""
+        page = self.window.links_page
+        before = self.qbar.read_text(encoding="utf-8")
+        page.view.get_selection().select_path(Gtk.TreePath.new_from_indices([0]))
+        page.f_trigger.set_text("ghp")                       # 和第 2 行撞
+        page.on_save_row(Gtk.Button())
+        self.assertEqual(self.status_color(), "red")
+        self.assertIn("trigger 重复", self.status_text())
+        self.assertEqual(self.qbar.read_text(encoding="utf-8"), before, "拦下了还写盘 = 判据失败")
+
+    def test_save_this_row_writes_the_file_and_keeps_comments(self):
+        page = self.window.links_page
+        page.view.get_selection().select_path(Gtk.TreePath.new_from_indices([1]))
+        page.f_name.set_text("我的仓库")
+        page.on_save_row(Gtk.Button())
+        self.assertEqual(self.status_color(), "blue")
+        back = load_config(self.qbar, create=False)
+        self.assertEqual([l.name for l in back.links], ["必应", "我的仓库", "笔记目录"])
+        text = self.qbar.read_text(encoding="utf-8")
+        self.assertIn("我自己加的说明，写回之后必须还在", text)   # 开头注释仍原样带回去
 
     def test_preview_shows_input_and_final_url(self):
         page = self.window.links_page
@@ -247,40 +378,60 @@ class TestSettingsWindow(unittest.TestCase):
 
     def test_duplicate_trigger_is_marked_red_and_blocks_saving(self):
         page = self.window.links_page
-        page.store[1][0] = "b"                     # 第二行的 trigger 改成和第一行一样
+        page.store[1][0] = "b"                     # 第二行的前缀改成和第一行一样
         page._repaint_all()
         self.assertIn("trigger 重复", page.store[1][5])
+        self.assertIn("trigger 重复", page.store[1][6])   # 备注列 = 表格里看得见的那一列
         saved = self.window.save_qbar()
         self.assertFalse(saved, "trigger 重复必须拦住写盘")
         self.assertEqual(self.status_color(), "red")
         self.assertIn("重复", self.status_text())
 
-    def test_add_delete_and_move(self):
+    def test_add_then_fill_form_and_save_writes_the_new_link(self):
+        """「新增」→ 焦点在前缀框 → 表单填完 → 「保存这一条」写文件（顺序仍按表格）。"""
         page = self.window.links_page
         page.on_add(Gtk.Button())
         self.assertEqual(len(page.store), 4)
         self.assertEqual(page.store[3][1], "新链接")
         # 新增那行还没填 → 校验必须已经在报"缺少 trigger"
         self.assertIn("缺少 trigger", page.store[3][5])
-        page.store[3][0] = "zz"
-        page.store[3][1] = "测试"
-        page.store[3][4] = "https://zz.test/?q={q}"
-        page.store[3][2] = "search"
+        self.assertEqual(page.form_values(), ("", "新链接", "url", ""))
+        self.pump(0.3, until=lambda: self.window.get_focus() is page.f_trigger)
+        self.assertIs(self.window.get_focus(), page.f_trigger, "新增之后焦点要在前缀框")
+        page.f_trigger.set_text("zz")
+        page.f_target.set_text("https://zz.test/?q={q}")
+        page.f_type.set_active(LINK_TYPES.index("search"))
+        page.on_save_row(Gtk.Button())
+        self.assertEqual(self.status_color(), "blue")
+        back = load_config(self.qbar, create=False)
+        self.assertEqual([l.trigger for l in back.links], ["b", "ghp", "no", "zz"])
+        self.assertEqual(back.links[3].resolved_type, "search")
+
+    def test_move_and_delete_with_confirmation(self):
+        page = self.window.links_page
+        page.store[2][0] = "zz"
         page._repaint_all()
-        self.assertEqual(page.store[3][5], "")
-        page.on_move(-1)
-        self.assertEqual(page.store[2][0], "zz")
-        # 删除会弹确认框：这里直接走 store.remove 的分支（确认框本身另测）
         page.view.get_selection().select_path(Gtk.TreePath.new_from_indices([2]))
-        dialog_shown = []
+        page.on_move(-1)
+        self.assertEqual(page.store[1][0], "zz")
+        self.assertEqual(page.store[2][0], "ghp")
+        page.on_move(-1)                                  # 到顶之后不许越界
+        self.assertEqual(page.store[0][0], "zz")
+        page.on_move(-1)
+        self.assertEqual(page.store[0][0], "zz")
+        self.assertIn("到顶", self.status_text())
+        answers = iter([Gtk.ResponseType.NO, Gtk.ResponseType.YES])
         original = Gtk.MessageDialog.run
-        Gtk.MessageDialog.run = lambda self: (dialog_shown.append(1), Gtk.ResponseType.NO)[1]
+        Gtk.MessageDialog.run = lambda self: next(answers)   # 删除必须带确认
         try:
             page.on_delete(Gtk.Button())
+            self.assertEqual(len(page.store), 3, "确认框回答「否」就不该删")
+            page.on_delete(Gtk.Button())
+            self.assertEqual([row[0] for row in page.store], ["b", "ghp"])
         finally:
             Gtk.MessageDialog.run = original
-        self.assertEqual(dialog_shown, [1], "删除必须带确认")
-        self.assertEqual(len(page.store), 4, "确认框回答否就不该删")
+        self.assertEqual(self.status_color(), "grey")
+        self.assertIn("已删除", self.status_text())
 
     def test_saving_writes_toml_and_keeps_leading_comments(self):
         page = self.window.links_page
@@ -333,76 +484,101 @@ class TestSettingsWindow(unittest.TestCase):
         raise AssertionError(f"表格里找不到 [{section}] {key}")
 
     def test_edit_action_marks_override_and_writes_quoted_toml(self):
-        page = self.window.mapping_page
-        page._on_action_edited(None, Gtk.TreePath.new_from_indices([self.row_index("capl", "e")]),
-                               "pageup")
+        page = self.edit_action("capl", "e", "pageup")
         self.assertEqual(page.store[self.row_index("capl", "e")][4], "覆盖")
         self.assertEqual(self.window.ov.get("capl", "e"), "pageup")
+        # 「改这一格」立刻写覆盖层文件，但不碰系统
+        self.assertIn('e = "pageup"', self.overrides.read_text(encoding="utf-8"))
         # 试渲染（不动系统）
         ok, text = self.app_module.SL.run_apply(dry_run=True, overrides_path=self.overrides,
                                                 known_keys=self.window.known_keys)
         self.assertTrue(ok, text)
         page.on_apply(dry_run=True)
         self.assertIn("dry-run", self.status_text())
-        # 预览改动要说清是哪一条变了
+        # 预览改动要说清是哪一条变了（keyd 段名写法）
         page.on_preview(Gtk.Button())
         self.assertIn("[capl] e: up -> pageup", self.status_text())
+
+    def test_status_names_the_exact_cell_being_changed(self):
+        """「这一格要改的是 `capl / t`」必须**编辑条和状态栏两边都写出来**（防写错键的保险）。"""
+        page = self.edit_action("capl", "t", "pageup")
+        self.assertEqual(page.editor_target.get_text(), "capl / t")
+        text = self.status_text()
+        self.assertIn("已把 capl / t 改成 pageup", text)
+        self.assertIn("还没生效", text)
+        self.assertIn("应用", text)
+        self.assertEqual(self.status_color(), "blue")
+        # 编辑条旁边还带着这一格的说明（截图里那行"大段上/下滚…"）
+        self.assertIn("大段上/下滚", page.editor_note.get_text())
 
     def test_illegal_action_is_refused_and_row_unchanged(self):
         page = self.window.mapping_page
         index = self.row_index("capl", "e")
         before = page.store[index][2]
-        page._on_action_edited(None, Gtk.TreePath.new_from_indices([index]), "up down")
-        self.assertEqual(page.store[index][2], before, "非法值不许留在表里")
+        self.edit_action("capl", "e", "up down")
+        self.assertEqual(page.store[self.row_index("capl", "e")][2], before, "非法值不许留在表里")
         self.assertEqual(self.status_color(), "red")
         self.assertIn("空格", self.status_text())
+        self.assertIsNone(self.window.ov.get("capl", "e"))
+        self.assertFalse(self.overrides.exists(), "非法值不许写盘")
+        self.assertEqual(index, self.row_index("capl", "e"))
 
     def test_unknown_key_action_is_refused_when_keyd_present(self):
         page = self.window.mapping_page
         if self.window.known_keys is None:
             self.skipTest("本机没有 keyd.rvaiya list-keys，键名校验本来就该跳过")
         index = self.row_index("capl", "e")
-        page._on_action_edited(None, Gtk.TreePath.new_from_indices([index]), "nosuchkey")
+        self.edit_action("capl", "e", "nosuchkey")
         self.assertEqual(self.status_color(), "red")
         self.assertIn("不认识的键名", self.status_text())
+        self.assertEqual(page.store[index][2], "up")
 
     def test_long_macro_warns_in_amber(self):
-        page = self.window.mapping_page
-        index = self.row_index("capl", "e")
-        page._on_action_edited(None, Gtk.TreePath.new_from_indices([index]),
-                               "macro(" + " ".join(["up"] * 16) + ")")
+        self.edit_action("capl", "e", "macro(" + " ".join(["up"] * 16) + ")")
         self.assertEqual(self.status_color(), "amber")
         self.assertIn("16", self.status_text())
         self.assertIn("静默", self.status_text())
 
     def test_restoring_default_removes_the_override(self):
-        page = self.window.mapping_page
-        page._on_action_edited(None, Gtk.TreePath.new_from_indices([self.row_index("capl", "t")]),
-                               "up")
-        page.view.get_selection().select_path(Gtk.TreePath.new_from_indices([self.row_index("capl", "t")]))
+        page = self.edit_action("capl", "t", "up")
+        self.assertEqual(page.store[self.row_index("capl", "t")][4], "覆盖")
         page.on_restore(Gtk.Button())
         self.assertIsNone(self.window.ov.get("capl", "t"))
         self.assertEqual(page.store[self.row_index("capl", "t")][4], "默认")
+        # 文件里也真删掉了（不是只改内存）
+        disk = MO.load_overrides(self.overrides, self.window.known_keys)
+        self.assertIsNone(disk.get("capl", "t"), disk.errors)
+        self.assertIn("capl / t", self.status_text())
 
     def test_editing_back_to_default_value_drops_the_override(self):
         """改成和默认一模一样的值 = 这条覆盖没有意义，直接删掉（覆盖层只存真改过的）。"""
         page = self.window.mapping_page
         index = self.row_index("capl", "e")
         default = page.store[index][2]
-        page._on_action_edited(None, Gtk.TreePath.new_from_indices([index]), "pageup")
-        page._on_action_edited(None, Gtk.TreePath.new_from_indices([index]), default)
+        self.edit_action("capl", "e", "pageup")
+        self.edit_action("capl", "e", default)
         self.assertIsNone(self.window.ov.get("capl", "e"))
+        self.assertEqual(page.store[self.row_index("capl", "e")][4], "默认")
+
+    def test_editing_the_same_value_writes_nothing_new(self):
+        """值没变 = 不重写文件（覆盖层只存"真的改过的"，也不该刷一堆快照）。"""
+        page = self.edit_action("capl", "e", "pageup")
+        before = self.overrides.read_text(encoding="utf-8")
+        self.edit_action("capl", "e", "pageup")
+        self.assertEqual(self.status_color(), "grey")
+        self.assertIn("已经是", self.status_text())
+        self.assertEqual(self.overrides.read_text(encoding="utf-8"), before)
 
     def test_apply_writes_overrides_file_with_quoted_alt_section(self):
-        page = self.window.mapping_page
-        page._on_action_edited(None,
-                               Gtk.TreePath.new_from_indices([self.row_index("capl+alt", "b")]),
-                               "up")
-        page.on_apply(dry_run=True)           # 写覆盖层 + 试渲染（不动 /etc/keyd）
+        page = self.edit_action("capl+alt", "b", "up")
+        # 界面显示用 keyd 写法（capl+alt / b），同时把"文件里为什么带引号"说清楚
+        self.assertIn("capl+alt / b", page.editor_target.get_text())
+        self.assertIn('["capl+alt"]', self.status_text())
+        page.on_apply(dry_run=True)           # 覆盖层已写 + 试渲染（不动 /etc/keyd）
         text = self.overrides.read_text(encoding="utf-8")
-        self.assertIn('["capl+alt"]', text)
+        self.assertIn('["capl+alt"]', text)             # 写盘走 toml_table()：+ 不是合法裸键
         self.assertNotIn("\n[capl+alt]\n", text)
-        self.assertIn("b = \"up\"", text)
+        self.assertIn('b = "up"', text)
 
     def test_main_section_cannot_be_reached_from_the_table(self):
         """表格里出现的段只有 ALLOWED_SECTIONS —— [main] 的 capslock 不许出现在界面上。"""

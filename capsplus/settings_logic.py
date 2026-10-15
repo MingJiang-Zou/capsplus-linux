@@ -42,6 +42,50 @@ COMMON_ACTIONS = [
 
 
 # ---------------------------------------------------------------------------
+# 编辑条（2026-10-15 治本方案 A）
+#   表格只读，编辑控件搬到表格下方。这些函数负责"第 N 行到底是谁"这件事 ——
+#   刻意接收**表格行的序列**而不是控件，所以没有显示服务器也能把"编辑条填错行"判红。
+# ---------------------------------------------------------------------------
+def editor_binding(rows, index: int | None) -> dict | None:
+    """编辑条要显示的第 `index` 行 -> `{"section","key","action","note","source"}`。
+
+    `rows` 是表格行序列 `(section, key, action, note, source, ...)`。
+    越界 / 没选中 / 空表返回 `None`（界面据此清空编辑条，不许留上一行的残影）。
+    """
+    items = [tuple(row) for row in (rows or ())]
+    if index is None or not (0 <= index < len(items)):
+        return None
+    section, key, action, note, source = items[index][:5]
+    return {"section": section, "key": key, "action": action,
+            "note": note, "source": source}
+
+
+def editor_target(section: str, key: str) -> str:
+    """「这一格是谁」的一句写法：`capl / t`（段名用 keyd 的写法，不加引号）。
+
+    编辑条和状态栏**两边都要显式写出来** —— 这是防"静默改错键"的那道保险。
+    """
+    return f"{(section or '').strip()} / {(key or '').strip()}"
+
+
+def commit_status(section: str, key: str, action: str) -> str:
+    """改完一格的蓝字：写的是覆盖层文件，**没说生效**。生效必须再点「应用」。"""
+    return (f"已把 {editor_target(section, key)} 改成 {action}"
+            f"（还没生效，点「应用」才写进 keyd）")
+
+
+def restore_status(section: str, key: str) -> str:
+    return (f"{editor_target(section, key)} 已恢复仓库默认（覆盖层里这条删了；"
+            f"还没生效，点「应用」才写进 keyd）")
+
+
+def desync_problem(claimed: str, selected: str) -> str:
+    """编辑条认的格子 ≠ 表格当前选中的格子：拦住，宁可一个都不改。"""
+    return (f"没改：编辑条显示的是 {claimed}，表格里选中的却是 {selected}。"
+            f"先点一下真正要改的那一行 —— 认错行比改错值严重得多。")
+
+
+# ---------------------------------------------------------------------------
 # 宏长度
 # ---------------------------------------------------------------------------
 def macro_event_count(action: str) -> int:

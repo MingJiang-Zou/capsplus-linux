@@ -250,6 +250,54 @@ def preview_pair(link: SearchLink, sample: str = "") -> tuple[str, str]:
 
 
 # ---------------------------------------------------------------------------
+# 表单条（2026-10-15 治本方案 A：表格只读，编辑搬到表格下方）
+#   `rows` 一律是表格行的序列，不是控件 —— 没有显示服务器也能判死"表单填错行"。
+# ---------------------------------------------------------------------------
+def form_at(rows, index: int | None) -> tuple[str, str, str, str] | None:
+    """第 `index` 行的表单初值 `(trigger, name, type_id, target)`。
+
+    `rows` = 表格行 `(trigger, name, type_id, type_label, target, problem)`。
+    越界 / 没选中返回 `None`（界面清空表单）。类型取 `type_id`（第 3 列），
+    老配置没写 type 时第 3 列已经是推断结果（`reload_from_memory` 用 `resolved_type` 填的），
+    所以下拉不会显示空白。
+    """
+    items = [tuple(row) for row in (rows or ())]
+    if index is None or not (0 <= index < len(items)):
+        return None
+    trigger, name, type_id, _label, target = items[index][:5]
+    return (trigger, name, type_id, target)
+
+
+def link_from_form(trigger: str, name: str, type_id: str, target: str) -> SearchLink:
+    """表单四个框 -> 一条 SearchLink（去空格；类型留给 `resolved_type` 兜底）。"""
+    return SearchLink((trigger or "").strip(), (name or "").strip(),
+                      (target or "").strip(), (type_id or "").strip())
+
+
+def form_problems(fields, index: int | None, links: list[SearchLink]) -> list[str]:
+    """表单里这一条要不要拦下来（中文，界面直接显式显示）。没问题返回 []。
+
+    `index` = 正在改第几行（`None` = 新增）。算 trigger 重复时**必须把自己那一行排除**，
+    否则"选中一条、什么都没改、点保存"会被自己判成重复（这条是真坑）。
+    """
+    if index is not None and not (0 <= index < len(links)):
+        return [f"表格里没有第 {index + 1} 行（先点一行，或点「新增」）"]
+    link = link_from_form(*fields)
+    others = tuple(links[i].trigger.strip().lower()
+                   for i in range(len(links)) if i != index)
+    return link_problems(link, others)
+
+
+def swapped(items, index: int, target: int) -> list | None:
+    """交换两项，返回**新表**（原表不动）。任何一个越界返回 None（界面据此说"到顶/到底了"）。"""
+    out = list(items or ())
+    if not (0 <= index < len(out)) or not (0 <= target < len(out)):
+        return None
+    out[index], out[target] = out[target], out[index]
+    return out
+
+
+# ---------------------------------------------------------------------------
 # 配置对象
 # ---------------------------------------------------------------------------
 @dataclass

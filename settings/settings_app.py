@@ -1,13 +1,24 @@
 #!/usr/bin/env python3
 """capsplus-settings —— Capslock+ 的设置窗口（GTK3，中文，三页）。
 
-    ① 快速链接   增/删/上下移动 + 四种类型 + 实时预览，写回 `qbar.toml`
+    ① 快速链接   只读表格 + 表格下方的**表单条**：增/删/上下移动 + 四种类型 + 实时预览，
+                 写回 `qbar.toml`
     ② 通用       default_search / browser / hide_on_focus_out
-    ③ 按键映射   当前生效表（层/键/动作/说明/来源），改动写覆盖层 `mappings.toml`，
-                 「应用」走 render_with_overrides() + 现有 apply 流程（出错自动回滚）
+    ③ 按键映射   只读生效表（层/键/动作/说明/来源）+ 表格下方的**编辑条**，
+                 改动写覆盖层 `mappings.toml`，「应用」走 render_with_overrides() + 现有
+                 apply 流程（出错自动回滚）
 
-分工（**这个文件只摆控件**）：校验、覆盖层增删、宏事件计数、预览拼装、TOML 写回、
-apply 流程全在 `capsplus/settings_logic.py` 与 `qbar/search_config.py`，那两份不 import gi、有单测。
+**表格一律只读**（2026-10-15 治本方案 A，明江实测截图定案）：Wayland/GTK3 下 TreeView 的
+cell editor 是独立 surface、**不跟随表格滚动** —— 表格滚了、编辑框的像素坐标不动，于是编辑框
+视觉上落到别的行，用户以为自己改的是 `t`，实际写进了 `k`。这是"静默改错键"，上一轮"滚动即收
+悬浮下拉"只补了下拉那一半，输入框本身照样脱开。所以把编辑控件从滚动的表格里**搬出去**：
+表格只显示，编辑走表格下方固定的编辑条/表单条，这个 bug 类从根上没有立足点
+（源码级判据见 `tests/test_table_readonly.py`：出现 `CellRendererCombo` 或
+`set_property("editable", True)` 直接判红）。
+
+分工（**这个文件只摆控件**）：校验、覆盖层增删、宏事件计数、"第 N 行是谁"、预览拼装、
+TOML 写回、apply 流程全在 `capsplus/settings_logic.py` 与 `qbar/search_config.py`，
+那两份不 import gi、有单测。
 
 单实例：Unix socket `~/.local/state/capsplus/settings.sock`。第二次启动（含 Qbar 的
 `-> settings`）只发一个字节，让已经开着的窗口回到前台 —— 开两个窗口各自覆盖对方的改动，
@@ -31,11 +42,13 @@ if str(REPO) not in sys.path:
 
 import gi  # noqa: E402
 gi.require_version("Gtk", "3.0")
-gi.require_version("Gdk", "3.0")   # 必须显式要：漏了就会默认加载 Gdk 4.0，
-                                   # `from gi.repository import Gdk` 当场 ImportError ——
-                                   # 而且**只有真跑入口才暴露**（测试进程自己先 require 过 3.0，
-                                   # 235 条测试全绿照样打不开界面，2026-10-15 就是这么翻车的）
-from gi.repository import Gdk, GLib, Gtk, Pango  # noqa: E402
+# 这里**不用** Gdk：编辑控件离开表格之后，"有没有悬浮下拉"这件事已经没人关心了，
+# 上一轮为探测下拉而引入的 Gdk 已随那段死代码一起删掉。
+# （留个提醒给以后：真要 `from gi.repository import Gdk`，必须同时加
+#  `gi.require_version("Gdk", "3.0")` —— 漏了会默认加载 4.0，`import Gdk` 当场 ImportError，
+#  而且**只有真跑入口才暴露**（2026-10-15 就是这么翻车的，判据在
+#  `tests/test_settings_window.py::test_real_entry_points_import_cleanly`）。）
+from gi.repository import GLib, Gtk, Pango  # noqa: E402
 
 from capsplus import mapping_overrides as MO  # noqa: E402
 from capsplus import settings_logic as SL  # noqa: E402
@@ -66,55 +79,14 @@ def markup(text: str, color: str = "") -> str:
     return f'<span foreground="{color}">{escaped}</span>' if color else escaped
 
 
+def bold(text: str) -> str:
+    """编辑条里「这一格是谁」用加粗写出来 —— 防写错键的那道保险。"""
+    return f"<b>{GLib.markup_escape_text(text)}</b>"
 
 
-def _open_dropdown_windows() -> list:
-    """当前**展开着**的下拉窗口（组合框 popup / 下拉菜单）。
-
-    用它判断"屏幕上是否真有一个悬浮的下拉"，比猜编辑状态可靠 —— Wayland 下这个下拉是
-    独立 surface，type hint 是 COMBO / DROPDOWN_MENU。
-    （坑：`Gdk.Window.get_window_type()` 返回的是实现种类 TOPLEVEL/TEMP，不是提示种类，
-    得用 `Gtk.Window.get_type_hint()`。）
-    """
-    kinds = (Gdk.WindowTypeHint.COMBO, Gdk.WindowTypeHint.DROPDOWN_MENU,
-             Gdk.WindowTypeHint.POPUP_MENU)
-    found = []
-    for w in Gtk.Window.list_toplevels():
-        try:
-            if not (w.get_realized() and w.is_visible()):
-                continue
-            if w.get_type_hint() in kinds:      # 注意：用 type hint，不是 get_window_type()
-                found.append(w)
-        except (AttributeError, TypeError, RuntimeError):
-            continue              # 正在销毁的 toplevel 会炸，跳过就算
-    return found
-
-
-def keep_dropdown_attached_to_scroll(view, scroll, renderer) -> None:
-    """Wayland 下表格里的下拉（`CellRendererCombo`）是**独立 surface**：表格滚动时它不跟着走，
-    就悬浮在原来的位置上（2026-10-15 明江实测反馈的 bug）。
-
-    GTK3 在这个构建里既不暴露 `editing-started` 信号（实测 `GObject.signal_lookup` 查不到），
-    也没有"popup 跟随父窗口"的机制，所以收口是：**一旦滚动就结束这个格子的编辑会话**
-    （下拉随之销毁；格子和内容都还在，再点一次重新展开）。
-    只在"确实有下拉展开"时才动手 —— 否则会把用户正在敲的普通文本格也一起打断。
-
-    `view.dropdown_closes` 计数给单测断言用（证明"滚一下真收了"，不靠人眼）。
-    """
-    view.dropdown_closes = 0
-
-    def _scrolled(_adj):
-        if not _open_dropdown_windows():
-            return                       # 没有悬浮下拉：别打扰正在输入的文本格
-        try:
-            renderer.stop_editing(True)
-        except (AttributeError, TypeError):
-            return
-        view.dropdown_closes += 1
-
-    for adj in (scroll.get_vadjustment(), scroll.get_hadjustment()):
-        if adj is not None:
-            adj.connect("value-changed", _scrolled)
+def store_rows(store) -> list[tuple]:
+    """Gtk.TreeStore -> 纯元组序列，交给不 import gi 的判据函数（`SL.editor_binding` 等）。"""
+    return [tuple(row) for row in store]
 
 
 # ===========================================================================
@@ -246,66 +218,94 @@ class SettingsWindow(Gtk.Window):
 # 第①页：快速链接
 # ===========================================================================
 class LinksPage(Gtk.Box):
-    """表格每行 = trigger / 名称 / 类型 / 目标；带增删改、上下移动与实时预览。"""
+    """上方**只读**表格（前缀/名称/类型/目标/备注）+ 表格下方的**表单条**。
 
-    COLUMNS = ("trigger", "名称", "类型", "目标")
+    表格为什么必须只读：见文件头 —— Wayland 下 cell editor 不跟表格滚动，会静默改错行。
+    表单条不参与滚动，"第几行"这件事由 `SC.form_at(表格行, 选中行号)` 现算，
+    而且点「保存这一条」时还会再核一遍（表单认的行号 == 表格选中的行号），不一致就拦下。
+    """
+
+    COLUMNS = ("前缀", "名称", "类型", "目标", "备注")
+    # 列号 -> ListStore 列号（类型显示第 3 列的中文标签，备注显示第 6 列的现算文本）
+    TEXT_COL = (0, 1, 3, 4, 6)
 
     def __init__(self, app: SettingsWindow):
         super().__init__(orientation=Gtk.Orientation.VERTICAL, spacing=6)
         self.app = app
         self.set_border_width(10)
 
-        # ListStore 列：trigger, name, type_id, type_label, target, problem
-        self.store = Gtk.ListStore(str, str, str, str, str, str)
-        self.type_model = Gtk.ListStore(str, str)
-        for type_id in SC.LINK_TYPES:
-            self.type_model.append([type_id, SC.LINK_TYPE_LABEL[type_id]])
+        # ListStore 列：trigger, name, type_id, type_label, target, problem, 备注显示
+        self.store = Gtk.ListStore(str, str, str, str, str, str, str)
 
         self.view = Gtk.TreeView(model=self.store)
         self.view.set_headers_visible(True)
-        # 第 6 列是"这行哪儿错了"，直接让 TreeView 拿它当 tooltip（GTK3 内置列）
-        self.view.set_tooltip_column(5)
-        self.view.get_selection().connect("changed", lambda *_a: self._update_preview())
+        self.view.set_tooltip_column(5)         # 第 5 列是"这行哪儿错了"，也挂 tooltip
+        self.view.get_selection().connect("changed", self._on_selection_changed)
+        self.view.connect("row-activated", self._on_row_activated)
 
         for index, title in enumerate(self.COLUMNS):
-            if index == 2:                                   # 类型 = 下拉（四个固定值）
-                renderer = Gtk.CellRendererCombo(model=self.type_model, text_column=1,
-                                                 has_entry=False)
-                dropdown_renderer = renderer
-                renderer.connect("changed", self._on_type_changed)
-                column = Gtk.TreeViewColumn(title, renderer, text=3)
-            else:                                            # 其余三格可直接编辑
-                renderer = Gtk.CellRendererText()
-                renderer.set_property("editable", True)
-                renderer.connect("edited", self._on_text_edited, index)
-                column = Gtk.TreeViewColumn(title, renderer, text=index)
+            renderer = Gtk.CellRendererText()
+            renderer.set_property("editable", False)    # 只读；判据见 tests/test_table_readonly.py
+            column = Gtk.TreeViewColumn(title, renderer, text=self.TEXT_COL[index])
             column.set_resizable(True)
-            column.set_min_width(280 if index == 3 else 100)
+            column.set_min_width(240 if index == 3 else 90)
             column.set_expand(index == 3)
-            column.set_cell_data_func(renderer, self._paint_problem, index)
+            column.set_cell_data_func(renderer, self._paint_cell, index)
             self.view.append_column(column)
 
         scroll = Gtk.ScrolledWindow()
         scroll.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
-        scroll.set_min_content_height(300)
+        scroll.set_min_content_height(280)
         scroll.add(self.view)
         self.pack_start(scroll, True, True, 0)
-        keep_dropdown_attached_to_scroll(self.view, scroll, dropdown_renderer)
 
-        bar = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
-        for label, handler in (("新增", self.on_add), ("删除", self.on_delete),
+        # ------------------------------------------------------------------
+        # 表单条：字段 + 「保存这一条」
+        # ------------------------------------------------------------------
+        form = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        self.f_trigger = Gtk.Entry()
+        self.f_trigger.set_width_chars(10)
+        self.f_name = Gtk.Entry()
+        self.f_name.set_width_chars(18)
+        self.f_type = Gtk.ComboBoxText()
+        for type_id in SC.LINK_TYPES:
+            self.f_type.append_text(f"{SC.LINK_TYPE_LABEL[type_id]}（{type_id}）")
+        self.f_target = Gtk.Entry()
+        self.f_target.set_width_chars(34)
+        self.f_target.set_hexpand(True)
+        for label, widget in (("前缀", self.f_trigger), ("名称", self.f_name),
+                              ("类型", self.f_type), ("目标", self.f_target)):
+            form.pack_start(Gtk.Label(label=label, xalign=0), False, False, 0)
+            form.pack_start(widget, False, False, 0)
+        self.save_row_button = Gtk.Button(label="保存这一条")
+        self.save_row_button.get_style_context().add_class("suggested-action")
+        self.save_row_button.connect("clicked", self.on_save_row)
+        form.pack_start(self.save_row_button, False, False, 0)
+        self.pack_start(form, False, False, 0)
+
+        for widget in (self.f_trigger, self.f_name, self.f_target):
+            widget.connect("changed", lambda *_a: self._on_form_edited())
+            widget.connect("activate", lambda *_a: self.on_save_row(None))
+        self.f_type.connect("changed", lambda *_a: self._on_form_edited())
+
+        # ------------------------------------------------------------------
+        # 工具条：增删移 + 文件级动作（这些改的是整张表，写盘靠「保存快速链接」）
+        # ------------------------------------------------------------------
+        tools = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        for label, handler in (("新增", self.on_add),
+                               ("删除（带确认）", self.on_delete),
                                ("上移", lambda _b: self.on_move(-1)),
                                ("下移", lambda _b: self.on_move(1)),
                                ("重读文件", lambda _b: self.app.reload_qbar_from_disk())):
             button = Gtk.Button(label=label)
             button.connect("clicked", handler)
-            bar.pack_start(button, False, False, 0)
-        bar.pack_start(Gtk.Box(), True, True, 0)
+            tools.pack_start(button, False, False, 0)
+        tools.pack_start(Gtk.Box(), True, True, 0)
         save = Gtk.Button(label="保存快速链接")
         save.get_style_context().add_class("suggested-action")
         save.connect("clicked", lambda _b: self.app.save_qbar())
-        bar.pack_start(save, False, False, 0)
-        self.pack_start(bar, False, False, 0)
+        tools.pack_start(save, False, False, 0)
+        self.pack_start(tools, False, False, 0)
 
         preview = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
         preview.pack_start(Gtk.Label(label="示例词：", xalign=0), False, False, 0)
@@ -324,11 +324,14 @@ class LinksPage(Gtk.Box):
         hint = Gtk.Label(xalign=0)
         hint.set_line_wrap(True)
         hint.set_markup(markup(
+            "表格只读：选中一行 → 下面表单条填的是**那一行**，双击行直接把焦点送进对应输入框。"
             "四种类型：search = 网站内搜索（目标里要有 {q} 或 {q_raw}）；"
             "url = 固定网址；app = 本地应用（.desktop 名或一条命令，命令里 {q} 当参数）；"
             "file = 文件或目录路径（~ 会展开，固定路径不支持 {q}）。", GREY))
         self.pack_start(hint, False, False, 0)
 
+        self.form_index: int | None = None
+        self._loading = False
         self.reload_from_memory()
 
     # ------------------------------------------------------------------
@@ -339,10 +342,12 @@ class LinksPage(Gtk.Box):
         self.store.clear()
         for link in self.app.cfg.links:
             self.store.append([link.trigger, link.name, link.resolved_type,
-                               link.type_label, link.url, ""])
+                               link.type_label, link.url, "", "—"])
         self._repaint_all()
         if selected is not None and selected < len(self.store):
             self.view.get_selection().select_path(Gtk.TreePath.new_from_indices([selected]))
+        else:
+            self.sync_form_to_row()
         self._update_preview()
 
     def memory_links(self) -> list[SC.SearchLink]:
@@ -353,46 +358,122 @@ class LinksPage(Gtk.Box):
         return model.get_path(it).get_indices()[0] if it is not None else None
 
     # ------------------------------------------------------------------
-    # 编辑
+    # 表单条 <-> 选中的那一行
     # ------------------------------------------------------------------
-    def _on_text_edited(self, _renderer, path_string, new_text, column_index):
-        it = self.store.get_iter(Gtk.TreePath.new_from_string(path_string))
-        self.store[it][column_index] = new_text.strip()
-        self._repaint_all()
+    def form_values(self) -> tuple[str, str, str, str]:
+        """表单四个框的当前值 `(trigger, name, type_id, target)`（type 存 id，不存中文）。"""
+        position = self.f_type.get_active()
+        type_id = SC.LINK_TYPES[position] if 0 <= position < len(SC.LINK_TYPES) else ""
+        return (self.f_trigger.get_text().strip(), self.f_name.get_text().strip(),
+                type_id, self.f_target.get_text().strip())
+
+    def sync_form_to_row(self) -> None:
+        """把表单条填成**表格选中的那一行**（行号现算，不猜、不从别的来源取）。"""
+        index = self.selected_index()
+        fields = SC.form_at(store_rows(self.store), index)
+        self._loading = True
+        self.form_index = index if fields is not None else None
+        if fields is None:                        # 没选中/空表：清空，别留上一行的残影
+            self.f_trigger.set_text("")
+            self.f_name.set_text("")
+            self.f_target.set_text("")
+            self.f_type.set_active(-1)
+        else:
+            trigger, name, type_id, target = fields
+            self.f_trigger.set_text(trigger)
+            self.f_name.set_text(name)
+            self.f_target.set_text(target)
+            self.f_type.set_active(SC.LINK_TYPES.index(type_id) if type_id in SC.LINK_TYPES
+                                   else len(SC.LINK_TYPES) - 1)
+        self._loading = False
         self._update_preview()
 
-    def _on_type_changed(self, _renderer, path, combo_iter):
-        it = self.store[path]
-        type_id = self.type_model[combo_iter][0]
-        it[2] = type_id
-        it[3] = SC.LINK_TYPE_LABEL[type_id]
+    def _on_selection_changed(self, *_args) -> None:
+        self.sync_form_to_row()
+
+    def _on_form_edited(self) -> None:
+        """表单里打字 = 只刷新预览（**不写表格、不写盘**），改成什么由「保存这一条」决定。"""
+        if not self._loading:
+            self._update_preview()
+
+    def _on_row_activated(self, _view, _path, column, _data=None) -> None:
+        """双击（或键盘回车）某一行：先同步表单，再把焦点落到那一列对应的输入框。"""
+        self.sync_form_to_row()
+        columns = self.view.get_columns()
+        try:
+            position = columns.index(column) if column is not None else -1
+        except ValueError:
+            position = -1
+        widget = {0: self.f_trigger, 1: self.f_name, 2: self.f_type,
+                  3: self.f_target}.get(position, self.f_target)
+        widget.grab_focus()
+
+    def _commit_index(self) -> int | None:
+        """要写回第几行 —— 表单认的行号必须 == 表格当前选中的行号，否则拦住。"""
+        selected = self.selected_index()
+        if self.form_index is None:
+            self.app.status("先在表格里选中一行，或点「新增」。", AMBER)
+            return None
+        if self.form_index != selected:
+            chosen = f"第 {selected + 1} 行" if selected is not None else "没选中任何行"
+            self.app.status(f"没写盘：表单里显示的是第 {self.form_index + 1} 行，"
+                            f"表格里选中的却是{chosen}。"
+                            f"先点一下真正要改的那一行 —— 认错行比改错值严重得多。", RED)
+            return None
+        return selected
+
+    def on_save_row(self, _button) -> None:
+        """校验表单 -> 写进表格那一行 -> 走 `save_qbar()` 写文件（保留开头注释与顺序）。"""
+        index = self._commit_index()
+        if index is None:
+            return
+        fields = self.form_values()
+        problems = SC.form_problems(fields, index, self.memory_links())
+        if problems:
+            self.app.status("没有写盘，先改这几处：\n  " + "\n  ".join(problems), RED)
+            return
+        trigger, name, type_id, target = fields
+        for column, value in enumerate((trigger, name, type_id,
+                                        SC.LINK_TYPE_LABEL[type_id], target, "")):
+            self.store[index][column] = value
         self._repaint_all()
-        self._update_preview()
+        self.app.save_qbar()
+
+    # ------------------------------------------------------------------
+    # 校验结果画进表格（备注列）
+    # ------------------------------------------------------------------
+    def _paint_cell(self, column, renderer, model, it, column_index):
+        """有毛病的行**整行标红**（备注列没毛病时显示 — ，所以它是灰字）。"""
+        problem = model[it][5]
+        if problem:
+            renderer.set_property("foreground", RED)
+        else:
+            renderer.set_property("foreground", GREY if column_index == 4 else BLACK)
 
     def _repaint_all(self) -> None:
         """每行现算一次校验结果 —— trigger 完全重复 = 红字拦下（硬错误）。"""
         links = self.memory_links()
         seen: list[str] = []
         for index, row in enumerate(self.store):
-            self.store[index][5] = "；".join(SC.link_problems(links[index], tuple(seen)))
+            problem = "；".join(SC.link_problems(links[index], tuple(seen)))
+            self.store[index][5] = problem
+            self.store[index][6] = problem or "—"
             seen.append(row[0].strip().lower())
         self.view.queue_draw()
-
-    def _paint_problem(self, column, renderer, model, it, column_index):
-        problem = model[it][5]
-        renderer.set_property("foreground", RED if problem else BLACK)
 
     # ------------------------------------------------------------------
     # 增 / 删（带确认）/ 上下移动
     # ------------------------------------------------------------------
     def on_add(self, _button):
-        it = self.store.append(["", "新链接", "url", SC.LINK_TYPE_LABEL["url"], "", ""])
+        it = self.store.append(["", "新链接", "url", SC.LINK_TYPE_LABEL["url"], "", "", "—"])
         path = self.store.get_path(it)
-        self.view.get_selection().select_path(path)
-        self.view.scroll_to_cell(path, None, True, 0.5, 0.0)
-        self.view.set_cursor(path, self.view.get_column(0), True)   # 光标直接落在 trigger 格
+        index = path.get_indices()[0]
         self._repaint_all()
-        self.app.status("填 trigger、名称和目标；类型点第三格换。", GREY)
+        self.view.get_selection().select_path(path)      # 触发 sync_form_to_row
+        self.view.scroll_to_cell(path, None, True, 0.5, 0.0)
+        self.f_trigger.grab_focus()
+        self.app.status(f"新增：第 {index + 1} 行。填前缀、名称和目标，类型在「类型」下拉里换；"
+                        f"点「保存这一条」写进 {self.app.qbar_path}。", GREY)
 
     def on_delete(self, _button):
         index = self.selected_index()
@@ -410,8 +491,13 @@ class LinksPage(Gtk.Box):
         if answer != Gtk.ResponseType.YES:
             return
         self.store.remove(self.store.get_iter(Gtk.TreePath.new_from_indices([index])))
+        self.form_index = None
         self._repaint_all()
-        self._update_preview()
+        if len(self.store):
+            self.view.get_selection().select_path(
+                Gtk.TreePath.new_from_indices([min(index, len(self.store) - 1)]))
+        else:
+            self.sync_form_to_row()
         self.app.status("已删除（还没写盘，记得点「保存快速链接」）。", GREY)
 
     def on_move(self, delta: int) -> None:
@@ -419,33 +505,35 @@ class LinksPage(Gtk.Box):
         if index is None:
             self.app.status("先选中一行再移动。", AMBER)
             return
-        target = index + delta
-        if target < 0 or target >= len(self.store):
+        rows = SC.swapped(store_rows(self.store), index, index + delta)
+        if rows is None:
             self.app.status("已经到顶 / 到底了。", GREY)
             return
-        rows = [list(row) for row in self.store]
-        rows[index], rows[target] = rows[target], rows[index]
+        target = index + delta
         self.store.clear()
+        self.form_index = None
         for row in rows:
-            self.store.append(row)
+            self.store.append(list(row))
         self.view.get_selection().select_path(Gtk.TreePath.new_from_indices([target]))
         self._repaint_all()
-        self._update_preview()
         self.app.status(f"顺序变了（第 {index + 1} 行 ↔ 第 {target + 1} 行）；"
-                        f"配置文件里的先后顺序就是表格顺序，写回时原样保留。", GREY)
+                        f"配置文件里的先后顺序就是表格顺序，写回时原样保留。"
+                        f"还没写盘，点「保存快速链接」。", GREY)
 
     # ------------------------------------------------------------------
-    # 实时预览：输入 `b 关键词` → 最终 URL
+    # 实时预览：跟着**表单条**走 —— 输入 `b 关键词` → 最终 URL
     # ------------------------------------------------------------------
     def _update_preview(self) -> None:
-        index = self.selected_index()
-        if index is None:
-            self.preview_label.set_markup(markup("选中一行就能预览。", GREY))
+        if self._loading:
             return
-        link = self.memory_links()[index]
-        problem = self.store[index][5]
-        if problem:
-            self.preview_label.set_markup(markup(f"这条先改对：{problem}", RED))
+        fields = self.form_values()
+        if not any(fields):
+            self.preview_label.set_markup(markup("选中一行（或把表单填完）就能预览。", GREY))
+            return
+        link = SC.link_from_form(*fields)
+        problems = SC.link_problems(link, ())
+        if problems:
+            self.preview_label.set_markup(markup("这条先改对：" + "；".join(problems), RED))
             return
         text, result = SC.preview_pair(link, self.sample.get_text())
         self.preview_label.set_markup(
@@ -538,7 +626,12 @@ class GeneralPage(Gtk.Box):
 # 第③页：按键映射
 # ===========================================================================
 class MappingPage(Gtk.Box):
-    """当前生效表（层/键/动作/说明/来源）；「动作」= 常用下拉 + 允许自由输入。"""
+    """上方**只读**生效表（层/键/动作/说明/来源）+ 表格下方的**编辑条**。
+
+    编辑条永远显示"这一格是谁 + 它当前的动作"，并且「这一格要改的是 `capl / t`」在编辑条
+    和状态栏**两边都写出来**（防写错键的保险，明江同意加）。改完立刻写覆盖层文件、
+    立刻刷表（来源变「覆盖」），但**不碰系统** —— 生效必须点「应用」。
+    """
 
     COLUMNS = ("层", "键", "动作", "说明", "来源")
 
@@ -555,18 +648,12 @@ class MappingPage(Gtk.Box):
 
         self.view = Gtk.TreeView(model=self.store)
         self.view.set_tooltip_column(5)            # 出错原因挂在 tooltip 上
+        self.view.get_selection().connect("changed", self._on_selection_changed)
+        self.view.connect("row-activated", self._on_row_activated)
         for index, title in enumerate(self.COLUMNS):
-            if index == 2:
-                renderer = Gtk.CellRendererCombo(model=self.action_model, text_column=0,
-                                                 has_entry=True)      # 下拉 + 自由输入
-                dropdown_renderer = renderer
-                renderer.set_property("editable", True)
-                renderer.connect("edited", self._on_action_edited)
-                renderer.connect("changed", self._on_action_edited)
-                column = Gtk.TreeViewColumn(title, renderer, text=2)
-            else:
-                renderer = Gtk.CellRendererText()
-                column = Gtk.TreeViewColumn(title, renderer, text=index)
+            renderer = Gtk.CellRendererText()
+            renderer.set_property("editable", False)    # 只读；判据见 tests/test_table_readonly.py
+            column = Gtk.TreeViewColumn(title, renderer, text=index)
             column.set_resizable(True)
             column.set_min_width(200 if index in (2, 3) else 70)
             column.set_expand(index in (2, 3))
@@ -575,14 +662,45 @@ class MappingPage(Gtk.Box):
 
         scroll = Gtk.ScrolledWindow()
         scroll.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
-        scroll.set_min_content_height(330)
+        scroll.set_min_content_height(300)
         scroll.add(self.view)
         self.pack_start(scroll, True, True, 0)
-        keep_dropdown_attached_to_scroll(self.view, scroll, dropdown_renderer)
 
+        # ------------------------------------------------------------------
+        # 编辑条（不参与滚动，所以不可能"落到别的行"）
+        # ------------------------------------------------------------------
+        editor = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        editor.pack_start(Gtk.Label(label="目标：", xalign=0), False, False, 0)
+        self.editor_target = Gtk.Label(xalign=0)
+        self.editor_target.set_selectable(True)
+        self.editor_target.set_markup(markup("（先在表格里点一行）", GREY))
+        editor.pack_start(self.editor_target, False, False, 0)
+        self.editor_note = Gtk.Label(xalign=0)
+        self.editor_note.set_ellipsize(Pango.EllipsizeMode.END)
+        self.editor_note.set_markup(markup("", GREY))
+        editor.pack_start(self.editor_note, True, True, 0)
+        editor.pack_start(Gtk.Label(label="动作：", xalign=0), False, False, 0)
+        self.action_combo = Gtk.ComboBox.new_with_entry()     # 下拉列常用动作 + 可自由输入
+        self.action_combo.set_model(self.action_model)
+        self.action_combo.set_entry_text_column(0)
+        self.action_entry = self.action_combo.get_child()     # ← 双击行要把焦点给它
+        self.action_entry.set_width_chars(28)
+        self.action_entry.connect("activate", lambda *_a: self.on_commit(None))
+        editor.pack_start(self.action_combo, False, False, 0)
+        self.commit_button = Gtk.Button(label="改这一格")
+        self.commit_button.get_style_context().add_class("suggested-action")
+        self.commit_button.connect("clicked", self.on_commit)
+        editor.pack_start(self.commit_button, False, False, 0)
+        restore = Gtk.Button(label="恢复默认（删这条覆盖）")
+        restore.connect("clicked", self.on_restore)
+        editor.pack_start(restore, False, False, 0)
+        self.pack_start(editor, False, False, 0)
+
+        # ------------------------------------------------------------------
+        # 工具条（这些不编辑某一只格子，是对整层/整个系统的动作）
+        # ------------------------------------------------------------------
         bar = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
-        for label, handler in (("恢复默认（删这条覆盖）", self.on_restore),
-                               ("预览改动（只读）", self.on_preview),
+        for label, handler in (("预览改动（只读）", self.on_preview),
                                ("只试渲染（不动系统）", lambda _b: self.on_apply(dry_run=True)),
                                ("重读覆盖层", lambda _b: self.reload_overrides())):
             button = Gtk.Button(label=label)
@@ -597,20 +715,81 @@ class MappingPage(Gtk.Box):
         hint = Gtk.Label(xalign=0)
         hint.set_line_wrap(True)
         hint.set_markup(markup(
-            "改完点「应用」才生效；出错自动回滚上一版（备份在 ~/.local/state/capsplus/"
-            "keyd-conf-backup/）。改动只写进覆盖层 mappings.toml，没改的键跟着仓库默认走；"
+            "表格只读：点一行 → 下面编辑条填的就是**那一行**（双击行焦点直接进输入框，"
+            "框里按回车 = 点「改这一格」）。「改这一格 / 恢复默认」立刻写覆盖层 "
+            f"{self.app.overrides_path} 并刷表，但不碰系统；点「应用」才装进 /etc/keyd 并 reload，"
+            "出错自动回滚上一版（备份在 ~/.local/state/capsplus/keyd-conf-backup/）。"
             f"宏硬边界：单条 macro(...) 累计 ≤{SL.MACRO_EVENT_LIMIT} 个按键事件，超了整条静默不发。",
             GREY))
         self.pack_start(hint, False, False, 0)
 
+        self.editor_pair: tuple[str, str] | None = None
+        self._loading = False
         self.reload_from_memory()
+
+    # ------------------------------------------------------------------
+    # 编辑条 <-> 选中的那一行
+    # ------------------------------------------------------------------
+    def _on_selection_changed(self, *_args) -> None:
+        self.sync_editor()
+
+    def _on_row_activated(self, *_args) -> None:
+        """双击行（或键盘回车）：同步编辑条，然后焦点直接进动作输入框。"""
+        self.sync_editor()
+        self.action_entry.grab_focus()
+
+    def sync_editor(self) -> None:
+        """编辑条 = 表格选中那一行。行内容一律由 `SL.editor_binding(表格行, 选中行号)` 现算。"""
+        row = SL.editor_binding(store_rows(self.store), self.selected_index())
+        self._loading = True
+        if row is None:
+            self.editor_pair = None
+            self.editor_target.set_markup(markup("（先在表格里点一行）", GREY))
+            self.editor_note.set_markup(markup("", GREY))
+            self.action_entry.set_text("")
+        else:
+            self.editor_pair = (row["section"], row["key"])
+            self.editor_target.set_markup(bold(SL.editor_target(row["section"], row["key"])))
+            self.editor_note.set_markup(markup(row["note"], GREY))
+            self.action_entry.set_text(row["action"])
+        self._loading = False
+        self._refresh_target_tooltip()
+
+    def _refresh_target_tooltip(self) -> None:
+        target = SL.editor_target(*self.editor_pair) if self.editor_pair else ""
+        text = (f"这一格要改的是 {target}：改完立刻写覆盖层（{self.app.overrides_path}），"
+                f"但还不生效 —— 点「应用」才写进 /etc/keyd。" if target else
+                "先在表格里点一行。")
+        self.editor_target.set_tooltip_text(text)
+
+    def checked_pair(self) -> tuple[str, str] | None:
+        """要改的是哪一格：编辑条认的 == 表格当前选中的，否则拦住（宁可一格都不改）。"""
+        selected = self.selected_pair()
+        if self.editor_pair is None:
+            self._count_status("先在表格里点一行 —— 得先知道要改的是哪一格。", AMBER)
+            return None
+        if selected is None:
+            self._count_status(SL.desync_problem(SL.editor_target(*self.editor_pair),
+                                                 "（没选中任何行）"), RED)
+            return None
+        if self.editor_pair != selected:
+            self._count_status(SL.desync_problem(SL.editor_target(*self.editor_pair),
+                                                 SL.editor_target(*selected)), RED)
+            return None
+        return selected
+
+    def current_action(self, section: str, key: str) -> str:
+        for row in self.store:
+            if (row[0], row[1]) == (section, key):
+                return row[2]
+        return ""
 
     # ------------------------------------------------------------------
     def reload_overrides(self) -> None:
         self.app.ov = MO.load_overrides(self.app.overrides_path, self.app.known_keys)
         self.reload_from_memory()
         if self.app.ov.error:
-            self.app.status(f"覆盖层读不了：{self.app.ov.error}", RED)
+            self.app.status(f"覆盖层读不了：{self.app.overrides_path} —— {self.app.ov.error}", RED)
         elif self.app.ov.errors:
             self.app.status("覆盖层里有几条被跳过（没生效）：\n  "
                             + "\n  ".join(self.app.ov.errors), AMBER)
@@ -629,6 +808,8 @@ class MappingPage(Gtk.Box):
                 if (row[0], row[1]) == selected:
                     self.view.get_selection().select_path(Gtk.TreePath.new_from_indices([index]))
                     break
+        else:
+            self.sync_editor()          # 选不回来（表空了/那行没了）也要让编辑条跟着清空
         self._count_status()
 
     def _count_status(self, text: str | None = None, color: str = GREY) -> None:
@@ -636,6 +817,11 @@ class MappingPage(Gtk.Box):
         base = (f"当前生效 {len(self.store)} 条，其中 {overridden} 条来自覆盖层"
                 f"（{self.app.overrides_path}）")
         self.app.status((text + "\n" + base) if text else base + "。", color)
+
+    def selected_index(self) -> int | None:
+        """表格当前选中的**行号**（编辑条靠它现算"这一格是谁"）。"""
+        model, it = self.view.get_selection().get_selected()
+        return model.get_path(it).get_indices()[0] if it is not None else None
 
     def selected_pair(self) -> tuple[str, str] | None:
         model, it = self.view.get_selection().get_selected()
@@ -658,33 +844,45 @@ class MappingPage(Gtk.Box):
                               else Pango.Weight.NORMAL)
 
     # ------------------------------------------------------------------
-    def _on_action_edited(self, _renderer, path, new_text):
-        row = self.store[path]
-        section, key = row[0], row[1]
-        problem = SL.action_problem(new_text, key, section, self.app.known_keys)
+    # 改这一格 / 恢复默认（都**立刻写覆盖层文件**，都不碰系统）
+    # ------------------------------------------------------------------
+    def on_commit(self, _button):
+        pair = self.checked_pair()
+        if pair is None:
+            return
+        section, key = pair
+        target = SL.editor_target(section, key)
+        action = self.action_entry.get_text().strip()
+        problem = SL.action_problem(action, key, section, self.app.known_keys)
         if problem:
             # 非法就保持原值：表格里不许留坏数据，否则下一次渲染会把整层带崩
-            self.app.status(f"[{section}] {key} 没改成「{new_text}」：{problem}", RED)
+            self._count_status(f"{target} 没改成「{action}」：{problem}", RED)
+            return
+        if action == self.current_action(section, key):
+            self._count_status(f"{target} 已经是「{action}」（覆盖层没变化）。", GREY)
             return
         try:
-            self.app.ov.values = SL.set_override(self.app.ov.values, section, key,
-                                                 new_text, self.app.known_keys)
+            values = SL.set_override(self.app.ov.values, section, key, action,
+                                     self.app.known_keys)
         except ValueError as exc:
-            self.app.status(f"[{section}] {key} 没改：{exc}", RED)
+            self._count_status(f"{target} 没改：{exc}", RED)
             return
-        if new_text.strip() == self._default_action(section, key):
+        back_to_default = action == self._default_action(section, key)
+        if back_to_default:
             # 改回和默认一样 = 这条覆盖没意义，顺手删掉（覆盖层只存"真的改过的"）
-            self.app.ov.values = SL.delete_override(self.app.ov.values, section, key)
+            values = SL.delete_override(values, section, key)
+        if not self.write_overrides(values):
+            return
+        self.app.ov.values = values
         self.reload_from_memory()
-        warning = SL.macro_warning(new_text)
+        hint = SL.override_toml_hint(section)
+        warning = SL.macro_warning(action)
         if warning:
             self._count_status(warning, AMBER)
-        elif self._dirty():
-            self._count_status(f"[{section}] {key} 改好了，还没写盘。"
-                               f"点「应用」= 写覆盖层 + 装到 /etc/keyd + reload；"
-                               f"点「恢复默认」= 把这条覆盖删掉。", BLUE)
-        else:
-            self._count_status(f"[{section}] {key} 已是这个值（覆盖层没变化）。", GREY)
+            return
+        message = (SL.restore_status(section, key) if back_to_default
+                   else SL.commit_status(section, key, action))
+        self._count_status(f"{message}\n{hint}" if hint else message, BLUE)
 
     def _default_action(self, section: str, key: str) -> str:
         for row in binding_rows(section):          # 不传 merged = 仓库默认表
@@ -697,20 +895,31 @@ class MappingPage(Gtk.Box):
         on_disk = MO.load_overrides(self.app.overrides_path, self.app.known_keys).values
         return on_disk != self.app.ov.values
 
+    def write_overrides(self, values: dict[str, dict[str, str]]) -> bool:
+        """把覆盖层写到文件（写之前快照原件）。失败 = 红字 + 返回 False，内存态不动。"""
+        try:
+            SL.save_overrides_with_snapshot(values, self.app.overrides_path,
+                                            self.app.backup_dir)
+        except OSError as exc:
+            self.app.status(f"写不了 {self.app.overrides_path}：{exc}", RED)
+            return False
+        return True
+
     def on_restore(self, _button):
-        pair = self.selected_pair()
+        pair = self.checked_pair()
         if pair is None:
-            self.app.status("先选中要恢复默认的那一行。", AMBER)
             return
         section, key = pair
+        target = SL.editor_target(section, key)
         if self.app.ov.get(section, key) is None:
-            self._count_status(f"[{section}] {key} 本来就没有覆盖，已经是仓库默认。", GREY)
+            self._count_status(f"{target} 本来就没有覆盖，已经是仓库默认。", GREY)
             return
-        self.app.ov.values = SL.delete_override(self.app.ov.values, section, key)
+        values = SL.delete_override(self.app.ov.values, section, key)
+        if not self.write_overrides(values):
+            return
+        self.app.ov.values = values
         self.reload_from_memory()
-        self._count_status(f"[{section}] {key} 已恢复默认。"
-                           f"{'还没写盘，点「应用」把它从覆盖层里删掉。' if self._dirty() else ''}",
-                           BLUE)
+        self._count_status(SL.restore_status(section, key), BLUE)
 
     def on_preview(self, _button):
         """仓库默认渲染 vs 默认+覆盖渲染差哪几条 —— 纯只读，不碰系统。"""
@@ -727,13 +936,10 @@ class MappingPage(Gtk.Box):
                            + (("\n" + hints) if hints else ""), BLUE)
 
     def on_apply(self, dry_run: bool = False) -> None:
-        """写覆盖层 -> 走现有 apply 流程（备份 / reload / 抓 journal / 出错自动回滚）。"""
-        if self._dirty():
-            try:
-                SL.save_overrides_with_snapshot(self.app.ov.values, self.app.overrides_path,
-                                                self.app.backup_dir)
-            except OSError as exc:
-                self.app.status(f"写不了 {self.app.overrides_path}：{exc}", RED)
+        """覆盖层已经在「改这一格」时写进文件了；这里只走现有 apply 流程
+        （备份 / reload / 抓 journal / 出错自动回滚），**真机生效只有这个按钮**。"""
+        if self._dirty():                     # 别的路径改过内存（例如手改文件后重读失败）
+            if not self.write_overrides(self.app.ov.values):
                 return
         # 传 overrides_path：渲染用的必须就是上面刚写下去的那份（临时目录演练也要真）
         ok, text = SL.run_apply(dry_run=dry_run, overrides_path=self.app.overrides_path,
