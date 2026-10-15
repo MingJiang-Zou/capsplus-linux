@@ -31,6 +31,10 @@ if str(REPO) not in sys.path:
 
 import gi  # noqa: E402
 gi.require_version("Gtk", "3.0")
+gi.require_version("Gdk", "3.0")   # 必须显式要：漏了就会默认加载 Gdk 4.0，
+                                   # `from gi.repository import Gdk` 当场 ImportError ——
+                                   # 而且**只有真跑入口才暴露**（测试进程自己先 require 过 3.0，
+                                   # 235 条测试全绿照样打不开界面，2026-10-15 就是这么翻车的）
 from gi.repository import Gdk, GLib, Gtk, Pango  # noqa: E402
 
 from capsplus import mapping_overrides as MO  # noqa: E402

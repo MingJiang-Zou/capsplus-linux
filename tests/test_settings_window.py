@@ -8,6 +8,7 @@
 
 import ast
 import os
+import subprocess
 import sys
 import tempfile
 import time
@@ -133,6 +134,30 @@ class TestSettingsWindow(unittest.TestCase):
     # ------------------------------------------------------------------
     # 真起窗
     # ------------------------------------------------------------------
+    def test_real_entry_points_import_cleanly(self):
+        """**子进程**跑真入口 `bin/capsplus-*`，防"单测全绿但界面打不开"。
+
+        2026-10-15 的翻车实录：给 settings_app 加 `from gi.repository import Gdk` 时漏了
+        `gi.require_version("Gdk","3.0")`，入口一跑就 ImportError，用户点图标没反应；
+        而 237 条单测全绿 —— 因为测试进程早就 require 过 Gdk 3.0，永远不重演入口那条路径。
+        判据：能撑到超时（= 真起了窗口）或干净退出（单实例已在跑）都算过；
+        stderr 里出现 Traceback 就是红。
+        """
+        env = dict(os.environ, XDG_RUNTIME_DIR="/run/user/1000", WAYLAND_DISPLAY="wayland-0")
+        for entry in ("capsplus-settings", "capsplus-qbar"):
+            path = REPO / "bin" / entry
+            self.assertTrue(path.exists(), f"入口不存在：{path}")
+            proc = subprocess.Popen([sys.executable, str(path)], cwd=str(REPO), env=env,
+                                    stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
+            try:
+                proc.wait(timeout=6)
+            except subprocess.TimeoutExpired:          # 活着到超时 = 起窗成功
+                proc.kill(); proc.wait(); continue
+            err = (proc.stderr.read() or "")
+            self.assertNotIn("Traceback", err, f"{entry} 启动即崩：\n{err[-600:]}")
+            self.assertEqual(proc.returncode, 0,
+                             f"{entry} 退出码 {proc.returncode}：\n{err[-600:]}")
+
     def _open_a_real_dropdown(self):
         """真开一个下拉（独立 combo + 临时窗口）—— 判据要靠真窗口，不靠 mock。"""
         model = Gtk.ListStore(str)
