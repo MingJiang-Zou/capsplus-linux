@@ -26,6 +26,17 @@ Python 3.11+ 自带），所以在没有显示服务器的环境里也能直接�
   - 模板里的 `{q}` 做 URL 编码替换（空格 → `+`）；要原样嵌入用 `{q_raw}`（如 `gh cli`）
 
 配置语法坏了**不许崩**：`QbarConfig.error` 带上原因，`links` 退回内置默认，界面照常能搜。
+
+## 四种链接类型（`type`，2026-10-15 加）
+
+    type = "search"  # 网站内搜索：目标里必须有 {q} 或 {q_raw}
+    type = "url"     # 固定网址：目标里不许有 {q}
+    type = "app"     # 本地应用：.desktop 名（firefox / firefox.desktop）或一条命令；
+                     #          命令里可以用 {q} 当参数（原样，不做 URL 编码）
+    type = "file"    # 文件或目录路径：`~` 会展开；固定路径，不支持 {q}
+
+**老文件不写 `type` 也能用**（`resolved_type` 推断：有占位符=search，没有=url），
+所以这次改动对现有配置逐字节无感；设置界面会把 `type` 显式写出来，读的人不用猜。
 """
 
 from __future__ import annotations
@@ -41,17 +52,54 @@ RAW_PLACEHOLDER = "{q_raw}"
 
 CONFIG_PATH = Path.home() / ".config/capsplus/qbar.toml"
 
+# 链接类型：界面下拉、写盘、校验共用这一份（别在 GUI 里再抄一遍）
+LINK_TYPES = ("search", "url", "app", "file")
+LINK_TYPE_LABEL = {
+    "search": "网站内搜索",
+    "url": "固定网址",
+    "app": "本地应用",
+    "file": "文件或目录",
+}
+# 打开方式（`open_plan` 的第一个返回值）：url 交给浏览器，app/file 各自走本地路径
+OPEN_KIND_LABEL = {"url": "网址", "app": "应用", "exec": "命令", "file": "文件", "dir": "目录"}
+
+
 @dataclass(frozen=True)
 class SearchLink:
-    """一条快速链接：trigger + 显示名 + URL 模板。"""
+    """一条快速链接：trigger + 显示名 + 目标 + 类型。
+
+    字段名 `url` 是历史包袱，**四种类型都存在这一列**（TOML 里也是 `url =`），
+    免得同一件事有两个键、读的人还得判断该看哪个。`target` 是它的别名。
+    """
     trigger: str
     name: str
     url: str
+    type: str = ""
+
+    @property
+    def target(self) -> str:
+        return self.url
 
     @property
     def is_fixed(self) -> bool:
         """模板里没有 {q}/{q_raw} = 固定链接（站点首页 / 某篇文档）。"""
         return (QUOTED_PLACEHOLDER not in self.url) and (RAW_PLACEHOLDER not in self.url)
+
+    @property
+    def resolved_type(self) -> str:
+        """没写 `type` 的老配置走推断：有占位符 = search，没有 = url（固定网址）。
+
+        app / file **必须显式写** `type`，因为「`code`」这种目标既像命令又像路径，
+        猜错就会去开浏览器 —— 宁可让人写清楚。
+        """
+        t = (self.type or "").strip().lower()
+        if t in LINK_TYPES:
+            return t
+        return "search" if not self.is_fixed else "url"
+
+    @property
+    def type_label(self) -> str:
+        return LINK_TYPE_LABEL.get(self.resolved_type, self.resolved_type)
 
     def target_url(self, keyword: str = "") -> str:
         """把关键词填进模板。`{q}` 编码、`{q_raw}` 原样；固定链接忽略关键词。"""
@@ -64,12 +112,18 @@ class SearchLink:
 
 @dataclass
 class SearchMatch:
-    """`match_search` 的命中结果：一条可直接打开的候选（上层包成 Entry）。"""
+    """`match_search` 的命中结果：一条可直接打开的候选（上层包成 Entry）。
+
+    `kind` / `payload` 是给上层决定**怎么打开**用的：网址走浏览器，
+    应用/文件走本地路径或命令（见 `open_plan`）。老调用点只读 `url`，不受影响。
+    """
     entry_title: str          # 如「必应搜索：keyd 配置」
     subtitle: str             # 如 `b keyd 配置 -> https://...`
     url: str                  # 已填好关键词的目标地址；固定链接 = 模板本身
     link: SearchLink
     keyword: str = ""
+    kind: str = "url"         # url / app / exec / file / dir
+    payload: str = ""         # 真正要打开的东西；留空 = 用 url 本身
 
 
 # 内置默认引擎。trigger 定得顺手且不重复：单字母给最常用的，两字母给站点。
@@ -88,6 +142,112 @@ BUILTIN_LINKS = [
 ]
 
 DEFAULT_TRIGGER = "b"
+
+
+# ---------------------------------------------------------------------------
+# 四种类型：怎么打开 / 怎么校验 / 怎么预览（全是纯函数，界面前端只负责摆控件）
+# ---------------------------------------------------------------------------
+def fill_raw(template: str, keyword: str) -> str:
+    """把 {q}/{q_raw} 都按**原样**填进目标（应用命令行用，URL 编码在参数里没意义）。"""
+    return template.replace(QUOTED_PLACEHOLDER, keyword).replace(RAW_PLACEHOLDER, keyword)
+
+
+def expand_path(text: str) -> str:
+    """路径里的 `~` 展开成家目录；**相对路径按家目录算**。
+
+    Qbar 进程的当前目录没人猜得到（托盘拉起 / keyd 拉起 / 手敲都不一样），
+    所以 `notes` 一律算成 `~/notes`；空串原样返回（校验层先拦掉"缺少 url"）。
+    """
+    raw = (text or "").strip()
+    if not raw:
+        return ""
+    path = Path(raw).expanduser()
+    return str(path if path.is_absolute() else Path.home() / path)
+
+
+def open_plan(link: SearchLink, keyword: str = "") -> tuple[str, str]:
+    """这条链接该怎么打开。返回 `(方式, 载荷)`：
+
+      url   载荷 = 最终网址（search 已填好关键词）
+      app   载荷 = .desktop 名或一条命令（上层再判断是哪一个）
+      file  载荷 = 展开 `~` 后的本地路径
+
+    刻意不在这里判断"desktop 名到底存不存在"：那要扫 /usr/share/applications，
+    属于上层（Qbar 已经有应用表）的事，纯函数保持可以离线跑单测。
+    """
+    kind = link.resolved_type
+    if kind in ("search", "url"):
+        return ("url", link.target_url(keyword))
+    if kind == "app":
+        return ("app", fill_raw(link.url, keyword))
+    return ("file", expand_path(link.url))
+
+
+def link_problems(link: SearchLink, seen: tuple[str, ...] = ()) -> list[str]:
+    """一条链接的全部毛病（中文，界面直接显式显示）。没问题返回 []。
+
+    `seen` 是**同一份配置里已用过的 trigger**（小写），用来抓完全重复的 trigger ——
+    重复会让"长前缀优先"变成掷硬币，必须拦住而不是静默挑一条。
+    """
+    out: list[str] = []
+    trigger = (link.trigger or "").strip()
+    name = (link.name or "").strip()
+    target = (link.url or "").strip()
+    if not trigger:
+        out.append("缺少 trigger")
+    elif any(ch.isspace() for ch in trigger):
+        out.append(f"trigger 不能含空格: {trigger!r}")
+    elif seen and trigger.lower() in seen:
+        out.append(f"trigger 重复: {trigger}")
+    if not name:
+        out.append("缺少 name")
+    if not target:
+        out.append("缺少 url")
+    raw_type = (link.type or "").strip().lower()
+    if raw_type and raw_type not in LINK_TYPES:
+        out.append(f"类型不认识: {raw_type}（只能 {'/'.join(LINK_TYPES)}）")
+        return out
+    if not target:
+        return out
+    if raw_type == "search" and link.is_fixed:
+        out.append("网站内搜索的目标里要有 {q} 或 {q_raw}")
+    elif raw_type == "url" and not link.is_fixed:
+        out.append("固定网址不许带 {q}（要搜索就选 search）")
+    elif raw_type == "file":
+        if not link.is_fixed:
+            out.append("文件或目录是固定路径，不支持 {q}")
+    elif raw_type == "app":
+        if "\n" in target:
+            out.append("应用命令不许换行")
+    return out
+
+
+def duplicate_triggers(links: list[SearchLink]) -> list[str]:
+    """完全重复的 trigger（大小写不敏感），保持首次出现的顺序。"""
+    seen: set[str] = set()
+    dup: list[str] = []
+    for link in links:
+        key = (link.trigger or "").strip().lower()
+        if not key:
+            continue
+        if key in seen and key not in [d.lower() for d in dup]:
+            dup.append((link.trigger or "").strip())
+        seen.add(key)
+    return dup
+
+
+def preview_pair(link: SearchLink, sample: str = "") -> tuple[str, str]:
+    """界面上的实时预览：返回 `(输入什么, 得到什么)`。
+
+    search 类没填示例词时用「关键词」占位，这样预览行永远读得通。
+    """
+    kind, payload = open_plan(link, sample)
+    sample = sample.strip()
+    if link.resolved_type == "search":
+        return (f"{link.trigger} {sample or '关键词'}", payload)
+    if link.resolved_type == "app" and not link.is_fixed:
+        return (f"{link.trigger} {sample or '参数'}", payload)
+    return (link.trigger, payload)
 
 
 # ---------------------------------------------------------------------------
@@ -167,11 +327,25 @@ class QbarConfig:
             return None
         return self._build(link, text)
 
+    def match_link(self, link: SearchLink, keyword: str = "") -> SearchMatch:
+        """对**指定的那一条**做同样的拼装（设置界面的实时预览、"只敲了前缀"两种情况用）。
+
+        公开这个入口是为了让上层不必去碰 `_build` 这个下划线方法。
+        """
+        return self._build(link, keyword)
+
     def _build(self, link: SearchLink, keyword: str) -> SearchMatch:
-        if link.is_fixed:
-            return SearchMatch(f"{link.name}（固定链接）", link.url, link.url, link, "")
-        return SearchMatch(f"{link.name}搜索：{keyword}", f"{link.trigger} {keyword} -> {link.target_url(keyword)}",
-                           link.target_url(keyword), link, keyword)
+        kind, payload = open_plan(link, keyword)
+        if kind == "url":
+            if link.is_fixed:
+                return SearchMatch(f"{link.name}（固定链接）", link.url, link.url, link, "",
+                                   kind, payload)
+            return SearchMatch(f"{link.name}搜索：{keyword}",
+                               f"{link.trigger} {keyword} -> {link.target_url(keyword)}",
+                               link.target_url(keyword), link, keyword, kind, payload)
+        # 应用 / 文件：把"要执行的东西"原样当副标题显出来，用户一眼看得懂会跑什么
+        label = LINK_TYPE_LABEL.get(link.resolved_type, link.resolved_type)
+        return SearchMatch(f"{link.name}（{label}）", payload, payload, link, keyword, kind, payload)
 
     def no_keyword_hint(self, text: str) -> "SearchLink | None":
         """`b` / `b ` 这种"只敲了前缀没跟内容"的情况，返回该 trigger 对应的 link。
@@ -194,35 +368,99 @@ class QbarConfig:
 
 
 # ---------------------------------------------------------------------------
-# 默认配置文件的文本（首次运行生成，带中文注释）
+# 配置文件的文本（首次运行生成 / 设置界面写回，都走同一个 writer）
 # ---------------------------------------------------------------------------
+HEADER = [
+    "# capsplus Qbar 快速链接配置",
+    "#",
+    "# 改完不用重启 Qbar：每次打开 Qbar 都会重读这个文件。",
+    "# （用「capsplus-settings」界面改也行，它写回的就是这个文件）",
+    "# trigger 冲突时**长前缀优先**（`gh 关键词` 走 gh，不会被 g 抢走）。",
+    "# 单字母 trigger（b/g/w…）必须**带空格**才算前缀：`b 关键词` 是搜索，",
+    "# 而 `beta` 这种普通输入不会被 `b` 吃掉（没有这条，以 b/g/w 开头的词全废）。",
+    "# url 里放 {q} 表示把关键词做 URL 编码填进去；想原样嵌入（保留空格）用 {q_raw}；",
+    "# 两者都不放 = 固定链接，整条直接打开（如站点首页、某篇文档）。",
+    "# 注：# 后面必须留一个空格，否则 tomllib 会把它当成键值对报错。",
+    "#",
+    "# type = 这条链接的类型（不写就按老规则推断：有 {q} = search，没有 = url）：",
+    "#   search 网站内搜索（目标必须有 {q}/{q_raw}）   url 固定网址（目标不许有 {q}）",
+    "#   app    本地应用：.desktop 名（firefox）或一条命令，命令里 {q} 当参数（原样）",
+    "#   file   文件或目录路径：~ 会展开；固定路径，不支持 {q}",
+    "# 提醒：设置界面会重写 [general] 与每条 [[link]]，**写在条目中间的注释会被模板注释顶掉**；",
+    "#       自己的说明请写在文件开头（开头那段注释界面会原样带回去）。",
+]
+
+
+def toml_str(value: str) -> str:
+    """TOML 基本字符串转义（界面里用户可能敲引号/反斜杠，不许写出坏配置）。"""
+    out = (value or "")
+    out = out.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n").replace("\t", "\\t")
+    return f'"{out}"'
+
+
 def render_default_toml() -> str:
     """生成默认 qbar.toml 的正文（含中文注释与全部默认引擎）。"""
-    lines = [
-        "# capsplus Qbar 快速链接配置",
-        "#",
-        "# 改完不用重启 Qbar：每次打开 Qbar 都会重读这个文件。",
-        "# trigger 冲突时**长前缀优先**（`gh 关键词` 走 gh，不会被 g 抢走）。",
-        "# 单字母 trigger（b/g/w…）必须**带空格**才算前缀：`b 关键词` 是搜索，",
-        "# 而 `beta` 这种普通输入不会被 `b` 吃掉（没有这条，以 b/g/w 开头的词全废）。",
-        "# url 里放 {q} 表示把关键词做 URL 编码填进去；想原样嵌入（保留空格）用 {q_raw}；",
-        "# 两者都不放 = 固定链接，整条直接打开（如站点首页、某篇文档）。",
-        "# 注：# 后面必须留一个空格，否则 tomllib 会把它当成键值对报错。",
+    return render_config_toml(list(BUILTIN_LINKS), DEFAULT_TRIGGER, "", True)
+
+
+def render_config_toml(links: list[SearchLink], default_search: str = DEFAULT_TRIGGER,
+                       browser: str = "", hide_on_focus_out: bool = True,
+                       header: str | None = None) -> str:
+    """把配置渲染成 TOML 文本：**顺序就是传进来的顺序**，注释来自模板（tomllib 只读）。
+
+    `header` = 文件开头那段注释（设置界面会传原文件的开头注释回来，用户手写的说明不丢）。
+    """
+    lines = list(header.splitlines()) if header else list(HEADER)
+    lines += [
         "",
         "[general]",
-        f'default_search = "{DEFAULT_TRIGGER}"     # 不带前缀的输入用哪个引擎（填某个 link 的 trigger）',
-        'browser = ""             # 留空 = 系统默认浏览器（xdg-open）；填了 = 用命令模板',
+        f'default_search = {toml_str(default_search)}     # 不带前缀的输入用哪个引擎（填某个 link 的 trigger）',
+        f'browser = {toml_str(browser)}             # 留空 = 系统默认浏览器（xdg-open）；填了 = 用命令模板',
         '                         # 模板里 {url} 会被替换成真实地址，如 "firefox --new-tab {url}"',
-        'hide_on_focus_out = true # 点别处就收起来（等价于再按一次 Caps+Q，下次一次就能唤起）',
+        f'hide_on_focus_out = {"true" if hide_on_focus_out else "false"} # 点别处就收起来（等价于再按一次 Caps+Q，下次一次就能唤起）',
         "",
     ]
-    for link in BUILTIN_LINKS:
+    for link in links:
         lines.append("[[link]]")
-        lines.append(f'trigger = "{link.trigger}"')
-        lines.append(f'name = "{link.name}"')
-        lines.append(f'url = "{link.url}"')
+        lines.append(f'trigger = {toml_str(link.trigger)}')
+        lines.append(f'name = {toml_str(link.name)}')
+        lines.append(f'type = {toml_str(link.resolved_type)}')
+        lines.append(f'url = {toml_str(link.url)}')
         lines.append("")
     return "\n".join(lines).rstrip() + "\n"
+
+
+def leading_comments(text: str) -> str:
+    """文件**开头**那段注释（连续的 # 行 / 空行）。写回时原样带回去 = 用户说明不丢。
+
+    只认开头：条目中间的注释要保真就得自己做一份保留注释的 TOML 解析器，
+    代价远大于收益（界面会重写整个 [[link]] 块，见文件头那句提醒）。
+    """
+    out: list[str] = []
+    for line in (text or "").splitlines():
+        stripped = line.strip()
+        if stripped == "" or stripped.startswith("#"):
+            out.append(line)
+            continue
+        break
+    return "\n".join(out).strip("\n")
+
+
+def save_config(links: list[SearchLink], default_search: str, browser: str,
+                hide_on_focus_out: bool, path: Path | None = None) -> Path:
+    """原子写回 qbar.toml：先写 .tmp 再 replace；开头注释从原文件带回来。"""
+    target = Path(path) if path else CONFIG_PATH
+    header = ""
+    try:
+        header = leading_comments(target.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError):
+        header = ""
+    target.parent.mkdir(parents=True, exist_ok=True)
+    text = render_config_toml(links, default_search, browser, hide_on_focus_out, header or None)
+    tmp = target.with_name(target.name + ".tmp")
+    tmp.write_text(text, encoding="utf-8")
+    tmp.replace(target)
+    return target
 
 
 def ensure_config_file(path: Path | None = None) -> Path:
@@ -306,30 +544,25 @@ def load_config(path: Path | None = None, create: bool = True) -> QbarConfig:
         if not isinstance(item, dict):
             errors.append(f"第 {index} 条 link 不是表")
             continue
-        trigger = item.get("trigger", "")
-        name = item.get("name", "")
-        url = item.get("url", "")
-        bad = False
-        if not isinstance(trigger, str) or not trigger.strip():
-            errors.append(f"第 {index} 条 link 缺少 trigger")
-            bad = True
-        if not isinstance(name, str) or not name.strip():
-            errors.append(f"第 {index} 条 link 缺少 name")
-            bad = True
-        if not isinstance(url, str) or not url.strip():
-            errors.append(f"第 {index} 条 link 缺少 url")
-            bad = True
-        if bad:
+
+        def text_of(key: str, default: object = "") -> str:
+            value = item.get(key, default)
+            return value if isinstance(value, str) else ""
+
+        # `target` 是 `url` 的别名（app / file 类用"目标"更顺），两个键都认、只存一份
+        # 变量名绝不能用 `target`：外层的 `target` 是配置文件路径，被顶掉就把
+        # `QbarConfig.path` 变成了网址（2026-10-15 单测真的红过这条）
+        destination = text_of("url") or text_of("target")
+        link = SearchLink(text_of("trigger"), text_of("name"), destination.strip(), text_of("type"))
+
+        problems = link_problems(link, tuple(seen))
+        if problems:
+            for msg in problems:
+                errors.append(f"第 {index} 条 link {msg}")
             continue
-        key = trigger.strip().lower()
-        if key in seen:
-            errors.append(f"trigger 重复: {trigger.strip()}")
-            continue
-        if any(ch.isspace() for ch in trigger.strip()):
-            errors.append(f"trigger 不能含空格: {trigger.strip()!r}")
-            continue
-        seen.add(key)
-        links.append(SearchLink(trigger.strip(), name.strip(), url.strip()))
+        seen.add(link.trigger.strip().lower())
+        links.append(SearchLink(link.trigger.strip(), link.name.strip(), link.url.strip(),
+                                (link.type or "").strip().lower()))
 
     if not raw_links:
         errors.append("没有定义任何 [[link]]，已用内置默认引擎")

@@ -34,7 +34,7 @@ from gi.repository import Gdk, Gio, GLib, Gtk  # noqa: E402
 from qbar.logic import (  # noqa: E402
     toggle_action, should_hide_on_focus_out,
     Entry, FileFinder, History, SearchEngine, browser_search_url, history_key,
-    scan_desktop_files,
+    scan_desktop_files, settings_launch_command,
 )
 from qbar.search_config import open_command  # noqa: E402
 
@@ -274,6 +274,9 @@ class QbarWindow(Gtk.Window):
                 info.launch(None, None)
             elif entry.kind in ("file", "dir"):
                 Gio.AppInfo.launch_default_for_uri(Path(entry.payload).as_uri(), None)
+            elif entry.kind == "exec":
+                # 快速链接 type="app" 但目标带了参数 / 不是 .desktop 名 → 当命令跑
+                self._run_command(entry.payload)
             elif entry.kind == "cfg":
                 self._open_file(entry.payload)
             elif entry.kind == "url":
@@ -298,11 +301,21 @@ class QbarWindow(Gtk.Window):
         self.hide()
 
     def _run_builtin(self, payload: str) -> bool:
-        """`-> date` / `-> time` 这类能自己处理的命令：处理了返回 True，否则 False。
+        """`-> date` / `-> time` / `-> settings` 这类能自己处理的命令：处理了返回 True。
 
         返回 False 的（`calc`/`q` 之类的补全提示）由调用方按老路子当搜索词开浏览器。
         """
         word = payload.strip()
+        if word == "settings":
+            cmd = settings_launch_command()
+            if not cmd:
+                self.entry.set_placeholder_text("没找到 capsplus-settings，先跑一次 ./install.sh")
+                return True
+            # 设置窗口是**另一个进程**：这里只负责把它拉起来，Qbar 自己收起
+            threading.Thread(target=lambda: subprocess.run(cmd, capture_output=True),
+                             daemon=True).start()
+            GLib.timeout_add(150, self._hide_now)
+            return True
         if word not in ("date", "time"):
             return False
         text = datetime.datetime.now().strftime("%Y-%m-%d" if word == "date" else "%H:%M:%S")
@@ -310,6 +323,15 @@ class QbarWindow(Gtk.Window):
         self.entry.set_placeholder_text(f"已复制 {text}，关闭中…")
         GLib.timeout_add(700, self._hide_now)
         return True
+
+    def _run_command(self, command: str):
+        """跑一条 shell 命令（快速链接 app 类的兜底路径）。放线程里，窗口不卡。"""
+        if not command.strip():
+            return
+        threading.Thread(
+            target=lambda: subprocess.run(["bash", "-lc", command], capture_output=True),
+            daemon=True).start()
+
 
     def _open_file(self, path: str):
         """用系统默认程序打开一个本地文件（Qbar 的配置就靠它）。不存在就报错不崩。"""

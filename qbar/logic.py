@@ -14,17 +14,18 @@ from datetime import datetime
 from pathlib import Path
 
 try:                                      # 作为包导入（bin/ 与单测的调用方式）
-    from .search_config import QbarConfig, load_config, parse_search_cmd
+    from .search_config import QbarConfig, load_config, open_plan, parse_search_cmd
 except ImportError:                       # 兜底：直接按文件路径跑时
     import sys
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-    from qbar.search_config import QbarConfig, load_config, parse_search_cmd
+    from qbar.search_config import QbarConfig, load_config, open_plan, parse_search_cmd
 
 # ---------------------------------------------------------------------------
 # 条目模型
 # ---------------------------------------------------------------------------
 KIND_LABEL = {
     "app": "应用",
+    "exec": "命令",
     "file": "文件",
     "dir": "目录",
     "cmd": "命令",
@@ -187,6 +188,24 @@ def browser_search_url(keyword: str, config: QbarConfig | None = None) -> str:
 
 BUILTIN_PREFIX = "->"
 
+# 设置窗口的入口名（install.sh 把它软链到 ~/.local/bin）
+SETTINGS_BIN = "capsplus-settings"
+
+
+def settings_launch_command(repo_root: Path | None = None) -> list[str]:
+    """起设置窗口的命令：优先 PATH 里的 `capsplus-settings`（install.sh 装的软链）。
+
+    找不到就回落到仓内 `bin/capsplus-settings` —— 没跑过 install.sh 也能从 Qbar 点开，
+    开发态少一个"改了代码但要重装才能试"的坑。两个都没有就返回 []（上层给提示）。
+    """
+    from shutil import which
+    found = which(SETTINGS_BIN)
+    if found:
+        return [found]
+    root = Path(repo_root) if repo_root else Path(__file__).resolve().parent.parent
+    fallback = root / "bin" / SETTINGS_BIN
+    return [str(fallback)] if fallback.exists() else []
+
 
 def builtin_entries(text: str, config: QbarConfig | None = None) -> list[Entry]:
     """`-> xxx` 内置命令。返回候选（含 calc 的即时结果）。"""
@@ -198,6 +217,7 @@ def builtin_entries(text: str, config: QbarConfig | None = None) -> list[Entry]:
         for name, desc in (("date", "今天日期"), ("time", "当前时间"),
                            ("calc ", "算术求值，如 -> calc 1+2*3"),
                            ("q ", f"网页搜索（用默认引擎：{default_name}）"),
+                           ("settings", "设置窗口：快速链接 / 通用 / 按键映射"),
                            ("link", "打开快速链接配置文件" if config is None
                             else f"打开 {config.path}")):
             out.append(Entry(f"-> {name}", "cmd", 50.0, desc, name.strip()))
@@ -232,8 +252,11 @@ def builtin_entries(text: str, config: QbarConfig | None = None) -> list[Entry]:
         path = (config or QbarConfig()).path
         out.append(Entry(f"-> link {path}", "cfg", 90.0, "打开快速链接配置文件（改完重开 Qbar 生效）",
                          str(path)))
+    elif word == "settings":
+        out.append(Entry("-> settings", "cmd", 90.0,
+                         "打开设置窗口（快速链接 / 通用 / 按键映射三页）", "settings"))
     else:
-        for name in ("date", "time", "calc", "q", "link"):
+        for name in ("date", "time", "calc", "q", "link", "settings"):
             if name.startswith(word):
                 out.append(Entry(f"-> {name}", "cmd", 30.0, "", name))
     return out
@@ -345,6 +368,20 @@ def scan_desktop_files(dirs: list[Path]) -> list[Entry]:
     return list(seen.values())
 
 
+def desktop_index(apps: list[Entry]) -> dict[str, str]:
+    """把扫到的应用表倒排成 `名字 -> .desktop 路径`，三种写法都认：
+    `firefox` / `firefox.desktop` / 显示名（小写比较）。快速链接的 `app` 类靠它落地。
+    """
+    index: dict[str, str] = {}
+    for entry in apps:
+        if entry.kind != "app" or not entry.payload:
+            continue
+        path = Path(entry.payload)
+        for name in (path.stem.lower(), path.name.lower(), entry.title.lower()):
+            index.setdefault(name, entry.payload)
+    return index
+
+
 # ---------------------------------------------------------------------------
 # fdfind 后端访问器
 # ---------------------------------------------------------------------------
@@ -436,6 +473,8 @@ class SearchEngine:
         self.apps = apps
         self.history = history
         self.file_finder = file_finder
+        # 快速链接里 `type = "app"` 的目标要落到 .desktop 文件上，靠这张表
+        self.desktops = desktop_index(apps)
         # config=None 时惰性读一次磁盘（空输入列表也会读，代价只有一次 TOML 解析）
         self.config = config if config is not None else load_config(config_path)
         self.config_path = self.config.path
@@ -464,6 +503,41 @@ class SearchEngine:
                       f"{self.config.error}（已退回内置默认引擎；回车打开 {self.config_path}）",
                       str(self.config_path))]
 
+    def _desktop_path(self, raw: str) -> str:
+        """`app` 类目标 → .desktop 文件路径；返回空串表示"当命令跑"。
+
+        带了参数（`code --diff {q}`）就**必须**走命令：桌面启动器不吃参数，
+        硬套 .desktop 会把参数丢掉，用户看到的就是"打开了但什么都没 diff"。
+        """
+        text = (raw or "").strip()
+        if not text or any(ch.isspace() for ch in text):
+            return ""
+        lowered = text.lower()
+        stem = lowered[:-8] if lowered.endswith(".desktop") else lowered
+        for key in (lowered, stem, stem + ".desktop"):
+            hit = self.desktops.get(key)
+            if hit:
+                return hit
+        path = Path(text)
+        return str(path) if path.suffix == ".desktop" and path.is_file() else ""
+
+    def _entry_from_match(self, hit) -> Entry:
+        """把一条快速链接的命中变成**能打开**的 Entry（四种类型四条路）。"""
+        kind, payload = open_plan(hit.link, hit.keyword)
+        if kind == "url":
+            return Entry(hit.entry_title, "url", 200.0, hit.subtitle, hit.url)
+        if kind == "app":
+            desktop = self._desktop_path(payload)
+            if desktop:
+                return Entry(hit.entry_title, "app", 200.0, desktop, desktop)
+            return Entry(hit.entry_title, "exec", 200.0, payload, payload)
+        # file：路径已经展开过 ~；不存在也照样列出来（副标题写明白），
+        # 免得用户以为"界面坏了"——真正的原因通常是他还没建这个目录
+        target = Path(payload)
+        note = "" if target.exists() else "（路径不存在）"
+        return Entry(hit.entry_title, "dir" if target.is_dir() else "file",
+                     200.0, f"{payload}{note}", payload)
+
     def _search_entries(self, text: str) -> tuple[list[Entry], bool]:
         """把输入解析成搜索/跳转候选。
 
@@ -481,7 +555,7 @@ class SearchEngine:
 
         hit = self.config.match(text)
         if hit is not None:
-            out.append(Entry(hit.entry_title, "url", 200.0, hit.subtitle, hit.url))
+            out.append(self._entry_from_match(hit))
             explicit = _explicit_prefix(self.config, text)
             return out, explicit
 
@@ -491,6 +565,10 @@ class SearchEngine:
         # 固定链接没有"关键词"一说：直接给整条
         if hint.is_fixed:
             out.append(Entry(f"{hint.name}（固定链接）", "url", 200.0, hint.url, hint.url))
+            return out, True
+        if hint.resolved_type in ("app", "file"):
+            # 敲了前缀没跟参数：应用照样能开（{q} 填空），比"输入关键词"有用
+            out.append(self._entry_from_match(self.config.match_link(hint, "")))
             return out, True
         out.append(Entry(f"{hint.name}：输入关键词", "cmd", 200.0,
                          f"如「{hint.trigger} 关键词」；回车打开 {hint.name} 首页", hint.url))
@@ -526,7 +604,7 @@ class SearchEngine:
         pool = self.apps + self._history_entries()
         out += fuzzy_filter(text, pool)
         out += fuzzy_filter(text, [Entry("-> " + c, "cmd", 0.0)
-                                   for c in ("date", "time", "calc", "q", "link")])
+                                   for c in ("date", "time", "calc", "q", "link", "settings")])
         return SearchOutcome(out, needs_files=need_files)
 
     def open_config(self) -> Path:
