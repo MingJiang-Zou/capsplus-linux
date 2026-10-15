@@ -249,5 +249,36 @@ class FocusOutHideTests(unittest.TestCase):
         self.assertFalse(should_hide_on_focus_out(True, False, FOCUS_OUT_GRACE_MS - 1))
 
 
+class TestPygiMethodNotUsedAsProperty(unittest.TestCase):
+    """护栏：PyGI 里 `window.is_active` 是**方法**，漏了括号就是个恒真的 bound method。
+
+    这类错不会抛异常、类型也对（truthy），单测里只要不真改焦点就看不出来 ——
+    本轮"点别处不消失"的根因就是它（`should_hide_on_focus_out(..., self.is_active, ...)`
+    永远收到真值 ⇒ 永不隐藏）。所以直接在源码层面拦：GUI 模块里这些名字必须带括号调用。
+    """
+
+    METHODS = ("is_active", "get_mapped", "get_realized", "get_visible", "is_visible")
+    FILES = ("qbar/qbar_app.py", "tray/tray_app.py", "settings/settings_app.py")
+
+    def test_no_bare_pygi_method_attribute(self):
+        import ast
+        root = Path(__file__).resolve().parent.parent
+        bad = []
+        for rel in self.FILES:
+            path = root / rel
+            if not path.exists():
+                continue
+            tree = ast.parse(path.read_text(encoding="utf-8"))
+            called = set()
+            for node in ast.walk(tree):
+                if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
+                    called.add(id(node.func))
+            for node in ast.walk(tree):
+                if (isinstance(node, ast.Attribute) and node.attr in self.METHODS
+                        and id(node) not in called):
+                    bad.append(f"{rel}:{node.lineno} {node.attr} 漏了括号（当属性用了）")
+        self.assertEqual(bad, [], "\n".join(bad))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

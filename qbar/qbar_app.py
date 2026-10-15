@@ -252,7 +252,13 @@ class QbarWindow(Gtk.Window):
         """
         flag = getattr(self.engine.config, "hide_on_focus_out", True)
         elapsed_ms = int((time.monotonic() - self._shown_at) * 1000) if self._shown_at else 10 ** 9
-        if should_hide_on_focus_out(self.get_visible(), self.is_active, elapsed_ms, flag):
+        # **别**把 self.is_active 当"还带焦点"传进去：GTK 是在默认类处理器里才清掉 active 标记的，
+        # 我们连的回调跑在它前面 —— 于是 focus-out-event 触发的那一刻 is_active 仍然是 True，
+        # 传进去等于"永远不隐藏"，而且这条分支原先不打日志，就表现为"点别处没反应"（2026-10-15 明江实测）。
+        # 既然信号叫 focus-out，焦点就是要走了，focused 一律按 False 处理。
+        log(f"focus-out visible={self.get_visible()} is_active={self.is_active()} "
+            f"距显示={elapsed_ms}ms flag={flag}")
+        if should_hide_on_focus_out(self.get_visible(), False, elapsed_ms, flag):
             self.hide()
             log(f"hide(focus-out) 显示后 {elapsed_ms}ms")
         return False
@@ -359,7 +365,9 @@ class QbarWindow(Gtk.Window):
 
     # ------------------------------------------------------------------
     def toggle(self):
-        action = toggle_action(self.get_visible(), self.is_active)
+        # is_active() 是**方法**不是属性：漏括号时它是个 bound method，永远为真 ——
+        # 于是"显示但没焦点→raise"这一支从来没走过（2026-10-15 同一个坑的两处）
+        action = toggle_action(self.get_visible(), self.is_active())
         if action == "hide":
             self.hide()
             log("hide")
