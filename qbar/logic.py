@@ -564,3 +564,26 @@ def toggle_action(visible: bool, active: bool) -> str:
     if not visible:
         return "show"
     return "hide" if active else "raise"
+
+
+# 窗口显示后多久之内的失焦不算"用户点别处"（毫秒）。
+# 冷启动时 present() 与焦点落到输入框之间有个几十毫秒的空档，Wayland 下
+# 这期间可能先来一次 focus-out；没有这个防抖，Qbar 会刚开就自己收掉。
+FOCUS_OUT_GRACE_MS = 300
+
+
+def should_hide_on_focus_out(visible: bool, focused: bool, ms_since_show: int,
+                             flag: bool = True) -> bool:
+    """窗口失焦时该不该 hide()（纯函数，便于单测）。
+
+    明江的口径（2026-10-15）：**点别处就真隐藏**，跟再按一次 Caps+Q 一个效果 ——
+    否则下次唤起要先"隐藏"再"显示"，得按两次。所以这里默认就是隐藏，而不是拉回前台。
+
+    - flag=False            -> 保持老行为（不隐藏，交给 toggle 的 raise 去拉回前台）
+    - 窗口没显示            -> 没什么可藏的，返回 False
+    - 还带焦点（模拟/测试用）-> 不隐藏
+    - 显示后不足防抖窗口    -> 不隐藏（躲掉刚显示那一下的瞬时失焦）
+    """
+    if not flag or not visible or focused:
+        return False
+    return ms_since_show >= FOCUS_OUT_GRACE_MS

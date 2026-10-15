@@ -15,6 +15,7 @@ REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO))
 
 from capsplus import apply as A          # noqa: E402
+from capsplus.render import render        # noqa: E402
 
 OLD_CONFIG = "[ids]\n*\n\n[main]\ncapslock = overload(capl, capslock)\n\n[capl]\ne = up\n"
 
@@ -24,10 +25,15 @@ class ApplySandbox(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         root = Path(self.tmp.name)
         self._saved = (A.KEYD_CONF, A.BACKUP_DIR, A.attic_dir,
-                       A.install_conf, A.reload_keyd, A.keyd_log, A._run)
+                       A.install_conf, A.reload_keyd, A.keyd_log, A._run,
+                       A.render_with_overrides)
         A.KEYD_CONF = root / "capslock-plus.conf"
         A.BACKUP_DIR = root / "backup"
         A.attic_dir = lambda: root / "attic"
+        # 渲染一律钉在仓库默认上：绝不读真实的 ~/.config/capsplus/mappings.toml
+        # （否则明江改过键位就会把测试搞红，测试也就没法复现了）
+        self._real_render_with_overrides = self._saved[7]
+        A.render_with_overrides = render
         self.logs: list[str] = []
         self.reloads = 0
         self.real_run = self._saved[6]
@@ -50,7 +56,8 @@ class ApplySandbox(unittest.TestCase):
 
     def tearDown(self):
         (A.KEYD_CONF, A.BACKUP_DIR, A.attic_dir,
-         A.install_conf, A.reload_keyd, A.keyd_log, A._run) = self._saved
+         A.install_conf, A.reload_keyd, A.keyd_log, A._run,
+         A.render_with_overrides) = self._saved
         self.tmp.cleanup()
 
     def backups(self):

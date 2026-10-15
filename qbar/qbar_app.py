@@ -19,6 +19,7 @@ import socket
 import subprocess
 import sys
 import threading
+import time
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
@@ -31,7 +32,7 @@ gi.require_version("Gdk", "3.0")
 from gi.repository import Gdk, Gio, GLib, Gtk  # noqa: E402
 
 from qbar.logic import (  # noqa: E402
-    toggle_action,
+    toggle_action, should_hide_on_focus_out,
     Entry, FileFinder, History, SearchEngine, browser_search_url, history_key,
     scan_desktop_files,
 )
@@ -103,6 +104,8 @@ class QbarWindow(Gtk.Window):
         self.results: list[Entry] = []
         self._gen = 0
         self._debounce_id = 0
+        # 窗口这一轮显示的时刻（monotonic 秒）：失焦防抖要靠它算"显示多久了"
+        self._shown_at = 0.0
 
         box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
         box.set_name("qbarbox")
@@ -136,6 +139,7 @@ class QbarWindow(Gtk.Window):
         # 于是窗口开着却打不进字。map / focus-in 都补抓一次，再延时兜一刀。
         self.connect("map-event", self._on_map)
         self.connect("focus-in-event", self._on_focus_in)
+        self.connect("focus-out-event", self._on_focus_out)
 
         provider = Gtk.CssProvider()
         provider.load_from_data(CSS)
@@ -239,6 +243,20 @@ class QbarWindow(Gtk.Window):
         self.entry.grab_focus()
         return False
 
+    def _on_focus_out(self, *_args):
+        """失焦 → 隐藏（明江的口径：跟再按一次 Caps+Q 等效）。
+
+        `[general] hide_on_focus_out = false` 时保持老行为（不隐藏，
+        下次 Caps+Q 走 toggle_action 的 raise 拉回前台）。
+        刚显示后 300ms 内的失焦不算"用户点了别处"，见 logic.should_hide_on_focus_out。
+        """
+        flag = getattr(self.engine.config, "hide_on_focus_out", True)
+        elapsed_ms = int((time.monotonic() - self._shown_at) * 1000) if self._shown_at else 10 ** 9
+        if should_hide_on_focus_out(self.get_visible(), self.is_active, elapsed_ms, flag):
+            self.hide()
+            log(f"hide(focus-out) 显示后 {elapsed_ms}ms")
+        return False
+
     def _on_delete(self, *_args):
         self.hide()
         return True
@@ -336,6 +354,7 @@ class QbarWindow(Gtk.Window):
             self.show_all()
             self.present()
             self.entry.grab_focus()
+            self._shown_at = time.monotonic()    # 失焦防抖的时间基准
             log("show(toggle)")
             self._do_search()      # 文本本来就空时 "changed" 不触发，这里主动刷新一次
 
@@ -410,6 +429,7 @@ def main(argv: list[str]) -> int:
         # 只 show_all() 的话窗口没有键盘焦点，用户敲的字会落到别的窗口里。
         window.present()
         window.entry.grab_focus()
+        window._shown_at = time.monotonic()
         log("show(cold start)")
     Gtk.main()
     SOCK_PATH.unlink(missing_ok=True)

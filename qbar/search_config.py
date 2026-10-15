@@ -8,6 +8,7 @@ Python 3.11+ 自带），所以在没有显示服务器的环境里也能直接�
     [general]
     default_search = "b"     # 不带前缀的输入用哪个（填某个 link 的 trigger）
     browser = ""             # 留空 = 系统默认浏览器（xdg-open）
+    hide_on_focus_out = true # 点别处就收起来（等价于再按一次 Caps+Q）
 
     [[link]]
     trigger = "b"
@@ -98,6 +99,9 @@ class QbarConfig:
     links: list[SearchLink] = field(default_factory=lambda: list(BUILTIN_LINKS))
     default_search: str = DEFAULT_TRIGGER
     browser: str = ""
+    # 失焦即隐藏（默认开）：点别处 = 等价于再按一次 Caps+Q，
+    # 这样下次 Caps+Q 一定是"从隐藏到显示"，一次就能唤起。
+    hide_on_focus_out: bool = True
     path: Path = CONFIG_PATH
     error: str = ""
 
@@ -209,6 +213,7 @@ def render_default_toml() -> str:
         f'default_search = "{DEFAULT_TRIGGER}"     # 不带前缀的输入用哪个引擎（填某个 link 的 trigger）',
         'browser = ""             # 留空 = 系统默认浏览器（xdg-open）；填了 = 用命令模板',
         '                         # 模板里 {url} 会被替换成真实地址，如 "firefox --new-tab {url}"',
+        'hide_on_focus_out = true # 点别处就收起来（等价于再按一次 Caps+Q，下次一次就能唤起）',
         "",
     ]
     for link in BUILTIN_LINKS:
@@ -281,6 +286,11 @@ def load_config(path: Path | None = None, create: bool = True) -> QbarConfig:
         errors.append("browser 必须是字符串")
         browser = ""
 
+    hide_on_focus_out = general.get("hide_on_focus_out", True)
+    if not isinstance(hide_on_focus_out, bool):
+        errors.append("hide_on_focus_out 必须是 true / false")
+        hide_on_focus_out = True
+
     raw_links = raw.get("link", [])
     if raw_links is None:
         raw_links = []
@@ -332,6 +342,7 @@ def load_config(path: Path | None = None, create: bool = True) -> QbarConfig:
         errors.append(f"default_search={default_search!r} 没有对应的 link")
 
     return QbarConfig(links=links, default_search=default_search, browser=browser,
+                      hide_on_focus_out=hide_on_focus_out,
                       path=target, error="；".join(errors))
 
 

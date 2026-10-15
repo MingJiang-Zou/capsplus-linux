@@ -9,7 +9,7 @@ REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO))
 
 from qbar.logic import (  # noqa: E402
-    toggle_action,
+    toggle_action, should_hide_on_focus_out, FOCUS_OUT_GRACE_MS,
     CalcError, Entry, History, SearchEngine, FileFinder, builtin_entries,
     format_calc, fuzzy_score, history_key, looks_like_url, parse_desktop_file,
     safe_calc, scan_desktop_files,
@@ -208,10 +208,6 @@ class TestSearchEngine(unittest.TestCase):
         self.assertEqual(len(merged), 2)
 
 
-if __name__ == "__main__":
-    unittest.main(verbosity=2)
-
-
 class ToggleActionTests(unittest.TestCase):
     """Caps+Q 的切换决策：Wayland 没 keep-above，被盖住时窗口仍 visible 但没焦点。"""
 
@@ -224,3 +220,34 @@ class ToggleActionTests(unittest.TestCase):
 
     def test_visible_and_focused_hides(self):
         self.assertEqual(toggle_action(True, True), "hide")
+
+
+class FocusOutHideTests(unittest.TestCase):
+    """失焦即隐藏（默认开）：点别处 = 再按一次 Caps+Q，下次唤起一次就能显示。"""
+
+    def test_flag_off_never_hides(self):
+        """hide_on_focus_out=false = 老行为：不隐藏，交给 toggle 的 raise 拉回前台。"""
+        self.assertFalse(should_hide_on_focus_out(True, False, 10_000, False))
+
+    def test_not_visible_does_not_hide(self):
+        self.assertFalse(should_hide_on_focus_out(False, False, 10_000, True))
+
+    def test_still_focused_does_not_hide(self):
+        self.assertFalse(should_hide_on_focus_out(True, True, 10_000, True))
+
+    def test_just_shown_200ms_is_ignored(self):
+        """刚显示 200ms 的失焦是冷启动抖动，不算用户点了别处。"""
+        self.assertFalse(should_hide_on_focus_out(True, False, 200, True))
+
+    def test_400ms_after_show_hides(self):
+        self.assertTrue(should_hide_on_focus_out(True, False, 400, True))
+
+    def test_exactly_at_grace_boundary_hides(self):
+        self.assertTrue(should_hide_on_focus_out(True, False, FOCUS_OUT_GRACE_MS, True))
+
+    def test_grace_boundary_default_flag(self):
+        self.assertFalse(should_hide_on_focus_out(True, False, FOCUS_OUT_GRACE_MS - 1))
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)

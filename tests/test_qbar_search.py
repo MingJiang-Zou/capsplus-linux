@@ -241,6 +241,25 @@ class TestConfigFile(TempConfigMixin, unittest.TestCase):
         self.assertIn("default_search", cfg.error)
         self.assertEqual(cfg.match("词").link.trigger, "b")   # 退回第一条可用
 
+    def test_hide_on_focus_out_defaults_to_true(self):
+        """不写这一项 = 开（明江要的口径：点别处就收起来）。"""
+        self.write_config('[general]\ndefault_search = "b"\n'
+                          '[[link]]\ntrigger = "b"\nname = "必应"\nurl = "https://b/?q={q}"\n')
+        self.assertIs(self.load().hide_on_focus_out, True)
+
+    def test_hide_on_focus_out_false_is_parsed(self):
+        self.write_config('[general]\nhide_on_focus_out = false\n'
+                          '[[link]]\ntrigger = "b"\nname = "必应"\nurl = "https://b/?q={q}"\n')
+        self.assertIs(self.load().hide_on_focus_out, False)
+
+    def test_bad_hide_on_focus_out_reports_and_falls_back_to_true(self):
+        """写成字符串这种常见手滑：报错但退回默认开，界面不瘫。"""
+        self.write_config('[general]\nhide_on_focus_out = "yes"\n'
+                          '[[link]]\ntrigger = "b"\nname = "必应"\nurl = "https://b/?q={q}"\n')
+        cfg = self.load()
+        self.assertIn("hide_on_focus_out", cfg.error)
+        self.assertIs(cfg.hide_on_focus_out, True)
+
     def test_link_missing_field_reports(self):
         """坏条目被跳过，但**好条目不许被默认引擎顶掉**（否则用户看不出自己配的那条没了）。"""
         self.write_config('[[link]]\ntrigger = "b"\nname = "必应"\n'

@@ -24,8 +24,13 @@ def _format_binding(key: str, action: str) -> str:
     return f"{key} = {action}"
 
 
-def render(mapping_data=MD) -> str:
-    """渲染完整 keyd 配置文本（结尾带换行）。"""
+def render(mapping_data=None) -> str:
+    """渲染完整 keyd 配置文本（结尾带换行）。
+
+    `mapping_data` 省略 = 仓库默认（`capsplus/mapping_data.py`）；
+    传 `mapping_overrides.merge_overrides()` 的结果 = 默认 + 用户覆盖层。
+    """
+    mapping_data = MD if mapping_data is None else mapping_data
     out = ["#" + "=" * 66]
     for line in HEADER:
         out.append(("# " + line).rstrip())
@@ -93,8 +98,44 @@ def _key_table(notes, prefix: str) -> list[str]:
     return out
 
 
-def render_key_table(which: str = "capl", mapping_data=MD) -> str:
+def render_key_table(which: str = "capl", mapping_data=None) -> str:
     """给 README 用的 markdown 键表（由映射数据生成，绝不手写 —— 改映射即改文档）。"""
+    mapping_data = MD if mapping_data is None else mapping_data
     if which == "capl":
         return "\n".join(_key_table(mapping_data.KEY_TABLE_NOTES, "Caps+"))
     return "\n".join(_key_table(mapping_data.KEY_TABLE_NOTES_ALT, "Caps+Alt+"))
+
+
+def binding_notes(which: str = "capl") -> dict[str, str]:
+    """键 -> 一句人话说明（设置界面表格用）。
+
+    说明表是按 "e/d/s/f" 这种组合键写的，这里拆开倒排成单键；一个键出现在多组里
+    （如 `p/semicolon`）时后面的组不覆盖前面的，保证结果稳定。
+    """
+    notes = MD.KEY_TABLE_NOTES if which == "capl" else MD.KEY_TABLE_NOTES_ALT
+    out: dict[str, str] = {}
+    for combo, note in notes.items():
+        for key in combo.split("/"):
+            out.setdefault(key.strip(), note)
+    return out
+
+
+def binding_rows(which: str, mapping_data=None) -> list[tuple[str, str, str, str]]:
+    """一个层的绑定表：[(键, 动作, 说明, 来源)]，来源 = "默认" / "覆盖"。
+
+    设置界面的「当前生效映射」表格直接用这个（不解析 Python 源码，也不解析 conf 文本）。
+    """
+    mapping_data = MD if mapping_data is None else mapping_data
+    sections = dict(getattr(mapping_data, "SECTIONS", MD.SECTIONS))
+    rows = sections.get(which, [])
+    notes = binding_notes(which)
+    default = dict(MD.SECTIONS).get(which, [])
+    default_map = {e[0]: e[1] for e in default if not isinstance(e, str)}
+    out: list[tuple[str, str, str, str]] = []
+    for entry in rows:
+        if isinstance(entry, str):
+            continue
+        key, action = entry
+        source = "默认" if default_map.get(key) == action else "覆盖"
+        out.append((key, action, notes.get(key, ""), source))
+    return out

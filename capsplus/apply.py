@@ -25,6 +25,7 @@ from datetime import datetime
 from pathlib import Path
 
 from .render import render, normalized_bindings
+from .mapping_overrides import OverrideError, load_and_merge, load_overrides
 
 KEYD_CONF = Path("/etc/keyd/capslock-plus.conf")
 KEYD_BIN = shutil.which("keyd.rvaiya") or "/usr/bin/keyd.rvaiya"
@@ -138,10 +139,25 @@ def install_conf(text: str) -> None:
         tmp.unlink(missing_ok=True)
 
 
+def render_with_overrides():
+    """渲染"仓库默认 + 用户覆盖层"的最终配置。
+
+    覆盖层文件语法坏了 / 有非法条目 -> 抛 OverrideError（宁可拒绝，也不写出半份配置）。
+    覆盖层里没有条目时，结果与 `render()` **逐字节相同**（单测锁住）。
+    """
+    data, overrides = load_and_merge()
+    if overrides.error:
+        raise OverrideError(f"{overrides.path} 读不了: {overrides.error}")
+    if overrides.errors:
+        raise OverrideError("用户覆盖层有问题（改好后重试，或删掉该文件）：\n  " +
+                            "\n  ".join(overrides.errors))
+    return render(data)
+
+
 def apply(dry_run: bool = False, since: str = "10 seconds ago",
           text: str | None = None) -> ApplyResult:
     """主入口。dry_run=True 只渲染并自检，不碰系统；text 用于测试注入别的配置文本。"""
-    text = render() if text is None else text
+    text = render_with_overrides() if text is None else text
     normalized_bindings(text)  # macro 行带行尾注释 / 非法绑定行在这里就炸
 
     if dry_run:
@@ -208,7 +224,7 @@ def config_summary(conf: Path = KEYD_CONF):
     if not conf.exists():
         return [], conf, False
     current = normalized_bindings(conf.read_text(encoding="utf-8"))
-    rendered = normalized_bindings(render())
+    rendered = normalized_bindings(render_with_overrides())
     counts: dict[str, int] = {}
     for section, _key, _action in current:
         counts[section] = counts.get(section, 0) + 1
@@ -230,7 +246,8 @@ def main(argv: list[str] | None = None) -> int:
     cmd = argv[0] if argv else "status"
     try:
         if cmd == "render":
-            sys.stdout.write(render())
+            # 渲染的是"默认 + 用户覆盖层"的最终结果（apply 装到 /etc/keyd 的就是它）
+            sys.stdout.write(render_with_overrides())
             return 0
         if cmd == "apply":
             res = apply(dry_run="--dry-run" in argv)
@@ -246,6 +263,15 @@ def main(argv: list[str] | None = None) -> int:
             print(f"配置文件 : {conf} ({'存在' if conf.exists() else '不存在'})")
             print(f"与渲染一致: {'是' if same else '否（有人手改过或没 apply）'}")
             print("段/条数  : " + ", ".join(f"{s}={n}" for s, n in counts))
+            ov = load_overrides()
+            if ov.error:
+                print(f"用户覆盖 : 读不了 —— {ov.error}")
+            elif ov.count:
+                print(f"用户覆盖 : {ov.path}（{ov.count} 条）")
+            else:
+                print(f"用户覆盖 : 无（全部用仓库默认）")
+            for line in ov.errors:
+                print(f"           ⚠ {line}")
             print(f"最近日志 : {last_log_line()}")
             return 0
         print(f"用法: capsplus [render|apply [--dry-run]|status]", file=sys.stderr)
