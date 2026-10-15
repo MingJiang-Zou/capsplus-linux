@@ -168,9 +168,13 @@ class TestHistory(unittest.TestCase):
 
 class TestSearchEngine(unittest.TestCase):
     def setUp(self):
+        # 原来这里用 tempfile.mkdtemp()：它不会自己回收，每跑一次漏一个空目录，
+        # 本机已积到 568 个（2026-10-15 实测）。换成 TemporaryDirectory + addCleanup。
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
         self.engine = make_engine(
             apps=[Entry("Firefox", "app", 0.0, "浏览器", "/usr/share/applications/firefox.desktop")],
-            history=History(Path(tempfile.mkdtemp()) / "h.json"))
+            history=History(Path(self._tmp.name) / "h.json"))
 
     def test_equals_calc(self):
         out = self.engine.search("=1+2*3")
