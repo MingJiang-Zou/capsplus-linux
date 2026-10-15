@@ -38,6 +38,24 @@ from qbar.search_config import open_command  # noqa: E402
 
 STATE_DIR = Path.home() / ".local/state/capsplus"
 SOCK_PATH = STATE_DIR / "qbar.sock"
+LOG_PATH = STATE_DIR / "qbar.log"
+# CAPSPLUS_QBAR_DEBUG=1 时把每次按键/搜索条数也记进日志（排查"字没进去"用）
+DEBUG = os.environ.get("CAPSPLUS_QBAR_DEBUG") == "1"
+
+
+def log(msg: str) -> None:
+    """轻量诊断日志（只留最近 200 行）。
+
+    用途：排查"窗口开了但打不了字"这类看不见的问题 —— Wayland 下窗口拿到键盘焦点
+    可能晚于 present()，光看进程活着没法判断。只记焦点/动作，不记用户敲的内容。
+    """
+    try:
+        STATE_DIR.mkdir(parents=True, exist_ok=True)
+        old = LOG_PATH.read_text(encoding="utf-8").splitlines() if LOG_PATH.exists() else []
+        old.append(f"{datetime.datetime.now().isoformat(timespec='seconds')} {msg}")
+        LOG_PATH.write_text("\n".join(old[-200:]) + "\n", encoding="utf-8")
+    except OSError:
+        pass
 HISTORY_PATH = STATE_DIR / "qbar-history.json"
 SEARCH_ROOTS = [Path.home() / "project", Path.home(), Path("/mnt/data"), Path("/mnt/back")]
 DEBOUNCE_MS = 130
@@ -113,6 +131,10 @@ class QbarWindow(Gtk.Window):
 
         self.connect("key-press-event", self._on_key)
         self.connect("delete-event", self._on_delete)
+        # Wayland 下窗口拿到键盘焦点常晚于 present()；只抓一次可能落在"窗口还没激活"的空档，
+        # 于是窗口开着却打不进字。map / focus-in 都补抓一次，再延时兜一刀。
+        self.connect("map-event", self._on_map)
+        self.connect("focus-in-event", self._on_focus_in)
 
         provider = Gtk.CssProvider()
         provider.load_from_data(CSS)
@@ -174,6 +196,8 @@ class QbarWindow(Gtk.Window):
     # ------------------------------------------------------------------
     def _on_key(self, _widget, event):
         key = event.keyval
+        if DEBUG:
+            log(f"key {Gdk.keyval_name(key)} widget={type(_widget).__name__}")
         if key == Gdk.KEY_Escape:
             self.hide()
             return True
@@ -200,6 +224,20 @@ class QbarWindow(Gtk.Window):
         if 0 <= index < len(self.results):
             self._activate(self.results[index])
 
+    def _on_map(self, *_args):
+        log("map")
+        GLib.timeout_add(120, self._refocus)
+        return False
+
+    def _on_focus_in(self, *_args):
+        log("focus-in")
+        self.entry.grab_focus()
+        return False
+
+    def _refocus(self):
+        self.entry.grab_focus()
+        return False
+
     def _on_delete(self, *_args):
         self.hide()
         return True
@@ -208,6 +246,7 @@ class QbarWindow(Gtk.Window):
     # 打开
     # ------------------------------------------------------------------
     def _activate(self, entry: Entry):
+        log(f"activate kind={entry.kind} title={entry.title!r}")
         try:
             if entry.kind == "app":
                 info = Gio.DesktopAppInfo.new_from_filename(entry.payload)
@@ -281,6 +320,7 @@ class QbarWindow(Gtk.Window):
     def toggle(self):
         if self.get_visible():
             self.hide()
+            log("hide")
         else:
             # 每次打开都重读 qbar.toml：改完快速链接不用重启 Qbar
             self.engine.reload_config()
@@ -289,6 +329,7 @@ class QbarWindow(Gtk.Window):
             self.show_all()
             self.present()
             self.entry.grab_focus()
+            log("show(toggle)")
             self._do_search()      # 文本本来就空时 "changed" 不触发，这里主动刷新一次
 
 
@@ -357,6 +398,12 @@ def main(argv: list[str]) -> int:
     window.show_all()
     if "--hidden" in argv:
         window.hide()
+    else:
+        # 冷启动（Caps+Q 首次唤起走的就是这条路）必须自己抢焦点：
+        # 只 show_all() 的话窗口没有键盘焦点，用户敲的字会落到别的窗口里。
+        window.present()
+        window.entry.grab_focus()
+        log("show(cold start)")
     Gtk.main()
     SOCK_PATH.unlink(missing_ok=True)
     return 0
