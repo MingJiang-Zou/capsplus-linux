@@ -223,6 +223,24 @@ class TestSettingsWindow(unittest.TestCase):
         self.assertEqual(self.window.ov.get("capl", "e"), "pageup")
         self.assertEqual(page.store[self.row_index("capl", "e")][4], "覆盖")
         self.assertIn('e = "pageup"', self.overrides.read_text(encoding="utf-8"))
+        # 提交后编辑条跟着刷成新值（不许停在旧值上，那样下一次提交就会写错值）
+        self.assertEqual(page.action_entry.get_text(), "pageup")
+        self.assertEqual(page.editor_pair, ("capl", "e"))
+        # 编辑条在滚动区**外面**：表格滚到底，它仍然整块待在视口下方
+        # （断言"y 一动不动"是错的 —— 滚到底会出现横向滚动条，整块布局合法地缩小 23px；
+        #  真正不能接受的是"编辑条跑到某一行上面去"，所以断言结构与相对位置。）
+        scroll = page.view.get_parent()
+        self.assertFalse(page.action_combo.is_ancestor(scroll),
+                         "编辑条的 combo 在 ScrolledWindow 里面 = 老 bug 的结构")
+        adjustment = scroll.get_vadjustment()
+        adjustment.set_value(adjustment.get_upper())
+        self.pump(0.2)
+        area = scroll.get_allocation()
+        combo_a = page.action_combo.get_allocation()
+        self.assertGreaterEqual(combo_a.y, area.y + area.height - 1,
+                                f"滚动后编辑条(y={combo_a.y})不再位于视口下方"
+                                f"(视口底 {area.y + area.height}) = 可能压到别的行")
+        self.assertEqual(page.editor_target.get_text(), "capl / e", "滚动后编辑条还认这一格")
 
     def test_scrolling_the_table_cannot_move_the_editor(self):
         """截图那一步的等价复现：选中 `capl / t` → 把表格滚到底再滚回来 ——
