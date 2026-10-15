@@ -31,7 +31,7 @@ if str(REPO) not in sys.path:
 
 import gi  # noqa: E402
 gi.require_version("Gtk", "3.0")
-from gi.repository import GLib, Gtk  # noqa: E402
+from gi.repository import GLib, Gtk, Pango  # noqa: E402
 
 from capsplus import mapping_overrides as MO  # noqa: E402
 from capsplus import settings_logic as SL  # noqa: E402
@@ -50,7 +50,7 @@ BLACK = "#000000"
 GENERAL_HELP = {
     "default_search": "不带前缀直接输入时，用哪个引擎搜（下拉只列 search 类型的链接）",
     "browser": "留空 = 系统默认浏览器（xdg-open）；填命令模板，{url} 会被换成真实地址",
-    "hide_on_focus_out": "点别处就收起 Qbar（等价于再按一次 Caps+Q，下次一次就能唤起）",
+    "hide_on_focus_out": "点别处就收起 Qbar（等价于再按一次 Caps+Q，下次按一下就能唤起）",
 }
 
 VERB = {"search": "浏览器搜", "url": "浏览器开", "app": "启动", "file": "打开"}
@@ -593,6 +593,10 @@ class MappingPage(Gtk.Box):
         else:
             color = BLACK
         renderer.set_property("foreground", color)
+        # 颜色会被选中态的白字盖掉，所以"覆盖"再加粗：选中那一行也认得出它是覆盖来的
+        renderer.set_property("weight",
+                              Pango.Weight.BOLD if source == "覆盖" and column_index in (2, 4)
+                              else Pango.Weight.NORMAL)
 
     # ------------------------------------------------------------------
     def _on_action_edited(self, _renderer, path, new_text):
@@ -657,8 +661,9 @@ class MappingPage(Gtk.Box):
             self._count_status("覆盖层为空：渲染结果与仓库默认**逐条相同**。", GREY)
             return
         lines = "\n  ".join(deltas)
-        hints = "\n".join(SL.override_toml_hint(s) for s in MO.ALLOWED_SECTIONS
-                          if self.app.ov.values.get(s))
+        hints = "\n".join(h for h in (SL.override_toml_hint(section)
+                                       for section in MO.ALLOWED_SECTIONS
+                                       if self.app.ov.values.get(section)) if h)
         self._count_status("应用之后会改成这几条：\n  " + lines
                            + (("\n" + hints) if hints else ""), BLUE)
 

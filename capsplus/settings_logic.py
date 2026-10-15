@@ -259,5 +259,11 @@ def save_overrides_with_snapshot(values: dict[str, dict[str, str]], path: Path,
 
 
 def override_toml_hint(section: str) -> str:
-    """界面上把段名显示成 keyd 写法、写盘用 TOML 写法 —— 这里给状态栏一句解释。"""
-    return f"[{section}] 写到文件里是 [{toml_table(section)}]（带 + 的段名 TOML 必须加引号）"
+    """界面上显示 keyd 的段名、写盘走 TOML 的段名 —— 只有两者**不一样**时才值得提示。
+
+    `[capl]` 本来就两边相同，跟着说一句"必须加引号"是纯噪音（实测截图里就刺眼）。
+    """
+    quoted = toml_table(section)
+    if quoted == section:
+        return ""
+    return f'界面里的 [{section}] 写进文件是 [{quoted}]（带 + 的段名 TOML 必须加引号）'

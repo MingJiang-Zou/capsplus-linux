@@ -414,7 +414,7 @@ def render_config_toml(links: list[SearchLink], default_search: str = DEFAULT_TR
         f'default_search = {toml_str(default_search)}     # 不带前缀的输入用哪个引擎（填某个 link 的 trigger）',
         f'browser = {toml_str(browser)}             # 留空 = 系统默认浏览器（xdg-open）；填了 = 用命令模板',
         '                         # 模板里 {url} 会被替换成真实地址，如 "firefox --new-tab {url}"',
-        f'hide_on_focus_out = {"true" if hide_on_focus_out else "false"} # 点别处就收起来（等价于再按一次 Caps+Q，下次一次就能唤起）',
+        f'hide_on_focus_out = {"true" if hide_on_focus_out else "false"} # 点别处就收起来（等价于再按一次 Caps+Q，下次按一下就能唤起）',
         "",
     ]
     for link in links:

@@ -155,7 +155,8 @@ class TestOverrideEditing(unittest.TestCase):
         text = render_overrides({"capl+alt": {"b": "pagedown"}})
         self.assertIn('["capl+alt"]', text)
         self.assertNotIn("\n[capl+alt]\n", text)
-        self.assertIn("带 +", override_toml_hint("capl+alt"))
+        self.assertIn("必须加引号", override_toml_hint("capl+alt"))
+        self.assertEqual(override_toml_hint("capl"), "", "两边写法一样的段名不值得提示")
 
 
 # ---------------------------------------------------------------------------
