@@ -15,12 +15,12 @@ capsplus/       CLI 与映射真相源（render / apply / status）
   render.py         渲染 keyd 配置 / 归一化校验 / 生成 README 键表 / binding_rows 给界面用
   mapping_overrides.py  用户键位覆盖层 `~/.config/capsplus/mappings.toml`（只存改过的那几条）
   apply.py          备份 -> 安装 -> reload -> 查错 -> 必要时回滚
-  settings_logic.py 设置窗口的纯逻辑层（校验 / 覆盖层增删 / 宏事件计数 / apply 文案），不 import gi
+  settings_logic.py 设置窗口的纯逻辑层（校验 / 覆盖层增删 / 宏事件计数 / 编辑条"第 N 行是谁" / apply 文案），不 import gi
 tray/           GTK3 + AyatanaAppIndicator3 托盘（capsplus-tray）
 qbar/           GTK3 浮层启动器（capsplus-qbar）
   logic.py          不依赖 gi 的纯逻辑层（fuzzy / 算术 / 历史 / 搜索编排）
-  search_config.py  快速链接的 TOML 配置层：四种类型、校验、预览、写回（同样不 import gi）
-settings/       GTK3 设置窗口（capsplus-settings）—— **只摆控件**，算法都在上面那两个纯层里
+  search_config.py  快速链接的 TOML 配置层：四种类型、校验、预览、表单条取值、写回（同样不 import gi）
+settings/       GTK3 设置窗口（capsplus-settings）—— **只摆控件，两页表格一律只读**；算法都在上面那两个纯层里
 bin/            capsplus / capsplus-tray / capsplus-qbar / capsplus-settings / keyd-qbar-cmd
 assets/         自画的两个托盘 SVG（启用/暂停）
 packaging/      应用菜单 .desktop（只放 Qbar 一条）、autostart .desktop、systemd --user unit
@@ -66,9 +66,19 @@ capsplus-settings        # 设置窗口（GTK3，三页）：快速链接 / 通�
 
 | 页 | 管的东西 | 写到哪个文件 |
 | --- | --- | --- |
-| **快速链接** | `trigger` / 名称 / 类型（四种，下拉）/ 目标；增、删（带确认）、上下移动；选中一行填示例词就出**实时预览**（`输入 b 关键词 → 最终 URL`）；trigger 完全重复 = 红字拦下、**拒绝写盘** | `~/.config/capsplus/qbar.toml` |
+| **快速链接** | **只读**表格（前缀 / 名称 / 类型 / 目标 / 备注）+ 表格下方**表单条**（`前缀` `名称` `类型`下拉四选一 `目标`）；按钮 `保存这一条` `新增` `删除（带确认）` `上移` `下移` `重读文件` `保存快速链接`。选中/输入即更新**实时预览**（`输入 b 关键词 → 最终 URL`，`file`/`app` 显示展开 `~` 后的真实目标）；前缀完全重复 = 红字拦下、**拒绝写盘** | `~/.config/capsplus/qbar.toml` |
 | **通用** | `default_search`（下拉只列 search 类）、`browser`（留空=系统默认）、`hide_on_focus_out` 开关；每项右侧一行灰字解释 | 同上（两页写同一个文件，任一页点保存都会整体写回） |
-| **按键映射** | 当前生效表（层/键/动作/说明/**来源=默认\|覆盖**）；「动作」= 常用下拉 + 允许自由输入，当场用 `validate_action` + `load_known_keys` 校验；「恢复默认」= 把这条从覆盖层删掉 | `~/.config/capsplus/mappings.toml`（覆盖层） |
+| **按键映射** | **只读**生效表（层/键/动作/说明/**来源=默认\|覆盖**，覆盖行加粗）+ 表格下方**编辑条**：`目标：capl / t`（加粗）+ 该行说明 + `动作：`下拉（`ComboBox.new_with_entry`，常用动作可点选也能自由输入）+ `改这一格` `恢复默认（删这条覆盖）`。单击行同步编辑条，**双击行焦点进输入框**，框内回车 = 点「改这一格」；当场用 `validate_action` + `load_known_keys` 校验（非法 = 红字不写盘），宏超 15 事件 = 黄字。「改这一格」立刻写覆盖层并刷表（来源变「覆盖」），但**不碰系统**；「应用」才装进 `/etc/keyd` | `~/.config/capsplus/mappings.toml`（覆盖层） |
+
+**两页表格为什么一律只读**（2026-10-15 明江实测截图定案，治本方案 A）：GTK3/Wayland 下 TreeView 的
+cell editor 是**独立 surface、不跟随表格滚动** —— 表格滚了、编辑框的像素坐标不动，于是编辑框视觉上
+落到别的行：高亮的是 `t` 行、编辑框落在 `k` 行、框里还是 `t` 的值，**用户以为改的是 `t`，写进盘的是
+`k`**。上一轮「滚动即收悬浮下拉」只补了下拉那一半，输入框本身照样脱开（治标）。所以把编辑控件整个
+搬出滚动的表格：表格只显示，编辑走表格下方固定的编辑条/表单条，这个 bug 类从根上没有立足点。
+另加两道保险：**①**「这一格要改的是 `capl / t`」在编辑条和状态栏**两边都显式写出来**；
+**②** 提交时核对「编辑条认的格子 == 表格当前选中的格子」，不一致直接红字拦住、一格都不写。
+源码级判据锁死不再回退：`tests/test_table_readonly.py`（AST 扫描，出现 `CellRendererCombo` 或
+`editable=True` 就判红，headless 也拦得住）。
 
 入口只有三个：**托盘「设置…」**、**Qbar 里敲 `-> settings`**、**命令行 `capsplus-settings`**。
 刻意**不装** 应用菜单 `.desktop`（应用里条目越多越难找，上一轮刚删掉一条冗余的）。
@@ -345,18 +355,32 @@ keyd 的一条 `macro(...)` 里累计发出的按键事件**超过 15 个就不�
    `[capl]` / `[capl+alt]` 这两个字串，按字串切会切错位置。要逐行判断段头
    （`[` 开头且 `]` 结尾的裸行，注释行跳过）—— `settings_logic._binding_map()` 就是这么做的，
    `tests/test_settings_logic.py::TestRenderDiff` 用带这两个字串的注释头把它锁住了。
+6. **设置窗口的表格必须只读**：`CellRendererCombo` 与 `set_property("editable", True)` 在
+   GTK3/Wayland 下会得到一块**不跟随表格滚动**的悬浮编辑框 —— 表格滚了、编辑框像素坐标不动，
+   于是视觉上落到别的行：用户以为改 `t`，实际写进 `k`（2026-10-15 明江实测截图定案，治本方案 A）。
+   编辑一律走表格下方的编辑条/表单条。判据两道：源码级 `tests/test_table_readonly.py`
+   （AST，出现可编辑 renderer 就红，headless 也跑）+ 行为级 `tests/test_settings_window.py`
+   （`get_property("editable")` 全 False、单击第 N 行编辑条就是第 N 行、双击焦点进编辑条的输入框）。
 
 ## 开发
 
 ```bash
-python3 -m unittest discover -s tests -v     # 233 个用例，纯标准库（无 pytest）
+python3 -m unittest discover -s tests -v     # 263 个用例，纯标准库（无 pytest）
 python3 tools/gen-readme.py                  # 重新生成 README（含键表）
 ```
 
-`tests/test_settings_window.py` 是**真起窗**的界面测试（会断言窗口真的 `mapped`、
-三页控件与表格行数、编辑→校验→写盘→恢复默认整条链）：它把两个配置路径与 state 目录
-都指到临时目录，所以不碰 `~/.config/capsplus/`；连不上显示服务器时整个模块自动 skip
-（`python3 -m unittest` 里表现为 `skipped=20`），headless / SSH 下跑单测不会被它卡住。
+`tests/test_settings_window.py` 是**真起窗**的界面测试（会断言窗口真的 `mapped`、三页控件与
+表格行数、"单击第 N 行 → 编辑条显示的就是第 N 行"、双击后焦点在编辑条的输入框、
+表格无可编辑 renderer、以及"编辑→校验→写盘→恢复默认→试渲染"整条链）：它把两个配置路径与
+state 目录都指到临时目录，所以不碰 `~/.config/capsplus/`；连不上显示服务器时整个模块自动 skip
+（headless 下表现为 `skipped=35`，全量 0.08s 跑完），SSH / CI 下不会被它卡住。
+有显示服务器时最慢的一条是 `test_real_entry_points_import_cleanly`（**子进程跑真入口**
+`bin/capsplus-*`，防"单测全绿但图标点了没反应"；两个入口各等 6 秒 ≈ 12 秒，
+全量那 13.9 秒里几乎全是它）。
+
+`tests/test_table_readonly.py` 是"表格只读"的源码级护栏（AST，不需要显示服务器）：
+`CellRendererCombo` / `set_property("editable", 真值)` / 构造关键字 `editable=真值` /
+上一轮那两条治标护栏复活 —— 任一条出现就判红；自带反例（证明抓得住）与正例（证明不误报）。
 
 `tests/test_qbar_search.py` 专门锁快速链接的行为：前缀最长匹配、单字母 trigger 必须带空格、
 默认引擎、URL 编码（中文/空格/`&`）、`{q_raw}`、固定链接、坏 TOML 容错、
