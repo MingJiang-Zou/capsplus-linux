@@ -13,6 +13,17 @@ from qbar.logic import (  # noqa: E402
     format_calc, fuzzy_score, history_key, looks_like_url, parse_desktop_file,
     safe_calc, scan_desktop_files,
 )
+from qbar.search_config import QbarConfig  # noqa: E402
+
+# 单测一律注入内置默认配置：绝不让 SearchEngine 去碰真实的 ~/.config/capsplus/qbar.toml
+# （否则跑测试会在用户家里生成配置文件）。
+BUILTIN = QbarConfig
+
+
+def make_engine(apps, history):
+    return SearchEngine(apps=apps, history=history,
+                        file_finder=FileFinder([Path("/nonexistent")]),
+                        config=BUILTIN())
 
 
 class TestFuzzy(unittest.TestCase):
@@ -137,26 +148,28 @@ class TestHistory(unittest.TestCase):
             self.assertGreater(again.score(key), 0.0)
 
     def test_history_prioritises_recent_hit(self):
-        """最近用过的条目要排到前面：同一 fuzzy 匹配分下，历史加成决定名次。"""
+        """最近用过的条目要排到前面：同一 fuzzy 匹配分下，历史加成决定名次。
+
+        注意 `beta` 是纯输入，第一条会是「默认引擎搜索」候选（见 qbar 快速链接），
+        所以这里比的是**应用条目之间**的名次。
+        """
         with tempfile.TemporaryDirectory() as tmp:
             hist = History(Path(tmp) / "h.json")
             hist.bump(history_key("app", "/x/beta.desktop"))
-            engine = SearchEngine(
-                apps=[Entry("beta", "app", 0.0, "", "/x/other.desktop")],
-                history=hist,
-                file_finder=FileFinder([Path("/nonexistent")]))
+            engine = make_engine(apps=[Entry("beta", "app", 0.0, "", "/x/other.desktop")],
+                                 history=hist)
             out = engine.search("beta")
-            self.assertEqual(out.entries[0].kind, "app")
-            self.assertEqual(out.entries[0].payload, "/x/beta.desktop")
-            self.assertGreater(out.entries[0].score, out.entries[1].score if len(out.entries) > 1 else 0.0)
+            apps = [e for e in out.entries if e.kind == "app"]
+            self.assertEqual(apps[0].payload, "/x/beta.desktop")
+            self.assertEqual(apps[0].kind, "app")
+            self.assertGreater(apps[0].score, out.entries[0].score - 200.0)
 
 
 class TestSearchEngine(unittest.TestCase):
     def setUp(self):
-        self.engine = SearchEngine(
+        self.engine = make_engine(
             apps=[Entry("Firefox", "app", 0.0, "浏览器", "/usr/share/applications/firefox.desktop")],
-            history=History(Path(tempfile.mkdtemp()) / "h.json"),
-            file_finder=FileFinder([Path("/nonexistent")]))
+            history=History(Path(tempfile.mkdtemp()) / "h.json"))
 
     def test_equals_calc(self):
         out = self.engine.search("=1+2*3")
@@ -174,8 +187,11 @@ class TestSearchEngine(unittest.TestCase):
         self.assertFalse(out.needs_files)
 
     def test_app_search_and_file_search(self):
+        """纯输入：默认引擎搜索排第一（回车即搜），应用紧随其后（还能按 ↓ 选应用）。"""
         out = self.engine.search("fire")
-        self.assertEqual(out.entries[0].title, "Firefox")
+        self.assertEqual(out.entries[0].title, "必应搜索：fire")
+        self.assertEqual(out.entries[0].kind, "url")
+        self.assertEqual(out.entries[1].title, "Firefox")
         self.assertTrue(out.needs_files)
 
     def test_empty_query_lists_apps_without_scan(self):

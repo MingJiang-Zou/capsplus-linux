@@ -27,6 +27,7 @@ from gi.repository import AyatanaAppIndicator3 as AppIndicator  # noqa: E402
 from gi.repository import GLib, Gtk  # noqa: E402
 
 from capsplus import __version__, apply as cap_apply  # noqa: E402
+from qbar.search_config import ensure_config_file, shell_quote  # noqa: E402
 
 STATE_DIR = Path.home() / ".local/state/capsplus"
 LOCK_PATH = STATE_DIR / "tray.lock"
@@ -64,9 +65,10 @@ class Tray:
 
         self.entries = {}
         for label, handler in (
+            ("打开 Qbar", self.on_qbar),
+            ("编辑快速链接", self.on_edit_links),
             ("启用 / 暂停映射", self.on_toggle),
             ("重载配置", self.on_reload),
-            ("打开 Qbar", self.on_qbar),
             ("打开映射文件", self.on_open_conf),
             ("查看最近日志", self.on_logs),
             ("关于", self.on_about),
@@ -198,6 +200,16 @@ class Tray:
     def on_qbar(self, _item):
         self.shell(f"{USER_ENV} capsplus-qbar")
 
+    def on_edit_links(self, _item):
+        """打开 Qbar 的快速链接配置；文件不在就先写一份默认的（带中文注释）。"""
+        try:
+            path = ensure_config_file()
+        except OSError as exc:
+            self.notify(f"写不了配置: {exc}"[:80])
+            return
+        self.notify("已打开快速链接配置")
+        self.shell(f"xdg-open {shell_quote(str(path))}")
+
     def on_open_conf(self, _item):
         self.shell(f"xdg-open {KEYD_CONF}")
 
@@ -206,7 +218,7 @@ class Tray:
         for term in ("ptyxis", "gnome-terminal", "kgx", "xterm"):
             if shutil.which(term):
                 flag = "--" if term == "gnome-terminal" else "-e"
-                self.shell(f'{term} {flag} bash -lc {shlex_quote(cmd)}')
+                self.shell(f'{term} {flag} bash -lc {shell_quote(cmd)}')
                 return
         self.notify("没找到可用终端，请看 journalctl -u keyd")
 
@@ -222,11 +234,6 @@ class Tray:
 
     def on_quit(self, _item):
         Gtk.main_quit()
-
-
-def shlex_quote(text: str) -> str:
-    import shlex
-    return shlex.quote(text)
 
 
 def acquire_lock():

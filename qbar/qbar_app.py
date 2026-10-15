@@ -13,8 +13,10 @@
 
 from __future__ import annotations
 
+import datetime
 import os
 import socket
+import subprocess
 import sys
 import threading
 from pathlib import Path
@@ -32,6 +34,7 @@ from qbar.logic import (  # noqa: E402
     Entry, FileFinder, History, SearchEngine, browser_search_url, history_key,
     scan_desktop_files,
 )
+from qbar.search_config import open_command  # noqa: E402
 
 STATE_DIR = Path.home() / ".local/state/capsplus"
 SOCK_PATH = STATE_DIR / "qbar.sock"
@@ -39,7 +42,7 @@ HISTORY_PATH = STATE_DIR / "qbar-history.json"
 SEARCH_ROOTS = [Path.home() / "project", Path.home(), Path("/mnt/data"), Path("/mnt/back")]
 DEBOUNCE_MS = 130
 ENTRY_LIMIT = 40
-PLACEHOLDER = "搜索应用 / 文件 / -> 命令 / = 算术 / 网址"
+PLACEHOLDER = "搜网页（b 关键词 / gh 关键词）/ 应用 / 文件 / -> 命令 / = 算术"
 
 CSS = b"""
 #qbarbox {
@@ -213,11 +216,15 @@ class QbarWindow(Gtk.Window):
                 info.launch(None, None)
             elif entry.kind in ("file", "dir"):
                 Gio.AppInfo.launch_default_for_uri(Path(entry.payload).as_uri(), None)
-            elif entry.kind in ("url", "hist"):
-                if entry.kind == "hist" and entry.payload and not entry.payload.startswith("http"):
-                    Gio.AppInfo.launch_default_for_uri(browser_search_url(entry.title), None)
+            elif entry.kind == "cfg":
+                self._open_file(entry.payload)
+            elif entry.kind == "url":
+                self._open_url(entry.payload)
+            elif entry.kind == "hist":
+                if entry.payload and not entry.payload.startswith("http"):
+                    self._open_url(browser_search_url(entry.title, self.engine.config))
                 else:
-                    Gio.AppInfo.launch_default_for_uri(entry.payload, None)
+                    self._open_url(entry.payload)
             elif entry.kind == "calc":
                 Gtk.Clipboard.get(Gdk.SELECTION_CLIPBOARD).set_text(entry.payload, -1)
                 self.entry.set_placeholder_text(f"已复制 {entry.payload}，关闭中…")
@@ -225,11 +232,46 @@ class QbarWindow(Gtk.Window):
                 self.history.bump(history_key(entry.kind, entry.payload))
                 return
             else:  # cmd / 其它
-                Gio.AppInfo.launch_default_for_uri(browser_search_url(entry.title), None)
+                if not self._run_builtin(entry.payload):
+                    self._open_url(browser_search_url(entry.title, self.engine.config))
         except (GLib.Error, RuntimeError) as exc:
             print(f"打开失败 {entry.title}: {exc}", file=sys.stderr)
         self.history.bump(history_key(entry.kind, entry.payload or entry.title))
         self.hide()
+
+    def _run_builtin(self, payload: str) -> bool:
+        """`-> date` / `-> time` 这类能自己处理的命令：处理了返回 True，否则 False。
+
+        返回 False 的（`calc`/`q` 之类的补全提示）由调用方按老路子当搜索词开浏览器。
+        """
+        word = payload.strip()
+        if word not in ("date", "time"):
+            return False
+        text = datetime.datetime.now().strftime("%Y-%m-%d" if word == "date" else "%H:%M:%S")
+        Gtk.Clipboard.get(Gdk.SELECTION_CLIPBOARD).set_text(text, -1)
+        self.entry.set_placeholder_text(f"已复制 {text}，关闭中…")
+        GLib.timeout_add(700, self._hide_now)
+        return True
+
+    def _open_file(self, path: str):
+        """用系统默认程序打开一个本地文件（Qbar 的配置就靠它）。不存在就报错不崩。"""
+        target = Path(path)
+        if not target.exists():
+            self.entry.set_placeholder_text(f"文件不存在：{target}")
+            return
+        Gio.AppInfo.launch_default_for_uri(target.as_uri(), None)
+
+    def _open_url(self, url: str):
+        """开网址：配了 `general.browser` 就用那条命令，否则系统默认浏览器（xdg-open）。"""
+        if not url:
+            return
+        cmd = open_command(self.engine.config.browser, url)
+        if cmd.startswith("xdg-open "):
+            Gio.AppInfo.launch_default_for_uri(url, None)
+            return
+        threading.Thread(
+            target=lambda: subprocess.run(["bash", "-lc", cmd], capture_output=True),
+            daemon=True).start()
 
     def _hide_now(self):
         self.hide()
@@ -240,11 +282,14 @@ class QbarWindow(Gtk.Window):
         if self.get_visible():
             self.hide()
         else:
+            # 每次打开都重读 qbar.toml：改完快速链接不用重启 Qbar
+            self.engine.reload_config()
             self.entry.set_text("")
             self.entry.set_placeholder_text(PLACEHOLDER)
             self.show_all()
             self.present()
             self.entry.grab_focus()
+            self._do_search()      # 文本本来就空时 "changed" 不触发，这里主动刷新一次
 
 
 # ---------------------------------------------------------------------------

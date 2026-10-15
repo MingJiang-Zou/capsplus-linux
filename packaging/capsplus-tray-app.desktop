@@ -1,0 +1,14 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=capsplus 托盘
+Name[zh_CN]=capsplus 托盘
+Comment=Capslock+ (keyd) 托盘：启停映射 / 重载配置 / 唤起 Qbar
+Comment[zh_CN]=Capslock+ (keyd) 托盘：启停映射 / 重载配置 / 唤起 Qbar
+Exec=/home/zmj/.local/bin/capsplus-tray
+Icon=/home/zmj/project/private/capsplus-linux/assets/capsplus-on.svg
+Terminal=false
+Categories=Utility;
+Keywords=capsplus;keyd;tray;托盘;
+StartupNotify=false
+X-GNOME-UsesNotifications=true

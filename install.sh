@@ -1,11 +1,12 @@
 #!/usr/bin/env bash
-# capsplus-linux 安装脚本：只装用户侧（bin 软链、autostart），并检查依赖。
+# capsplus-linux 安装脚本：只装用户侧（bin 软链、autostart、应用菜单入口），并检查依赖。
 # 刻意**不碰** /etc/keyd —— 那份配置由你手工跑 `capsplus apply` 并审 diff。
 set -euo pipefail
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BIN_DIR="${HOME}/.local/bin"
 AUTOSTART_DIR="${HOME}/.config/autostart"
+APPS_DIR="${HOME}/.local/share/applications"
 WITH_AUTOSTART=1
 
 for arg in "$@"; do
@@ -30,6 +31,7 @@ check_cmd python3
 check_cmd fdfind
 check_cmd keyd.rvaiya
 check_runuser
+check_cmd desktop-file-validate
 
 python3 - <<'PY' || missing=1
 import sys
@@ -52,6 +54,38 @@ for name in capsplus capsplus-tray capsplus-qbar keyd-qbar-cmd; do
   echo "  $BIN_DIR/$name -> $REPO/bin/$name"
 done
 
+echo "== 安装应用菜单入口 =="
+# Qbar 启动器 + 托盘：都装成"应用菜单版"（能在 GNOME 应用网格 / Dock 里搜到、固定住）。
+# 每项是「仓内模板文件:安装后的文件名:要绑的 bin 名」；Exec/Icon 按本机重写，
+# 免得模板里写死 /home/zmj 的绝对路径，换个用户就跑不起来。
+mkdir -p "$APPS_DIR"
+for spec in "packaging/capsplus-qbar.desktop:capsplus-qbar.desktop:capsplus-qbar" \
+            "packaging/capsplus-tray-app.desktop:capsplus-tray-app.desktop:capsplus-tray"; do
+  src="$REPO/${spec%%:*}"
+  rest="${spec#*:}"
+  dst="$APPS_DIR/${rest%%:*}"
+  bin="${rest#*:}"
+  sed -e "s#^Exec=.*#Exec=$BIN_DIR/$bin#" \
+      -e "s#^Icon=.*#Icon=$REPO/assets/capsplus-on.svg#" \
+      "$src" > "$dst"
+  echo "  $dst"
+done
+if command -v desktop-file-validate >/dev/null 2>&1; then
+  if desktop-file-validate "$APPS_DIR/capsplus-qbar.desktop" "$APPS_DIR/capsplus-tray-app.desktop"; then
+    echo "  ✓ desktop-file-validate 通过"
+  else
+    echo "  ✗ desktop-file-validate 报错（上面那些行）" >&2
+    missing=1
+  fi
+else
+  echo "  · 跳过 desktop-file-validate（本机没这个命令），用 gio info 自查"
+fi
+if command -v update-desktop-database >/dev/null 2>&1; then
+  update-desktop-database "$APPS_DIR" && echo "  ✓ 已更新 desktop 数据库"
+else
+  echo "  · 跳过 update-desktop-database（本机没这个命令）"
+fi
+
 if [ "$WITH_AUTOSTART" = 1 ]; then
   echo "== 安装 autostart =="
   mkdir -p "$AUTOSTART_DIR"
@@ -60,6 +94,9 @@ if [ "$WITH_AUTOSTART" = 1 ]; then
       "$REPO/packaging/capsplus-tray.desktop" > "$AUTOSTART_DIR/capsplus-tray.desktop"
   echo "  $AUTOSTART_DIR/capsplus-tray.desktop"
   echo "  （不想开机自启就删掉它，或下次加 --no-autostart）"
+else
+  echo "== 跳过 autostart（--no-autostart）=="
+  echo "  注意：应用菜单入口不受影响，Qbar 仍能在应用网格里搜到"
 fi
 
 echo "== 状态目录 =="
@@ -78,4 +115,8 @@ cat <<EOF
   3) 状态:            capsplus status
   4) 托盘常驻:        capsplus-tray   （或 systemctl --user enable --now capsplus-tray）
   5) Qbar:            capsplus-qbar   （keyd 侧用 bin/keyd-qbar-cmd 包装）
+  6) 快速链接配置:    ${HOME}/.config/capsplus/qbar.toml
+     （首次打开 Qbar 时自动生成；托盘右键「编辑快速链接」也能开）
+
+应用菜单里现在能搜到「capsplus Qbar」和「capsplus 托盘」，可以直接固定到 Dock。
 EOF

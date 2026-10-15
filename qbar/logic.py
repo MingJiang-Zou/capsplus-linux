@@ -13,6 +13,13 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 
+try:                                      # 作为包导入（bin/ 与单测的调用方式）
+    from .search_config import QbarConfig, load_config, parse_search_cmd
+except ImportError:                       # 兜底：直接按文件路径跑时
+    import sys
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+    from qbar.search_config import QbarConfig, load_config, parse_search_cmd
+
 # ---------------------------------------------------------------------------
 # 条目模型
 # ---------------------------------------------------------------------------
@@ -24,6 +31,7 @@ KIND_LABEL = {
     "calc": "计算",
     "url": "网址",
     "hist": "历史",
+    "cfg": "配置",
 }
 
 
@@ -163,21 +171,35 @@ def looks_like_url(text: str) -> str | None:
     return None
 
 
-def browser_search_url(keyword: str) -> str:
-    from urllib.parse import quote_plus
-    return "https://www.bing.com/search?q=" + quote_plus(keyword)
+def browser_search_url(keyword: str, config: QbarConfig | None = None) -> str:
+    """用配置里的默认引擎（`general.default_search`）拼搜索地址。
+
+    没传 config 就用内置默认（必应）—— 老调用点保持可用。
+    """
+    if config is None:
+        config = QbarConfig()
+    link = config.default_link
+    if link is None:                      # 理论上不会发生（links 至少一条），兜个底
+        from urllib.parse import quote_plus
+        return "https://www.bing.com/search?q=" + quote_plus(keyword)
+    return link.target_url(keyword)
 
 
 BUILTIN_PREFIX = "->"
 
 
-def builtin_entries(text: str) -> list[Entry]:
+def builtin_entries(text: str, config: QbarConfig | None = None) -> list[Entry]:
     """`-> xxx` 内置命令。返回候选（含 calc 的即时结果）。"""
     body = text[len(BUILTIN_PREFIX):].strip()
+    default_name = (config or QbarConfig()).default_link
+    default_name = default_name.name if default_name else "默认引擎"
     out: list[Entry] = []
     if not body:
         for name, desc in (("date", "今天日期"), ("time", "当前时间"),
-                           ("calc ", "算术求值，如 -> calc 1+2*3"), ("q ", "浏览器搜索")):
+                           ("calc ", "算术求值，如 -> calc 1+2*3"),
+                           ("q ", f"网页搜索（用默认引擎：{default_name}）"),
+                           ("link", "打开快速链接配置文件" if config is None
+                            else f"打开 {config.path}")):
             out.append(Entry(f"-> {name}", "cmd", 50.0, desc, name.strip()))
         return out
 
@@ -197,11 +219,21 @@ def builtin_entries(text: str) -> list[Entry]:
                 out.append(Entry("-> calc", "cmd", 10.0, f"算不了: {exc}", ""))
         else:
             out.append(Entry("-> calc", "cmd", 50.0, "输入表达式，如 -> calc 1+2*3", "calc"))
-    elif word == "q":
-        if rest:
-            out.append(Entry(f"-> q {rest}", "url", 90.0, "浏览器搜索", browser_search_url(rest)))
+    elif word in ("q", "search", "搜"):
+        action, keyword = parse_search_cmd(body)
+        if action == "search":
+            url = browser_search_url(keyword, config)
+            out.append(Entry(f"-> q {keyword}", "url", 90.0,
+                             f"网页搜索（{default_name}）: {url}", url))
+        elif action == "hint":
+            out.append(Entry("-> q", "cmd", 50.0,
+                             f"输入关键词，如 -> q keyd 配置（引擎：{default_name}）", "q"))
+    elif word == "link":
+        path = (config or QbarConfig()).path
+        out.append(Entry(f"-> link {path}", "cfg", 90.0, "打开快速链接配置文件（改完重开 Qbar 生效）",
+                         str(path)))
     else:
-        for name in ("date", "time", "calc", "q"):
+        for name in ("date", "time", "calc", "q", "link"):
             if name.startswith(word):
                 out.append(Entry(f"-> {name}", "cmd", 30.0, "", name))
     return out
@@ -380,11 +412,38 @@ class SearchOutcome:
     needs_files: bool = True     # 是否需要异步去搜文件
 
 
+def _explicit_prefix(config: QbarConfig, text: str) -> bool:
+    """输入是不是"明确写了 trigger"（`b 关键词` / `gh关键词`），而不是纯输入猜默认引擎。
+
+    纯输入（如 `hello`）用默认引擎搜，但同时要保留 fuzzy 应用结果 ——
+    否则用户打「firefox」就再也找不到应用了。
+    判定口径必须和 QbarConfig.match() 一致：单字母 trigger 只认「`b 词`」这种带空格写法。
+    """
+    stripped = text.strip()
+    if not stripped:
+        return False
+    head, sep, _rest = stripped.partition(" ")
+    if sep:
+        return config.find(head) is not None
+    lowered = stripped.lower()
+    return any(len(link.trigger) >= 2 and lowered.startswith(link.trigger.lower())
+               for link in config.links)
+
+
 class SearchEngine:
-    def __init__(self, apps: list[Entry], history: History, file_finder: FileFinder):
+    def __init__(self, apps: list[Entry], history: History, file_finder: FileFinder,
+                 config: QbarConfig | None = None, config_path: Path | None = None):
         self.apps = apps
         self.history = history
         self.file_finder = file_finder
+        # config=None 时惰性读一次磁盘（空输入列表也会读，代价只有一次 TOML 解析）
+        self.config = config if config is not None else load_config(config_path)
+        self.config_path = self.config.path
+
+    def reload_config(self) -> QbarConfig:
+        """重读配置文件（每次打开 Qbar 调一次：改完配置不用重启进程）。"""
+        self.config = load_config(self.config_path)
+        return self.config
 
     def _history_entries(self) -> list[Entry]:
         out = []
@@ -394,10 +453,53 @@ class SearchEngine:
                              "最近使用", payload))
         return out
 
+    # ------------------------------------------------------------------
+    # 快速链接 / 网页搜索（配置驱动）
+    # ------------------------------------------------------------------
+    def _config_entry(self) -> list[Entry]:
+        """配置有问题时返回一行醒目提示（回车打开配置去改）；没问题返回空列表。"""
+        if not self.config.error:
+            return []
+        return [Entry("⚠ 快速链接配置有误", "cfg", 400.0,
+                      f"{self.config.error}（已退回内置默认引擎；回车打开 {self.config_path}）",
+                      str(self.config_path))]
+
+    def _search_entries(self, text: str) -> tuple[list[Entry], bool]:
+        """把输入解析成搜索/跳转候选。
+
+        返回 `(候选, 是否独占)`：独占 = 用户明确写了前缀或网址，结果就这一条
+        （`b 关键词` 回车即搜，不许被应用/文件挤到后面）；不独占 = 纯输入猜默认引擎搜索，
+        此时仍要并上 fuzzy 结果 —— 否则「firefox」这类纯输入就再也找不到应用了。
+        """
+        out: list[Entry] = []
+
+        # 真网址优先：`example.com/path` 不被单字母 trigger 抢走
+        url = looks_like_url(text)
+        if url:
+            out.append(Entry(url, "url", 200.0, "浏览器打开", url))
+            return out, True
+
+        hit = self.config.match(text)
+        if hit is not None:
+            out.append(Entry(hit.entry_title, "url", 200.0, hit.subtitle, hit.url))
+            explicit = _explicit_prefix(self.config, text)
+            return out, explicit
+
+        hint = self.config.no_keyword_hint(text)
+        if hint is None:
+            return out, False
+        # 固定链接没有"关键词"一说：直接给整条
+        if hint.is_fixed:
+            out.append(Entry(f"{hint.name}（固定链接）", "url", 200.0, hint.url, hint.url))
+            return out, True
+        out.append(Entry(f"{hint.name}：输入关键词", "cmd", 200.0,
+                         f"如「{hint.trigger} 关键词」；回车打开 {hint.name} 首页", hint.url))
+        return out, True
+
     def search(self, text: str) -> SearchOutcome:
         text = text.strip()
-        out: list[Entry] = []
-        need_files = True
+        out = self._config_entry()           # 配置坏了就把那行提示顶在最前面
+        explicit = False
 
         if text.startswith("=") and len(text) > 1:
             try:
@@ -407,25 +509,30 @@ class SearchEngine:
                 out.append(Entry("= 算不了", "calc", 5.0, str(exc), ""))
             return SearchOutcome(out, needs_files=False)
 
-        url = looks_like_url(text)
-        if url:
-            out.append(Entry(url, "url", 100.0, "浏览器打开", url))
-            return SearchOutcome(out, needs_files=False)
-
         if text.startswith(BUILTIN_PREFIX):
-            return SearchOutcome(builtin_entries(text), needs_files=False)
+            return SearchOutcome(out + builtin_entries(text, self.config), needs_files=False)
 
+        found, explicit = self._search_entries(text)
+        out += found
+
+        need_files = True
         if not text:
             # 空输入：列出应用（按历史排序），不去扫盘
             need_files = False
+        elif explicit:
+            # 用户写了明确前缀/网址：结果就这一条，回车即搜
+            return SearchOutcome(out, needs_files=False)
+
         pool = self.apps + self._history_entries()
         out += fuzzy_filter(text, pool)
         out += fuzzy_filter(text, [Entry("-> " + c, "cmd", 0.0)
-                                   for c in ("date", "time", "calc", "q")])
+                                   for c in ("date", "time", "calc", "q", "link")])
         return SearchOutcome(out, needs_files=need_files)
-        out += fuzzy_filter(text, [Entry("-> " + c, "cmd", 0.0)
-                                   for c in ("date", "time", "calc", "q")])
-        return SearchOutcome(out, needs_files=need_files)
+
+    def open_config(self) -> Path:
+        """确保配置文件存在（不在就写一份默认的）并返回路径。"""
+        from .search_config import ensure_config_file
+        return ensure_config_file(self.config_path)
 
     def merge_files(self, current: list[Entry], files: list[Entry], text: str) -> list[Entry]:
         """把异步文件结果并进现有列表（去重后按分数排序）。"""
