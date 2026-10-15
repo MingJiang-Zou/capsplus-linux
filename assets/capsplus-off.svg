@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- capsplus 托盘图标：映射已暂停（灰键帽 + 暂停条） -->
+<svg xmlns="http://www.w3.org/2000/svg" width="48" height="48" viewBox="0 0 48 48">
+  <rect x="6" y="12" width="36" height="24" rx="5" fill="#8b8b8b"/>
+  <rect x="10" y="16" width="28" height="16" rx="3" fill="#6e6e6e"/>
+  <rect x="19" y="19" width="4" height="10" rx="1" fill="#e0e0e0"/>
+  <rect x="25" y="19" width="4" height="10" rx="1" fill="#e0e0e0"/>
+  <circle cx="38" cy="34" r="5" fill="#e5a50a" stroke="#ffffff" stroke-width="1.5"/>
+</svg>

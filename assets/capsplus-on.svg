@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- capsplus 托盘图标：映射已启用（亮蓝键帽 + 高亮下档指示） -->
+<svg xmlns="http://www.w3.org/2000/svg" width="48" height="48" viewBox="0 0 48 48">
+  <rect x="6" y="12" width="36" height="24" rx="5" fill="#3584e4"/>
+  <rect x="10" y="16" width="28" height="16" rx="3" fill="#1c71d8"/>
+  <path d="M24 19 l6 7 h-4 v5 h-4 v-5 h-4 z" fill="#ffffff"/>
+  <circle cx="38" cy="34" r="5" fill="#2ec27e" stroke="#ffffff" stroke-width="1.5"/>
+</svg>

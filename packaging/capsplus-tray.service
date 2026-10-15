@@ -1,0 +1,17 @@
+# capsplus-tray 的 systemd user unit 模板（install.sh 会把占位符替换成真实路径后安装）。
+# 装法（二选一，autostart 与 unit 别同时开，否则两个托盘实例；脚本内部有 flock 兜底）：
+#   cp packaging/capsplus-tray.service ~/.config/systemd/user/
+#   systemctl --user daemon-reload && systemctl --user enable --now capsplus-tray.service
+[Unit]
+Description=capsplus 托盘（Capslock+ / keyd）
+PartOf=graphical-session.target
+After=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=@BIN_DIR@/capsplus-tray
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=graphical-session.target

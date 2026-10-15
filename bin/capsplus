@@ -1,0 +1,13 @@
+#!/usr/bin/env python3
+"""capsplus CLI 入口：render / apply / status。"""
+import os
+import sys
+
+REPO = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+if REPO not in sys.path:
+    sys.path.insert(0, REPO)
+
+from capsplus.apply import main  # noqa: E402
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv[1:]))
