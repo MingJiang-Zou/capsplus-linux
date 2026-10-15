@@ -85,11 +85,11 @@ zmj ALL=(root) NOPASSWD: /usr/bin/journalctl -u keyd *
 | --- | --- |
 | `Caps+e` / `Caps+d` / `Caps+s` / `Caps+f` | 光标 上/下/左/右 |
 | `Caps+a` / `Caps+g` | 按词左/右跳 |
-| `Caps+t` / `Caps+b` | 大段上/下滚（10 行 / 增强 30 行） |
+| `Caps+t` / `Caps+b` | 大段上/下滚（10 行 / 增强：翻页） |
 | `Caps+i` / `Caps+k` / `Caps+j` / `Caps+l` | 选中 上/下/左/右 |
 | `Caps+h` | 选中到词首 |
 | `Caps+u` / `Caps+o` | 选中到行首/行尾 |
-| `Caps+y` / `Caps+n` | 大段选中（10 行 / 增强 30 行） |
+| `Caps+y` / `Caps+n` | 大段选中（7 行 / 增强：选中翻页） |
 | `Caps+dot` | 选中到词尾 |
 | `Caps+comma` | 选中当前词 |
 | `Caps+w` / `Caps+r` | 删词 / 删字符 |
@@ -97,6 +97,7 @@ zmj ALL=(root) NOPASSWD: /usr/bin/journalctl -u keyd *
 | `Caps+slash` | 删到行尾 |
 | `Caps+p` / `Caps+semicolon` | 行首 / 行尾 |
 | `Caps+c` / `Caps+x` / `Caps+v` | 复制 / 剪切 / 粘贴（系统剪贴板） |
+| `Caps+q` | 打开 Qbar（启动器） |
 | `Caps+space` | 回车 |
 | `Caps+enter` | 到行尾并回车 |
 
@@ -106,12 +107,12 @@ zmj ALL=(root) NOPASSWD: /usr/bin/journalctl -u keyd *
 | --- | --- |
 | `Caps+Alt+e` / `Caps+Alt+d` / `Caps+Alt+s` / `Caps+Alt+f` | 光标大步移动（3 行 / 5 字符） |
 | `Caps+Alt+a` / `Caps+Alt+g` | 按词跳 3 次 |
-| `Caps+Alt+t` / `Caps+Alt+b` | 滚 30 行 |
+| `Caps+Alt+t` / `Caps+Alt+b` | 上/下翻页（近似的 30 行） |
 | `Caps+Alt+i` / `Caps+Alt+k` | 选中上/下 3 行 |
 | `Caps+Alt+j` / `Caps+Alt+l` | 选中左/右 5 字符 |
 | `Caps+Alt+h` | 选中左 3 个词 |
 | `Caps+Alt+u` / `Caps+Alt+o` | 选中到文首/文尾（C-home / C-end） |
-| `Caps+Alt+y` / `Caps+Alt+n` | 选中 30 行 |
+| `Caps+Alt+y` / `Caps+Alt+n` | 选中上/下翻页 |
 | `Caps+Alt+dot` | 选中到词尾 ×3 |
 | `Caps+Alt+comma` | 选中整行（home 起、S-end 止） |
 | `Caps+Alt+r` | 删到词尾 |
@@ -148,7 +149,9 @@ zmj ALL=(root) NOPASSWD: /usr/bin/journalctl -u keyd *
   下没有客户端 API（合成器不给）。
 - **热字符串（自动替换）**：没做（espanso 那条线在 Wayland 支持也有限）。
 
-与原版一致的部分：短按 Caps = 大小写切换；`capl` / `capl+alt` 两层文本操作的语义与步长。
+与原版一致的部分：短按 Caps = 大小写切换；`capl` / `capl+alt` 两层的分层思路与键位取舍。
+**步长有两处受 keyd 宏上限压缩**（见下面「硬件与 keyd 的边界」）：选中 10 行 → 7 行；
+30 行 → 翻页键。
 
 多出来的部分：托盘（启停映射、重载、看日志）、Qbar 走 fdfind 搜真实文件、系统剪贴板直接可用。
 
@@ -165,11 +168,44 @@ zmj ALL=(root) NOPASSWD: /usr/bin/journalctl -u keyd *
 3. **整份撤掉**：`sudo mv /etc/keyd/capslock-plus.conf /tmp/attic-$(date +%Y%m%d)/ && sudo systemctl restart keyd`
 4. **救命组合**：同时按 `backspace` + `escape` + `enter` 会终止 keyd（配置改坏时不至于锁死机器）。
 
-## 两条硬规矩（踩过，别忘）
+## 硬件与 keyd 的边界（都是 2026-10-15 用虚拟键盘实测出来的，不是推测）
+
+### 宏长度上限：≤ 15 个按键事件
+
+keyd 的一条 `macro(...)` 里累计发出的按键事件**超过 15 个就不可靠**：
+
+| 宏内容 | 事件数 | 实测结果 |
+| --- | --- | --- |
+| `up ×14` | 14 | ✅ 14 个 |
+| `up ×15` | 15 | ✅ 15 个 |
+| `up ×16` | 16 | ❌ 一个都不发 |
+| `up ×20 / ×30 / ×40` | 20/30/40 | ❌ 只发 4 / 14 / 8 个（乱发，数量不单调，像缓冲区溢出）|
+| `S-down ×7` | 14 | ✅ 7 次选中 |
+| `S-down ×8` | 16 | ❌ 一个都不发 |
+
+因此原版 Capslock+ 的 30 次重复（`moveUp(30)` / `selectUp(30)`）在本机**做不到**，
+按语义等价改成了翻页键；10 行的选中（= 20 个事件）也超界，压到 7 行：
+
+| 键 | 原版 | 本机实现 | 说明 |
+| --- | --- | --- | --- |
+| `Caps+T/B` | 上/下 10 行 | `macro(up/down ×10)` | 一致（10 ≤ 15）|
+| `Caps+Y/N` | 选中 10 行 | `macro(S-up/S-down ×7)` | 压到 7 行（14 个事件）|
+| `Caps+Alt+T/B` | 上/下 30 行 | `pageup` / `pagedown` | 一页 ≈ 30 行 |
+| `Caps+Alt+Y/N` | 选中 30 行 | `S-pageup` / `S-pagedown` | 选中一页 |
+
+### 复合层会多吐一对 `Alt+Ctrl` 空点
+
+按住 `Caps+Alt+任意键` 时，keyd 在真正发映射键的前后各吐一次
+`leftalt↓ leftctrl↓ leftalt↑ leftctrl↑`（实测每个 `capl+alt` 动作都如此，与层名无关）。
+这是 keyd 处理复合层的修饰键状态所致，**不是配置错误**；影响面：少数程序看到 `Alt` 轻点会闪一下
+菜单栏。不想要这一层就删掉 `capsplus/mapping_data.py` 里的 `CAPL_ALT` 段。
+
+## 三条硬规矩（踩过，别忘）
 
 1. **`macro(...)` 行尾不许有注释** —— keyd 的宏行解析器会吃掉行尾剩余内容，把注释当宏 token，
    整行报 `invalid key or action`。渲染器 `render()` 只输出 `键 = 值`，注释一律单独成行；
    `normalized_bindings()` 碰到带行尾注释的 macro 行会直接抛异常。
+3. **宏别超过 15 个事件**（见上一节），也别相信 `apply` 报的成功 —— 宏超界 keyd 不报错、只是静默不发。
 2. **`capsplus apply` 的三步顺序**：先裁保留窗口腾位 → 再快照（= 这次替换掉的那一版）→
    才安装。顺序错了会出现"日志说已回滚、文件还是坏的"（2026-10-15 演练抓到的真 bug，
    `tests/test_apply.py` 里有回归断言）。
@@ -180,6 +216,16 @@ zmj ALL=(root) NOPASSWD: /usr/bin/journalctl -u keyd *
 python3 -m unittest discover -s tests -v     # 40 个用例，纯标准库
 python3 tools/gen-readme.py                  # 重新生成 README（含键表）
 ```
+
+**真机端到端验收**（需要 root + `/dev/uinput`；造一个满键位虚拟键盘让 keyd 处理，再读回
+keyd 虚拟键盘发出的键，逐条比对期望）：
+
+```bash
+sudo python3 tools/e2e/check_mappings.py     # 30 条映射全绿 = 配置真的生效
+```
+
+它比 `capsplus render` 强的地方：render 只证明"配置能解析"，这个能证明"按下去真的发出这些键"。
+只测无破坏性的移动/选中类；剪贴板、回车、删整行类会打到当前焦点窗口，请人肉验。
 
 - 改键位只改 `capsplus/mapping_data.py`，然后 `capsplus render` 看结果、`capsplus apply` 落地。
 - `qbar/logic.py` 刻意不 import `gi`，所以 fuzzy / 算术 / 历史 / .desktop 解析都能在

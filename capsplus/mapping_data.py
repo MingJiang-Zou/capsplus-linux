@@ -38,9 +38,12 @@ C_LEFT, C_RIGHT = "C-left", "C-right"
 S_C_LEFT, S_C_RIGHT, S_C_HOME, S_C_END = "S-C-left", "S-C-right", "S-C-home", "S-C-end"
 HOME, END, ENTER, BACKSPACE, DELETE = "home", "end", "enter", "backspace", "delete"
 
-# 长按重复次数：10 / 30 这两个数字来自原版源码的重复计数，别随手改
-N_SHORT = 10
-N_LONG = 30
+# keyd 宏长度硬边界（2026-10-15 用虚拟键盘实测，别凭感觉改）：
+#   一条 macro(...) 累计发出的按键事件 ≤15 个才可靠 —— up×15 ✓ / up×16 ✗（整条丢）
+#   / up×30 → 只发出 14 个 / up×40 → 8 个（乱发，数量不单调，像缓冲区溢出）。
+# 所以原版的 30 次重复在本机不可实现，长步长改用翻页键（一页 ≈ 30 行，语义等价）。
+N_SHORT = 10    # 原版 moveUp(10) → 10 个事件，安全
+N_SELECT = 7    # 原版 selectUp(10) = 20 个事件（超界）→ 压到 7 行 = 14 个事件，实测可用
 
 
 def _rep(action: str, n: int) -> str:
@@ -75,8 +78,8 @@ CAPL = [
     ("h", S_C_LEFT),
     ("u", "S-home"),
     ("o", "S-end"),
-    ("y", _rep(S_UP, N_SHORT)),
-    ("n", _rep(S_DOWN, N_SHORT)),
+    ("y", _rep(S_UP, N_SELECT)),
+    ("n", _rep(S_DOWN, N_SELECT)),
     ("dot", S_C_RIGHT),
     ("comma", _macro(C_LEFT, S_C_RIGHT)),
     "---- 删除 ----",
@@ -92,6 +95,8 @@ CAPL = [
     ("c", "C-c"),
     ("x", "C-x"),
     ("v", "C-v"),
+    "---- Qbar ----",
+    ("q", "command(/home/zmj/.local/bin/keyd-qbar-cmd)"),
     "---- 插入 ----",
     ("space", ENTER),
     ("enter", _macro(END, ENTER)),
@@ -108,8 +113,8 @@ CAPL_ALT = [
     ("f", _macro(RIGHT, RIGHT, RIGHT, RIGHT, RIGHT)),
     ("a", _macro(C_LEFT, C_LEFT, C_LEFT)),
     ("g", _macro(C_RIGHT, C_RIGHT, C_RIGHT)),
-    ("t", _rep(UP, N_LONG)),
-    ("b", _rep(DOWN, N_LONG)),
+    ("t", "pageup"),
+    ("b", "pagedown"),
     "---- 增强版选中 ----",
     ("i", _macro(S_UP, S_UP, S_UP)),
     ("k", _macro(S_DOWN, S_DOWN, S_DOWN)),
@@ -118,8 +123,8 @@ CAPL_ALT = [
     ("h", _macro(S_C_LEFT, S_C_LEFT, S_C_LEFT)),
     ("u", _macro(S_C_HOME)),
     ("o", _macro(S_C_END)),
-    ("y", _rep(S_UP, N_LONG)),
-    ("n", _rep(S_DOWN, N_LONG)),
+    ("y", "S-pageup"),
+    ("n", "S-pagedown"),
     ("dot", _macro(S_C_RIGHT, S_C_RIGHT, S_C_RIGHT)),
     ("comma", _macro(HOME, "S-end")),
     "---- 增强版删除 ----",
@@ -145,11 +150,11 @@ IDS = "*"
 KEY_TABLE_NOTES = {
     "e/d/s/f": "光标 上/下/左/右",
     "a/g": "按词左/右跳",
-    "t/b": "大段上/下滚（10 行 / 增强 30 行）",
+    "t/b": "大段上/下滚（10 行 / 增强：翻页）",
     "i/k/j/l": "选中 上/下/左/右",
     "h": "选中到词首",
     "u/o": "选中到行首/行尾",
-    "y/n": "大段选中（10 行 / 增强 30 行）",
+    "y/n": "大段选中（7 行 / 增强：选中翻页）",
     "dot": "选中到词尾",
     "comma": "选中当前词",
     "w/r": "删词 / 删字符",
@@ -157,6 +162,7 @@ KEY_TABLE_NOTES = {
     "slash": "删到行尾",
     "p/semicolon": "行首 / 行尾",
     "c/x/v": "复制 / 剪切 / 粘贴（系统剪贴板）",
+    "q": "打开 Qbar（启动器）",
     "space": "回车",
     "enter": "到行尾并回车",
 }
@@ -165,12 +171,12 @@ KEY_TABLE_NOTES = {
 KEY_TABLE_NOTES_ALT = {
     "e/d/s/f": "光标大步移动（3 行 / 5 字符）",
     "a/g": "按词跳 3 次",
-    "t/b": "滚 30 行",
+    "t/b": "上/下翻页（近似的 30 行）",
     "i/k": "选中上/下 3 行",
     "j/l": "选中左/右 5 字符",
     "h": "选中左 3 个词",
     "u/o": "选中到文首/文尾（C-home / C-end）",
-    "y/n": "选中 30 行",
+    "y/n": "选中上/下翻页",
     "dot": "选中到词尾 ×3",
     "comma": "选中整行（home 起、S-end 止）",
     "r": "删到词尾",
