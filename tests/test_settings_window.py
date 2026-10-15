@@ -133,6 +133,48 @@ class TestSettingsWindow(unittest.TestCase):
     # ------------------------------------------------------------------
     # 真起窗
     # ------------------------------------------------------------------
+    def _open_a_real_dropdown(self):
+        """真开一个下拉（独立 combo + 临时窗口）—— 判据要靠真窗口，不靠 mock。"""
+        model = Gtk.ListStore(str)
+        model.append(["甲"]); model.append(["乙"])
+        combo = Gtk.ComboBox.new_with_model(model)
+        cell = Gtk.CellRendererText()
+        combo.pack_start(cell, True)
+        combo.add_attribute(cell, "text", 0)
+        holder = Gtk.Window()
+        holder.add(combo)
+        holder.show_all()
+        self.pump(0.25)
+        combo.popup()                    # 没真实按键事件，GTK 会给一句 warning，无害
+        self.pump(0.25)
+        return holder, combo
+
+    def test_scroll_closes_floating_dropdown(self):
+        """明江实测的 bug：Wayland 下表格滚动，下拉悬浮在原处不跟着走。
+        修法是"滚动即结束该格的编辑会话"，这里用**真展开的下拉**验证计数真的加了。"""
+        view = self.window.links_page.view
+        self.assertEqual(view.dropdown_closes, 0)
+        holder, combo = self._open_a_real_dropdown()
+        try:
+            view.get_parent().get_vadjustment().emit("value-changed")
+            self.assertGreaterEqual(view.dropdown_closes, 1, "有悬浮下拉时滚动没收掉它")
+        finally:
+            combo.popdown(); holder.destroy(); self.pump(0.2)
+
+    def test_scroll_without_dropdown_does_not_disturb_text_cell(self):
+        """没有下拉展开时不许动编辑会话 —— 否则用户正在敲的普通文本格会被滚动打断。"""
+        view = self.window.links_page.view
+        other = self.window.mapping_page.view
+        view.get_parent().get_vadjustment().emit("value-changed")
+        self.assertEqual(view.dropdown_closes, 0)
+        self.assertEqual(other.dropdown_closes, 0)
+
+    def test_both_tables_have_the_dropdown_guard_wired(self):
+        """两页表格都得挂上这个兜底（按键页的下拉是 has_entry=True，另一条代码路径）。"""
+        for page in (self.window.links_page, self.window.mapping_page):
+            self.assertTrue(hasattr(page.view, "dropdown_closes"),
+                            f"{type(page).__name__} 的表格没挂滚动收下拉的钩子")
+
     def test_window_is_really_mapped(self):
         display = Gtk.Window.get_display(self.window) if hasattr(Gtk.Window, "get_display") else None
         from gi.repository import Gdk

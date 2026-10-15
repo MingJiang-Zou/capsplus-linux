@@ -31,7 +31,7 @@ if str(REPO) not in sys.path:
 
 import gi  # noqa: E402
 gi.require_version("Gtk", "3.0")
-from gi.repository import GLib, Gtk, Pango  # noqa: E402
+from gi.repository import Gdk, GLib, Gtk, Pango  # noqa: E402
 
 from capsplus import mapping_overrides as MO  # noqa: E402
 from capsplus import settings_logic as SL  # noqa: E402
@@ -60,6 +60,57 @@ def markup(text: str, color: str = "") -> str:
     """灰/红/黄字都走 pango markup；转义交给 GLib（要显示的都是用户自己输入的文本）。"""
     escaped = GLib.markup_escape_text(text)
     return f'<span foreground="{color}">{escaped}</span>' if color else escaped
+
+
+
+
+def _open_dropdown_windows() -> list:
+    """当前**展开着**的下拉窗口（组合框 popup / 下拉菜单）。
+
+    用它判断"屏幕上是否真有一个悬浮的下拉"，比猜编辑状态可靠 —— Wayland 下这个下拉是
+    独立 surface，type hint 是 COMBO / DROPDOWN_MENU。
+    （坑：`Gdk.Window.get_window_type()` 返回的是实现种类 TOPLEVEL/TEMP，不是提示种类，
+    得用 `Gtk.Window.get_type_hint()`。）
+    """
+    kinds = (Gdk.WindowTypeHint.COMBO, Gdk.WindowTypeHint.DROPDOWN_MENU,
+             Gdk.WindowTypeHint.POPUP_MENU)
+    found = []
+    for w in Gtk.Window.list_toplevels():
+        try:
+            if not (w.get_realized() and w.is_visible()):
+                continue
+            if w.get_type_hint() in kinds:      # 注意：用 type hint，不是 get_window_type()
+                found.append(w)
+        except (AttributeError, TypeError, RuntimeError):
+            continue              # 正在销毁的 toplevel 会炸，跳过就算
+    return found
+
+
+def keep_dropdown_attached_to_scroll(view, scroll, renderer) -> None:
+    """Wayland 下表格里的下拉（`CellRendererCombo`）是**独立 surface**：表格滚动时它不跟着走，
+    就悬浮在原来的位置上（2026-10-15 明江实测反馈的 bug）。
+
+    GTK3 在这个构建里既不暴露 `editing-started` 信号（实测 `GObject.signal_lookup` 查不到），
+    也没有"popup 跟随父窗口"的机制，所以收口是：**一旦滚动就结束这个格子的编辑会话**
+    （下拉随之销毁；格子和内容都还在，再点一次重新展开）。
+    只在"确实有下拉展开"时才动手 —— 否则会把用户正在敲的普通文本格也一起打断。
+
+    `view.dropdown_closes` 计数给单测断言用（证明"滚一下真收了"，不靠人眼）。
+    """
+    view.dropdown_closes = 0
+
+    def _scrolled(_adj):
+        if not _open_dropdown_windows():
+            return                       # 没有悬浮下拉：别打扰正在输入的文本格
+        try:
+            renderer.stop_editing(True)
+        except (AttributeError, TypeError):
+            return
+        view.dropdown_closes += 1
+
+    for adj in (scroll.get_vadjustment(), scroll.get_hadjustment()):
+        if adj is not None:
+            adj.connect("value-changed", _scrolled)
 
 
 # ===========================================================================
@@ -216,6 +267,7 @@ class LinksPage(Gtk.Box):
             if index == 2:                                   # 类型 = 下拉（四个固定值）
                 renderer = Gtk.CellRendererCombo(model=self.type_model, text_column=1,
                                                  has_entry=False)
+                dropdown_renderer = renderer
                 renderer.connect("changed", self._on_type_changed)
                 column = Gtk.TreeViewColumn(title, renderer, text=3)
             else:                                            # 其余三格可直接编辑
@@ -234,6 +286,7 @@ class LinksPage(Gtk.Box):
         scroll.set_min_content_height(300)
         scroll.add(self.view)
         self.pack_start(scroll, True, True, 0)
+        keep_dropdown_attached_to_scroll(self.view, scroll, dropdown_renderer)
 
         bar = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
         for label, handler in (("新增", self.on_add), ("删除", self.on_delete),
@@ -502,6 +555,7 @@ class MappingPage(Gtk.Box):
             if index == 2:
                 renderer = Gtk.CellRendererCombo(model=self.action_model, text_column=0,
                                                  has_entry=True)      # 下拉 + 自由输入
+                dropdown_renderer = renderer
                 renderer.set_property("editable", True)
                 renderer.connect("edited", self._on_action_edited)
                 renderer.connect("changed", self._on_action_edited)
@@ -520,6 +574,7 @@ class MappingPage(Gtk.Box):
         scroll.set_min_content_height(330)
         scroll.add(self.view)
         self.pack_start(scroll, True, True, 0)
+        keep_dropdown_attached_to_scroll(self.view, scroll, dropdown_renderer)
 
         bar = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
         for label, handler in (("恢复默认（删这条覆盖）", self.on_restore),
