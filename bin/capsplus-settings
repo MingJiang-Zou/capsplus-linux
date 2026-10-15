@@ -1,0 +1,14 @@
+#!/usr/bin/env python3
+"""capsplus-settings 入口（GTK3 设置窗口：快速链接 / 通用 / 按键映射）。"""
+import os
+import sys
+
+REPO = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+if REPO not in sys.path:
+    sys.path.insert(0, REPO)
+
+sys.path.insert(0, os.path.join(REPO, "settings"))
+from settings_app import main  # noqa: E402
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv[1:]))

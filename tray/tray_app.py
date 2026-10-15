@@ -27,6 +27,7 @@ from gi.repository import AyatanaAppIndicator3 as AppIndicator  # noqa: E402
 from gi.repository import GLib, Gtk  # noqa: E402
 
 from capsplus import __version__, apply as cap_apply  # noqa: E402
+from qbar.logic import settings_launch_command  # noqa: E402
 from qbar.search_config import ensure_config_file, shell_quote  # noqa: E402
 
 STATE_DIR = Path.home() / ".local/state/capsplus"
@@ -66,6 +67,7 @@ class Tray:
         self.entries = {}
         for label, handler in (
             ("打开 Qbar", self.on_qbar),
+            ("设置…", self.on_settings),
             ("编辑快速链接", self.on_edit_links),
             ("启用 / 暂停映射", self.on_toggle),
             ("重载配置", self.on_reload),
@@ -199,6 +201,23 @@ class Tray:
 
     def on_qbar(self, _item):
         self.shell(f"{USER_ENV} capsplus-qbar")
+
+    def on_settings(self, _item):
+        """设置窗口（三页：快速链接 / 通用 / 按键映射）。
+
+        与 on_qbar 不同，这里**不用** USER_ENV 包装：托盘本来就跑在明江的 Wayland 会话里，
+        直接 fork 就继承了会话环境；而 `runuser` 需要 root，非 root 调用只会失败。
+        窗口自带单实例（socket），重复点只是把已经开着的那扇拉到前台。
+        """
+        cmd = settings_launch_command()
+        if not cmd:
+            self.notify("没找到 capsplus-settings，先跑一次 ./install.sh")
+            return
+        try:
+            subprocess.Popen(cmd, stdin=subprocess.DEVNULL,
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except OSError as exc:
+            self.notify(f"打不开设置窗口: {exc}"[:80])
 
     def on_edit_links(self, _item):
         """打开 Qbar 的快速链接配置；文件不在就先写一份默认的（带中文注释）。"""

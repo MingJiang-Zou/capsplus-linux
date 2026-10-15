@@ -18,13 +18,12 @@ sys.path.insert(0, str(REPO))
 
 from capsplus import apply as cap_apply                      # noqa: E402
 from capsplus import mapping_data as MD                      # noqa: E402
-from capsplus.mapping_overrides import render_overrides      # noqa: E402
+from capsplus.mapping_overrides import Overrides, merge_overrides, render_overrides  # noqa: E402
 from capsplus.render import render                           # noqa: E402
 from capsplus.settings_logic import (                        # noqa: E402
-    MACRO_EVENT_LIMIT, action_problem, binding_deltas, changed_bindings, changed_lines,
-    copy_values, delete_override, macro_event_count, macro_warning, override_count,
-    override_toml_hint, run_apply, snapshot_config, validate_key_name, validate_section,
-    set_override,
+    MACRO_EVENT_LIMIT, action_problem, binding_deltas, changed_bindings, copy_values,
+    delete_override, macro_event_count, macro_warning, override_toml_hint, run_apply,
+    snapshot_config, validate_key_name, validate_section, set_override,
 )
 
 
@@ -136,12 +135,20 @@ class TestOverrideEditing(unittest.TestCase):
         clone["capl"]["e"] = "down"
         self.assertEqual(original["capl"]["e"], "up")
 
-    def test_count_and_changed_lines_order(self):
-        values = {"capl+alt": {"b": "pagedown"}, "capl": {"e": "pageup", "t": "up"}}
-        self.assertEqual(override_count(values), 3)
-        # 顺序 = ALLOWED_SECTIONS 的顺序，状态栏文案才不会每次跳动
-        self.assertEqual(changed_lines(values),
-                         ["[capl] e -> pageup", "[capl] t -> up", "[capl+alt] b -> pagedown"])
+    def test_changed_bindings_order_follows_the_rendered_text(self):
+        """diff 的行序 = keyd 文本里的出现顺序（先 capl 后 capl+alt），不看 dict 的插入顺序。
+
+        状态栏里同一次改动每次显示的顺序要一样，否则用户会以为界面在乱跳。
+        """
+        values = {"capl+alt": {"t": "up"}, "capl": {"e": "pageup"}}     # 故意把 alt 写在前面
+        deltas = changed_bindings(render(), render(merge_overrides(Overrides(values=values))))
+        self.assertEqual(deltas, ["[capl] e: up -> pageup", "[capl+alt] t: pageup -> up"])
+
+    def test_override_with_the_default_value_produces_no_delta(self):
+        """覆盖层里写了个和默认一模一样的值 = 没有变化（界面也会顺手把这种覆盖删掉）。"""
+        values = {"capl+alt": {"b": "pagedown"}}     # b 的默认就是 pagedown
+        self.assertEqual(changed_bindings(render(),
+                                          render(merge_overrides(Overrides(values=values)))), [])
 
     def test_written_file_uses_quoted_section_names(self):
         """界面显示 `[capl+alt]`，**写盘必须**是 `["capl+alt"]`（+ 不是 TOML 裸键字符）。"""

@@ -12,13 +12,16 @@ xcape / xmodmap / AutoKey 那类 X11 工具全部出局，keyd 是唯一通吃�
 ```
 capsplus/       CLI 与映射真相源（render / apply / status）
   mapping_data.py   键位数据 + 分组注释（改这里）
-  render.py         渲染 keyd 配置 / 归一化校验 / 生成 README 键表
+  render.py         渲染 keyd 配置 / 归一化校验 / 生成 README 键表 / binding_rows 给界面用
+  mapping_overrides.py  用户键位覆盖层 `~/.config/capsplus/mappings.toml`（只存改过的那几条）
   apply.py          备份 -> 安装 -> reload -> 查错 -> 必要时回滚
+  settings_logic.py 设置窗口的纯逻辑层（校验 / 覆盖层增删 / 宏事件计数 / apply 文案），不 import gi
 tray/           GTK3 + AyatanaAppIndicator3 托盘（capsplus-tray）
 qbar/           GTK3 浮层启动器（capsplus-qbar）
   logic.py          不依赖 gi 的纯逻辑层（fuzzy / 算术 / 历史 / 搜索编排）
-  search_config.py  快速链接与网页搜索的 TOML 配置（同样不 import gi）
-bin/            capsplus / capsplus-tray / capsplus-qbar / keyd-qbar-cmd
+  search_config.py  快速链接的 TOML 配置层：四种类型、校验、预览、写回（同样不 import gi）
+settings/       GTK3 设置窗口（capsplus-settings）—— **只摆控件**，算法都在上面那两个纯层里
+bin/            capsplus / capsplus-tray / capsplus-qbar / capsplus-settings / keyd-qbar-cmd
 assets/         自画的两个托盘 SVG（启用/暂停）
 packaging/      应用菜单 .desktop（只放 Qbar 一条）、autostart .desktop、systemd --user unit
 tests/          标准库 unittest（无 pytest 依赖）
@@ -51,10 +54,60 @@ capsplus apply           # 备份 -> 装到 /etc/keyd/capslock-plus.conf -> relo
 capsplus apply --dry-run # 只渲染并自检，不碰系统
 capsplus status          # 服务状态 + 当前配置摘要 + 与渲染是否一致 + 最近一条日志
 
-capsplus-tray            # 托盘：打开 Qbar / 编辑快速链接 / 启停映射 / 重载 / 打开映射文件 / 最近日志 / 关于
+capsplus-tray            # 托盘：打开 Qbar / 设置… / 编辑快速链接 / 启停映射 / 重载 / 打开映射文件 / 最近日志 / 关于
 capsplus-qbar            # Qbar：第一次起窗口，已在运行则切换显示/隐藏
 capsplus-qbar --hidden   # 常驻不显示（给 keyd 唤起用）
+capsplus-settings        # 设置窗口（GTK3，三页）：快速链接 / 通用 / 按键映射
 ```
+
+## 设置窗口 `capsplus-settings`
+
+不想手改 TOML 就用它。三页（`Gtk.Notebook`）：
+
+| 页 | 管的东西 | 写到哪个文件 |
+| --- | --- | --- |
+| **快速链接** | `trigger` / 名称 / 类型（四种，下拉）/ 目标；增、删（带确认）、上下移动；选中一行填示例词就出**实时预览**（`输入 b 关键词 → 最终 URL`）；trigger 完全重复 = 红字拦下、**拒绝写盘** | `~/.config/capsplus/qbar.toml` |
+| **通用** | `default_search`（下拉只列 search 类）、`browser`（留空=系统默认）、`hide_on_focus_out` 开关；每项右侧一行灰字解释 | 同上（两页写同一个文件，任一页点保存都会整体写回） |
+| **按键映射** | 当前生效表（层/键/动作/说明/**来源=默认\|覆盖**）；「动作」= 常用下拉 + 允许自由输入，当场用 `validate_action` + `load_known_keys` 校验；「恢复默认」= 把这条从覆盖层删掉 | `~/.config/capsplus/mappings.toml`（覆盖层） |
+
+入口只有三个：**托盘「设置…」**、**Qbar 里敲 `-> settings`**、**命令行 `capsplus-settings`**。
+刻意**不装** 应用菜单 `.desktop`（应用里条目越多越难找，上一轮刚删掉一条冗余的）。
+
+界面分工：`settings/settings_app.py` 只摆控件，校验/增删/预览/TOML 写回/apply 流程全在
+`capsplus/settings_logic.py` 与 `qbar/search_config.py` 这两个不 import `gi` 的纯层里，
+所以这部分逻辑在没有显示服务器的环境也能跑单测。
+
+三条从界面上就防住的坑（都写进了状态栏/灰字）：
+
+- **宏长度**：单条 `macro(...)` 累计 ≤15 个按键事件，超了 keyd **整条静默丢掉**（不是截断）。
+  界面上超过就出黄字并写明几个事件。
+- **段名写法**：界面上显示 keyd 的 `[capl+alt]`，**写进 TOML 必须是 `["capl+alt"]`**
+  （`+` 不是 TOML 裸键字符），由 `toml_table()` 统一处理，界面不许绕过它自己拼。
+- **`[main]` 改不了**：那是 Caps 的 `overload` 声明，改错就连不进层；覆盖层的
+  `ALLOWED_SECTIONS` 只认 `[capl]` / `[capl+alt]`，表格里也压根不会列出 `[main]`。
+
+按键页的两个按钮分得很清：「只试渲染（不动系统）」= `capsplus apply --dry-run` 同一件事，
+只渲染 + 归一化自检；「应用」才真的写 `/etc/keyd` 并 reload，**出错自动回滚上一版**
+（备份在 `~/.local/state/capsplus/keyd-conf-backup/`，需要免密 sudo，见下面那一节）。
+
+单实例：`~/.local/state/capsplus/settings.sock`。第二次启动（含 `-> settings`）
+只把已经开着的那扇拉到前台 —— 开两扇窗互相覆盖对方的改动是最容易丢配置的事故。
+
+### 用户键位覆盖层 `~/.config/capsplus/mappings.toml`
+
+**仓库默认映射仍是唯一真相源**，覆盖层只放"改过的那几条"，渲染时 `默认 + 覆盖` 合并：
+
+```toml
+[capl]
+e = "up"
+
+["capl+alt"]          # 增强层必须加引号，裸写 [capl+alt] 是 TOML 语法错误
+t = "up"
+```
+
+好处：没改过的键跟着仓库升级走（不会被一份老副本钉死）；「恢复默认」= 删掉那一行；
+没有覆盖层时渲染结果**逐字节不变**。文件语法坏了不会崩：`capsplus status` 与界面都会
+报出原因，并当"没有覆盖层"处理。
 
 `capsplus apply` 的输出语义：成功打印 `OK 已应用并 reload；备份: <路径>`；
 keyd 报错时**自动回滚**到被本次替换掉的那一版、再 reload，然后以非 0 退出并把 `ERROR:` 行打出来。
@@ -112,7 +165,8 @@ zmj ALL=(root) NOPASSWD: /usr/bin/journalctl -u keyd *
 | `=` 开头 | 算术求值，如 `=1+2*3`；结果回车即复制。用 `ast` 白名单求值，**不用 eval** |
 | `-> date` / `-> time` | 日期 / 时间（回车复制） |
 | `-> calc <表达式>` | 算术，同上 |
-| `-> link` | 打开快速链接配置文件 |
+| `-> link` | 打开快速链接配置文件（TOML） |
+| `-> settings` | **打开设置窗口**（快速链接 / 通用 / 按键映射三页）；窗口已开着就拉到前台 |
 | `http(s)://…` / `xxx.com` | 浏览器打开（真网址优先，不会被单字母 trigger 抢走） |
 
 键盘：`Esc` 关闭、`↑/↓` 选择、`Enter` 打开。历史记在
@@ -135,9 +189,34 @@ url = "https://github.com/search?q={q}"     # {q} = 关键词做 URL 编码填�
 | --- | --- | --- |
 | `default_search` | `[general]` | 不带前缀的输入用哪个引擎。填某个 link 的 `trigger`；填了不存在的值会在结果里提示，并退回第一条可用引擎 |
 | `browser` | `[general]` | 留空 = 系统默认浏览器（xdg-open）；填了 = 用命令模板，如 `"firefox --new-tab {url}"` |
+| `hide_on_focus_out` | `[general]` | 默认 `true`：点别处就收起 Qbar（等价于再按一次 Caps+Q，这样下次一次就能唤起）。改成 `false` 则失焦不隐藏，被盖住时靠 `Caps+Q` 拉回前台 |
 | `trigger` | `[[link]]` | 前缀，**不许重复、不许含空格**；重复的会被跳过并在结果里提示 |
 | `name` | `[[link]]` | 结果行里的引擎名，如「必应搜索：关键词」 |
-| `url` | `[[link]]` | URL 模板。`{q}` = 关键词 URL 编码（空格变 `+`）；`{q_raw}` = 原样嵌入（给 `ghcli cli` 这类要保留空格的路径）；**两个都不放 = 固定链接**，整条直接打开 |
+| `type` | `[[link]]` | 链接类型：`search` / `url` / `app` / `file`。**可以不写**：不写就按老规则推断（有 `{q}` = `search`，没有 = `url`），所以老配置一行都不用改；`app` / `file` **必须显式写**（`code` 这种目标既像命令又像路径，猜错就会去开浏览器）。设置界面写回时会把四种都显式写出来 |
+| `url` | `[[link]]` | 目标。`{q}` = 关键词 URL 编码（空格变 `+`）；`{q_raw}` = 原样嵌入（给 `ghcli cli` 这类要保留空格的路径）；**两个都不放 = 固定链接**，整条直接打开。`target =` 是它的别名，两个键都认、只存一份 |
+
+### 四种类型（`type`）
+
+| 类型 | 目标写法 | 敲 `trigger` 之后发生什么 |
+| --- | --- | --- |
+| `search` | `https://…?q={q}` 或 `{q_raw}` | 把关键词填进模板，交浏览器（`browser` 配了就用那条命令） |
+| `url` | 固定网址（**不许**带 `{q}`） | 直接开这条地址，不要关键词（如 `ghp`） |
+| `app` | `.desktop` 名（`firefox` / `firefox.desktop`）**或一条命令** | 名字能对上 `.desktop` 就走桌面启动器；**带了参数就走 shell 命令**（`code --diff {q}`）—— 桌面启动器不吃参数，硬套会把参数丢掉。命令里的 `{q}` 按**原样**填（URL 编码在参数里没意义） |
+| `file` | 文件或目录路径，`~` 会展开；相对路径按家目录算 | 用系统默认程序打开该文件 / 目录。路径不存在也照样列出并写明「（路径不存在）」，不会静默消失 |
+
+```toml
+[[link]]
+trigger = "co"
+name = "代码"
+type = "app"
+url = "code --diff {q}"          # co a b → code --diff a b（原样，不编码）
+
+[[link]]
+trigger = "no"
+name = "笔记目录"
+type = "file"
+url = "~/notes"                  # no → 打开 /home/<你>/notes
+```
 
 三种 `url` 各举一例（默认配置里都能看到）：
 
@@ -167,6 +246,15 @@ url = "https://github.com/pulls"              # ghp      → 固定链接，直�
 副标题写清原因（如 `TOML 语法错误: … at line 3`），回车打开配置去改；
 同时自动退回内置默认引擎，Qbar 照常能搜。
 
+**设置界面写回时的两条口径**（`tomllib` 只读，写回是自己拼模板，所以得有口径）：
+
+- **顺序**：写回的 `[[link]]` 先后 = 表格里从上到下的顺序，不排序、不去重、不改名。
+- **注释**：文件**开头**那段注释原样带回去（你自己的说明请写在开头）；
+  `[general]` 与每条 `[[link]]` 中间的注释由模板重新生成 —— 保真条目内注释要自己写一份
+  保留注释的 TOML 解析器，代价远大于收益。写盘前原件会存到
+  `~/.local/state/capsplus/config-backup/<时间戳>/`（超过 20 份的旧副本 mv 进焚化炉），
+  所以真写坏了也有得比。
+
 ## 与原版 Capslock+ 的差异
 
 **明确不做**（2026-10-15 明江拍板；不是"待办"，别再来回讨论）：
@@ -182,6 +270,8 @@ url = "https://github.com/pulls"              # ghp      → 固定链接，直�
 其余未实现（**已知差异，不是 bug**）：
 
 - **Qbar 的 `->` 快速添加设置项**、**文件夹上下级浏览**：没做，Qbar 只做搜索/打开。
+  （设置窗口 2026-10-15 已经单独做了 —— 是 `capsplus-settings` 与 `-> settings` 这条命令，
+  不是"在 Qbar 里直接改设置"，两者不是一回事，别混淆。）
 - **TabScript（JS 脚本）**：没做。
 - **F2 数学板 / F3 翻译 / F4 透明 / F6 置顶 / F12 切剪贴板**：没做；其中"置顶/透明"在 Wayland
   下没有客户端 API（合成器不给）。
@@ -239,7 +329,7 @@ keyd 的一条 `macro(...)` 里累计发出的按键事件**超过 15 个就不�
 这是 keyd 处理复合层的修饰键状态所致，**不是配置错误**；影响面：少数程序看到 `Alt` 轻点会闪一下
 菜单栏。不想要这一层就删掉 `capsplus/mapping_data.py` 里的 `CAPL_ALT` 段。
 
-## 三条硬规矩（踩过，别忘）
+## 硬规矩（踩过，别忘）
 
 1. **`macro(...)` 行尾不许有注释** —— keyd 的宏行解析器会吃掉行尾剩余内容，把注释当宏 token，
    整行报 `invalid key or action`。渲染器 `render()` 只输出 `键 = 值`，注释一律单独成行；
@@ -248,13 +338,25 @@ keyd 的一条 `macro(...)` 里累计发出的按键事件**超过 15 个就不�
 2. **`capsplus apply` 的三步顺序**：先裁保留窗口腾位 → 再快照（= 这次替换掉的那一版）→
    才安装。顺序错了会出现"日志说已回滚、文件还是坏的"（2026-10-15 演练抓到的真 bug，
    `tests/test_apply.py` 里有回归断言）。
+4. **带 `+` 的段名在 TOML 里必须加引号**：`[capl+alt]` 是**语法错误**（裸键只允许
+   `A-Za-z0-9_-`），必须写 `["capl+alt"]`。界面上显示 keyd 的写法、写盘一律过
+   `mapping_overrides.toml_table()`，不许自己拼表头。
+5. **按段取渲染结果不许 `text.split("[capl+alt]")`**：`render()` 的头部注释里**也写着**
+   `[capl]` / `[capl+alt]` 这两个字串，按字串切会切错位置。要逐行判断段头
+   （`[` 开头且 `]` 结尾的裸行，注释行跳过）—— `settings_logic._binding_map()` 就是这么做的，
+   `tests/test_settings_logic.py::TestRenderDiff` 用带这两个字串的注释头把它锁住了。
 
 ## 开发
 
 ```bash
-python3 -m unittest discover -s tests -v     # 94 个用例，纯标准库（无 pytest）
+python3 -m unittest discover -s tests -v     # 233 个用例，纯标准库（无 pytest）
 python3 tools/gen-readme.py                  # 重新生成 README（含键表）
 ```
+
+`tests/test_settings_window.py` 是**真起窗**的界面测试（会断言窗口真的 `mapped`、
+三页控件与表格行数、编辑→校验→写盘→恢复默认整条链）：它把两个配置路径与 state 目录
+都指到临时目录，所以不碰 `~/.config/capsplus/`；连不上显示服务器时整个模块自动 skip
+（`python3 -m unittest` 里表现为 `skipped=20`），headless / SSH 下跑单测不会被它卡住。
 
 `tests/test_qbar_search.py` 专门锁快速链接的行为：前缀最长匹配、单字母 trigger 必须带空格、
 默认引擎、URL 编码（中文/空格/`&`）、`{q_raw}`、固定链接、坏 TOML 容错、

@@ -47,9 +47,20 @@ except Exception as exc:  # noqa: BLE001
     sys.exit(1)
 PY
 
+# 设置窗口（capsplus-settings）只要能连上显示服务器就能起；
+# 连不上不算装坏（SSH / headless 里跑安装是常事），所以这里只提示、不置 missing。
+python3 - <<'PY' || true
+import gi
+gi.require_version("Gtk", "3.0")
+from gi.repository import Gtk
+ok, _ = Gtk.init_check()
+print("  ✓ 显示服务器可用：capsplus-settings 能起窗" if ok
+      else "  · 当前连不上显示服务器：capsplus-settings 装了也起不了窗（其余功能不受影响）")
+PY
+
 echo "== 安装 bin 软链 =="
 mkdir -p "$BIN_DIR"
-for name in capsplus capsplus-tray capsplus-qbar keyd-qbar-cmd; do
+for name in capsplus capsplus-tray capsplus-qbar capsplus-settings keyd-qbar-cmd; do
   ln -sfn "$REPO/bin/$name" "$BIN_DIR/$name"
   echo "  $BIN_DIR/$name -> $REPO/bin/$name"
 done
@@ -118,6 +129,8 @@ cat <<EOF
   5) Qbar:            capsplus-qbar   （keyd 侧用 bin/keyd-qbar-cmd 包装）
   6) 快速链接配置:    ${HOME}/.config/capsplus/qbar.toml
      （首次打开 Qbar 时自动生成；托盘右键「编辑快速链接」也能开）
-
-应用菜单里现在能搜到「capsplus Qbar」和「capsplus 托盘」，可以直接固定到 Dock。
+  7) 设置窗口:        capsplus-settings
+     三页：快速链接 / 通用 / 按键映射；改完按键要点「应用」才生效，出错自动回滚。
+     入口只有三个：托盘「设置…」、Qbar 里输 -> settings、命令行 capsplus-settings。
+     刻意没装 .desktop —— 应用菜单里条目越多越难找（上一轮刚删掉一条）。
 EOF

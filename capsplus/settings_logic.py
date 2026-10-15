@@ -138,19 +138,6 @@ def delete_override(values: dict[str, dict[str, str]], section: str,
     return out
 
 
-def override_count(values: dict[str, dict[str, str]]) -> int:
-    return sum(len(table) for table in values.values())
-
-
-def changed_lines(values: dict[str, dict[str, str]]) -> list[str]:
-    """覆盖层里每条改动渲染成 `[段] 键 -> 动作`（状态栏/预览用，顺序固定）。"""
-    out = []
-    for section in ALLOWED_SECTIONS:
-        for key, action in (values.get(section) or {}).items():
-            out.append(f"[{section}] {key} -> {action}")
-    return out
-
-
 # ---------------------------------------------------------------------------
 # 渲染 diff：默认 vs 默认+覆盖（界面「预览改动」用，绝不碰系统）
 # ---------------------------------------------------------------------------
@@ -199,13 +186,26 @@ def _binding_map(text: str) -> dict[tuple[str, str], str]:
 # ---------------------------------------------------------------------------
 # 应用（「应用」按钮的整条流程；任何异常都收成状态栏文本，不抛给 GUI）
 # ---------------------------------------------------------------------------
-def run_apply(dry_run: bool = False) -> tuple[bool, str]:
+def run_apply(dry_run: bool = False, overrides_path: Path | None = None,
+              known_keys: set[str] | None = None) -> tuple[bool, str]:
     """返回 `(是否成功, 状态栏文案)`。文案里带上 OverrideError / journal 错误行。
 
     dry_run=True 只渲染 + 归一化自检，**不碰 /etc/keyd**（界面自检、单测都走这条）。
+    `overrides_path` 指定覆盖层时用**它自己渲染**再走 apply：界面把配置指到临时目录做演练，
+    绝不能出现"写的是临时文件、渲染的是 ~/.config 那份"这种两张皮。
     """
+    text = None
+    if overrides_path is not None:
+        from .mapping_overrides import load_and_merge
+        from .render import render
+        data, overrides = load_and_merge(Path(overrides_path), known_keys)
+        if overrides.error:
+            return False, f"覆盖层有问题，没有应用：{overrides.path} —— {overrides.error}"
+        if overrides.errors:
+            return False, ("覆盖层有问题，没有应用：\n  " + "\n  ".join(overrides.errors))
+        text = render(data)
     try:
-        result = cap_apply.apply(dry_run=dry_run)
+        result = cap_apply.apply(dry_run=dry_run, text=text)
     except OverrideError as exc:
         return False, f"覆盖层有问题，没有应用：\n{exc}"
     except cap_apply.ApplyError as exc:
@@ -218,19 +218,6 @@ def run_apply(dry_run: bool = False) -> tuple[bool, str]:
     tail = result.log.strip().splitlines()[-1] if result.log.strip() else ""
     backup = Path(result.backup).name if result.backup else "无"
     return True, f"已应用并 reload；备份 {backup}" + (f"\n最近日志：{tail}" if tail else "")
-
-
-def render_preview_text() -> str:
-    """渲染"默认 + 覆盖层"的最终文本；覆盖层坏了照样返回一句能读的话。"""
-    try:
-        return cap_apply.render_with_overrides()
-    except OverrideError as exc:
-        return f"（覆盖层有问题，无法渲染）\n{exc}"
-
-
-def default_render_text() -> str:
-    from .render import render
-    return render()
 
 
 # ---------------------------------------------------------------------------

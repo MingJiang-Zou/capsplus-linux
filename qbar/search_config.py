@@ -60,9 +60,6 @@ LINK_TYPE_LABEL = {
     "app": "本地应用",
     "file": "文件或目录",
 }
-# 打开方式（`open_plan` 的第一个返回值）：url 交给浏览器，app/file 各自走本地路径
-OPEN_KIND_LABEL = {"url": "网址", "app": "应用", "exec": "命令", "file": "文件", "dir": "目录"}
-
 
 @dataclass(frozen=True)
 class SearchLink:
@@ -241,7 +238,7 @@ def preview_pair(link: SearchLink, sample: str = "") -> tuple[str, str]:
 
     search 类没填示例词时用「关键词」占位，这样预览行永远读得通。
     """
-    kind, payload = open_plan(link, sample)
+    _kind, payload = open_plan(link, sample)
     sample = sample.strip()
     if link.resolved_type == "search":
         return (f"{link.trigger} {sample or '关键词'}", payload)
