@@ -31,6 +31,10 @@
   不写 `type` 的老配置按推断规则照常工作。
 - 失焦即隐藏（`hide_on_focus_out`，默认开）；`Caps+Q` 智能切换（失焦时拉回前台而不是藏起来）。
 - 修冷启动不抢焦点（首次唤起后打不进字）；加诊断日志 `~/.local/state/capsplus/qbar.log`。
+- 修「打开网页会另起一个浏览器窗口」（2026-10-16 实测）：四处 `launch_default_for_uri` / `AppInfo.launch`
+  原本都传 `None`（不带激活上下文），桌面无法把它当成「用户主动点开」，Edge 于是新起窗口并把后续
+  页面全堆进去。改为带 `Gdk.AppLaunchContext` + 事件时间戳；判据 `tests/test_launch_context.py`
+  （AST 扫描，headless 也跑，改回 `None` 立刻红），详见 `docs/KNOWN-LIMITS.md`。
 - 默认引擎模板加淘宝 / 闲鱼（两个搜索端点实测 HTTP 200，中文关键词走 `{q}` URL 编码）。
 
 ### 托盘（`tray/`）
