@@ -155,9 +155,45 @@ def gui_tests_allowed() -> bool:
     return display_works() and RUN_GUI and not real_desktop_risk()
 
 
-@unittest.skipUnless(gui_tests_allowed(),
-                     real_desktop_risk() or "界面测试需要显式 CAPSPLUS_GUI=1（默认跳过，避免在真实桌面弹窗抢焦点）")
+def why_blocked() -> str:
+    """能跑就返回空串；不能跑就给出**具体是哪一层拦的**（含糊的理由今天浪费了我一刻钟）。"""
+    if gi is None:
+        return f"没有 python3-gi / GTK3 typelib：{GI_ERROR}"
+    risk = real_desktop_risk()
+    if risk:
+        return risk
+    if not display_works():
+        return "连不上任何显示服务器"
+    return ""
+
+
+# 注意条件方向：skipUnless(条件) 在条件为**假**时才跳过 —— 上一版我写成 `not RUN_GUI or …`，
+# 结果默认跑法反而**没跳过**、直接在你屏幕上开窗（2026-10-16 又弹了一次，是我的锅）。
+# 正确语义：只有「显式要跑」且「不是真桌面」才进这个类；进了类之后跑不了就判红（见 setUpClass）。
+@unittest.skipUnless(RUN_GUI and not real_desktop_risk(),
+                     '没设 CAPSPLUS_GUI=1（或 GDK 连着真实 Wayland 桌面）：界面测试跳过，避免弹窗抢焦点')
 class TestSettingsWindow(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        """`CAPSPLUS_GUI=1` 是"**我要求它们真跑**"的意思 —— 跑不了就必须判红，不许悄悄 skip。
+
+        今天就是这样假绿的：CI 的 gui-tests job 用 `setup-python` 装的 pyenv 版 python，
+        而 `python3-gi` 装在系统 `/usr/lib/python3/dist-packages`，pyenv 那个解释器根本看不见它
+        → `import gi` 失败 → 35 条界面用例全 skip → job 显示 success。
+        唯一的例外是"真实 Wayland 桌面"那道保护（那是故意不弹你屏幕，算 skip 合理）。
+        """
+        risk = real_desktop_risk()
+        if risk:
+            raise unittest.SkipTest(risk)
+        if gi is None:
+            raise AssertionError(
+                f"CAPSPLUS_GUI=1 但 import gi 失败：{GI_ERROR}\n"
+                "  → 解释器不是系统 python（`python3-gi` 只装在 /usr/lib/python3/dist-packages，\n"
+                "    setup-python/venv 的解释器看不见它）。CI 的界面 job 必须用系统 python3。")
+        if not display_works():
+            raise AssertionError("CAPSPLUS_GUI=1 但连不上显示服务器（没在 xvfb-run / 真桌面下跑？）")
+
+
     @classmethod
     def setUpClass(cls):
         cls.app_module = __import__("settings_app", globals(), locals(), ["SettingsWindow"], 0)

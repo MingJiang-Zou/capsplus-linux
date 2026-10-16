@@ -59,13 +59,19 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
+      # ⚠ **不要用 setup-python**：`python3-gi` 装在系统 `/usr/lib/python3/dist-packages`，
+      # setup-python 那个 pyenv 解释器看不见它 → `import gi` 失败 → 35 条界面用例全 skip，
+      # 而 job 照样显示 success（2026-10-16 首跑就是这么假绿的）。ubuntu-latest 系统 python
+      # 是 3.12，满足本仓 ≥3.11 的下限，直接用系统解释器。
+      - name: 诊断解释器与 gi 是否可用（假绿过一次，这里必须把根因打出来）
+        run: |
+          python3 -V
+          python3 -c "import sys; print('sys.path 里有 dist-packages:', any('dist-packages' in p for p in sys.path))"
+          python3 -c "import gi; print('gi OK ->', gi.__file__)"
 
       - name: 装 PyGObject 与 GTK3 的 gir（界面测试要用）
         run: |
-          sudo apt-get update
+          sudo apt-get update -qq
           sudo apt-get install -y --no-install-recommends python3-gi gir1.2-gtk-3.0 gir1.2-pango-1.0
 
       - name: 虚拟显示里真跑界面测试
