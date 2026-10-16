@@ -120,8 +120,36 @@ def display_works() -> bool:
     return bool(ok)
 
 
-@unittest.skipUnless(display_works() and RUN_GUI,
-                     "界面测试需要显式 CAPSPLUS_GUI=1（默认跳过，避免在真实桌面弹窗抢焦点）")
+def real_desktop_risk() -> str:
+    """GDK 连上的到底是哪个后端 —— 是**真实 Wayland 桌面**又没被授权，就别跑。
+
+    为什么必须在这里挡住（而不是靠文档里写一句"记得加 xvfb-run"）：
+    `import gi` 之后再设 `GDK_BACKEND=x11` 已经太晚，GDK 读它读得更早（2026-10-16 实测过，
+    所以我上一版"在模块里 setdefault"的写法是无效的）。唯一的兜底就是**跑之前看清后端、不对就拒跑**。
+    """
+    if not RUN_GUI or ALLOW_WAYLAND_DESKTOP:
+        return ""
+    try:
+        from gi.repository import Gdk
+        display = Gdk.Display.get_default()
+        backend = type(display).__name__ if display is not None else ""
+    except Exception:                                   # noqa: BLE001
+        return ""
+    if "Wayland" in backend:
+        return (f"GDK 当前连的是真实 Wayland 桌面（{backend} "
+                f"{display.get_name() if display is not None else ''}），界面测试会直接弹到你屏幕上"
+                "并抢走键盘焦点。要用虚拟显示跑："
+                "`xvfb-run -a env -u WAYLAND_DISPLAY GDK_BACKEND=x11 CAPSPLUS_GUI=1 …`；"
+                "确实需要真桌面证据就再加 `CAPSPLUS_WAYLAND=1`。")
+    return ""
+
+
+def gui_tests_allowed() -> bool:
+    return display_works() and RUN_GUI and not real_desktop_risk()
+
+
+@unittest.skipUnless(gui_tests_allowed(),
+                     real_desktop_risk() or "界面测试需要显式 CAPSPLUS_GUI=1（默认跳过，避免在真实桌面弹窗抢焦点）")
 class TestSettingsWindow(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
