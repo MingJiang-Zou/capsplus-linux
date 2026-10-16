@@ -30,7 +30,13 @@ REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO))
 sys.path.insert(0, str(REPO / "settings"))   # settings_app 是按目录路径导入的（与 bin/ 同样写法）
 
-try:                                            # 没有 PyGObject / 没有显示服务器就整模块跳过
+# 没有 PyGObject（CI 的 ubuntu-latest 就没装）或 require_version 拿不到 typelib 时，
+# **整个模块必须还能被 import** —— 顶层裸 `import gi` 会让 discover 报 collection error，
+# 表现是"整套红、一条用例都没跑"，而装了 gi 的开发机永远复现不了。
+# 兜底故意用宽 `except Exception`（不止 ImportError/ValueError）：这里的目的是
+# "收集阶段绝不崩"，宁可把界面用例全跳过，也不能红在导入上。
+# 判据：tests/test_no_gi_smoke.py（把 gi 屏蔽掉逐个模块导一遍 + 跑一遍 discover）。
+try:
     import gi
     gi.require_version("Gtk", "3.0")
     from gi.repository import Gtk

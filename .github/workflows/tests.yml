@@ -1,0 +1,46 @@
+# SPDX-License-Identifier: GPL-2.0-only
+# Copyright (c) 2026 capsplus-linux contributors
+# CI：只跑标准库能跑的东西。
+#
+# 三条刻意的设计（改这个文件前先读）：
+#   1. **不装 python3-gi**。ubuntu-latest 默认就没有 PyGObject，测试套件必须在
+#      "没有 gi" 的机器上也能收集 + 跑完（界面用例自己 skip）。这条由
+#      `tests/test_no_gi_smoke.py` 守着 —— 谁在测试模块顶层裸写 `import gi`，CI 就红。
+#   2. **不碰 /etc、不用 sudo**。`capsplus apply` 要写 /etc/keyd，CI 只跑单测；
+#      真机端到端验收（`tools/e2e/check_mappings.py`）需要 root + /dev/uinput，不进 CI。
+#   3. **界面测试默认关**。它们会真弹窗（会抢正在用人手里的键盘焦点），
+#      要跑就 `CAPSPLUS_GUI=1` 且在虚拟显示下：
+#        xvfb-run -a env -u WAYLAND_DISPLAY CAPSPLUS_GUI=1 python3 -m unittest discover -s tests
+
+name: tests
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  unittest:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12"]     # 下限 3.11：用了标准库 tomllib
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 准备 Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      # 语法层面全仓过一遍（含 bin/ 之外的所有 .py；bin/ 下的入口没有 .py 后缀，
+      # 由单测里"子进程跑真入口"那条判据覆盖，见 tests/test_settings_window.py）
+      - name: compileall
+        run: python3 -m compileall -q .
+
+      - name: 全量单测（无 python3-gi / 无显示服务器 / 无 sudo）
+        run: python3 -m unittest discover -s tests -v
