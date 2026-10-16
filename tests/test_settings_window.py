@@ -72,6 +72,7 @@ if RUN_GUI:
     os.environ.setdefault("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}")   # 别处不一定是 1000
 
 from capsplus import mapping_overrides as MO    # noqa: E402
+from capsplus.env import keyd_cli_hint          # noqa: E402  跳过文案里的命令名跟着本机走
 from capsplus.render import binding_rows        # noqa: E402
 from qbar.search_config import (                # noqa: E402
     LINK_TYPES, SearchLink, load_config, render_config_toml,
@@ -613,7 +614,7 @@ class TestSettingsWindow(unittest.TestCase):
     def test_unknown_key_action_is_refused_when_keyd_present(self):
         page = self.window.mapping_page
         if self.window.known_keys is None:
-            self.skipTest("本机没有 keyd.rvaiya list-keys，键名校验本来就该跳过")
+            self.skipTest(f"本机取不到 {keyd_cli_hint()} list-keys，键名校验本来就该跳过")
         index = self.row_index("capl", "e")
         self.edit_action("capl", "e", "nosuchkey")
         self.assertEqual(self.status_color(), "red")

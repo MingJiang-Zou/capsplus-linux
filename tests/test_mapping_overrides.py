@@ -27,7 +27,7 @@ from capsplus.mapping_overrides import (                # noqa: E402
 )
 from capsplus.render import binding_rows, normalized_bindings, render  # noqa: E402
 
-# 校验用的"键名表"直接取 keyd 自己的键名清单（`keyd.rvaiya list-keys`）——
+# 校验用的"键名表"直接取 keyd 自己的键名清单（`<keyd> list-keys`，名字由 capsplus/env.py 定）——
 # 测试里手写一份键名容易写错一个，把"覆盖层被正确接受"这条判据变成假红。
 KNOWN = load_known_keys() or {
     "up", "down", "left", "right", "home", "end", "pageup", "pagedown",
