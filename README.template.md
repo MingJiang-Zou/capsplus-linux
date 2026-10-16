@@ -5,7 +5,7 @@
 `capsplus/mapping_data.py`，keyd 配置与下面的键表都由它渲染（改映射不用改两处）。
 
 <!-- 徽章纪律：没有真跑过的 CI 就不许放假徽章（这条注释留着提醒后来人） -->
-[![tests](https://github.com/517477981/capsplus-linux/actions/workflows/tests.yml/badge.svg)](https://github.com/517477981/capsplus-linux/actions/workflows/tests.yml)
+[![tests](https://github.com/MingJiang-Zou/capsplus-linux/actions/workflows/tests.yml/badge.svg)](https://github.com/MingJiang-Zou/capsplus-linux/actions/workflows/tests.yml)
 [![license: GPL-2.0-only](https://img.shields.io/badge/license-GPL--2.0--only-blue.svg)](LICENSE)
 [![Python](https://img.shields.io/badge/python-3.11%20%7C%203.12-green.svg)](#依赖)
 
