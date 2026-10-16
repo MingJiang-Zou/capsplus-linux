@@ -616,7 +616,9 @@ class TestSettingsWindow(unittest.TestCase):
         page = self.window.general_page
         self.assertEqual(page._search_triggers, ["b"])
         self.assertTrue(page.focus_switch.get_active())
-        self.assertEqual(page.memory_values(), ("b", "", True))
+        # 四元组：default_search / browser / hide_on_focus_out / raise_browser
+        # （2026-10-16 加 raise_browser 时这里是唯一写死旧形状的地方，跟着改，不是放宽判据）
+        self.assertEqual(page.memory_values(), ("b", "", True, True))
 
     def test_general_switch_and_entry_write_through(self):
         page = self.window.general_page
@@ -753,6 +755,15 @@ class TestSettingsWindow(unittest.TestCase):
         self.assertIn("覆盖层里有几条被跳过", self.status_text())
         self.assertEqual(len(page.store), len(binding_rows("capl")) + len(binding_rows("capl+alt")))
 
+
+    def test_general_page_has_the_raise_browser_switch(self):
+        """第②页必须能改 `raise_browser`：否则 GUI 写盘会把它按默认值覆盖掉用户的手改。"""
+        page = self.window.general_page
+        self.assertTrue(hasattr(page, "raise_switch"), "通用页少了 raise_switch 控件")
+        self.assertTrue(page.raise_switch.get_active(), "cfg 里是 True，界面得回填成 True")
+        page.raise_switch.set_active(False)
+        self.assertFalse(page.memory_values()[3], "开关关了却没进 memory_values ⇒ 写盘会丢")
+        page.raise_switch.set_active(True)
 
     def test_qbar_window_is_not_wider_than_the_screen(self):
         """真构造一次 Qbar，断言它的宽度被屏幕钳住（2026-10-16 用户实测「超出屏幕」）。
