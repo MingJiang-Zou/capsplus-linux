@@ -35,7 +35,7 @@ class ApplySandbox(unittest.TestCase):
         A.BACKUP_DIR = root / "backup"
         A.attic_dir = lambda: root / "attic"
         # 渲染一律钉在仓库默认上：绝不读真实的 ~/.config/capsplus/mappings.toml
-        # （否则明江改过键位就会把测试搞红，测试也就没法复现了）
+        # （否则本机改过的键位会把测试搞红，测试也就没法复现了）
         self._real_render_with_overrides = self._saved[7]
         A.render_with_overrides = render
         self.logs: list[str] = []

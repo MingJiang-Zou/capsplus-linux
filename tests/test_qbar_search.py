@@ -246,7 +246,7 @@ class TestConfigFile(TempConfigMixin, unittest.TestCase):
         self.assertEqual(cfg.match("词").link.trigger, "b")   # 退回第一条可用
 
     def test_hide_on_focus_out_defaults_to_true(self):
-        """不写这一项 = 开（明江要的口径：点别处就收起来）。"""
+        """不写这一项 = 开（既定口径：点别处就收起来）。"""
         self.write_config('[general]\ndefault_search = "b"\n'
                           '[[link]]\ntrigger = "b"\nname = "必应"\nurl = "https://b/?q={q}"\n')
         self.assertIs(self.load().hide_on_focus_out, True)

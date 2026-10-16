@@ -40,28 +40,30 @@ except Exception as exc:                        # noqa: BLE001
 else:
     GI_ERROR = ""
 
-# 界面测试默认**不跑**。`show_all()` 会在真实桌面映射出窗口，Qbar 冷启动还会 grab_focus
-# 抢走键盘焦点 —— 明江就在这台机器上干活，2026-10-16 他明确抱怨"老把 qbar 和设置页面换出来"。
-# 要跑界面测试必须显式开关，并且要在虚拟显示下、把 WAYLAND_DISPLAY 摘掉：
+# ---------------------------------------------------------------------------
+# 界面测试的开关（2026-10-16 定，起因：用户实测抱怨"老把 qbar 和设置页面换出来"）
+#
+# `show_all()` 会在 **GDK 当前连上的那个桌面**映射出真窗口，Qbar 冷启动还 present()+grab_focus
+# 抢键盘焦点。这台机器是人干活的机器，所以默认一律不跑。
+#
+# 两条硬实测事实（都踩过，别再指望进程内补救）：
+#   1. 只 `-u WAYLAND_DISPLAY` 不够：libwayland 会退回连 `$XDG_RUNTIME_DIR/wayland-0`，
+#      GDK 照样连真实 Wayland 桌面（2026-10-16 实测）。
+#   2. 在 `import gi` **之后**设 `GDK_BACKEND=x11` 完全无效 —— GDK 读它比这早。对照实验：
+#        xvfb-run -a env -u WAYLAND_DISPLAY                  → GdkWaylandDisplay（弹真屏 ✗）
+#        xvfb-run -a env -u WAYLAND_DISPLAY GDK_BACKEND=x11  → X11Display :99（看不见 ✓）
+#
+# 所以设计成「默认拒绝真桌面」，两个开关各管一件事：
+#   CAPSPLUS_GUI=1       允许跑界面测试（不设就整类 skip）
+#   CAPSPLUS_WAYLAND=1   明确授权在**真实 Wayland 桌面**上跑（会弹窗抢焦点，只在该机没人用时用）
+# 推荐跑法（不打扰桌面，也是 CI 的跑法 —— 于是界面测试在 CI 里是**真跑**，不是 skip）：
 #   xvfb-run -a --server-args="-screen 0 1280x800x24" \
-#     env -u WAYLAND_DISPLAY CAPSPLUS_GUI=1 python3 -m unittest discover -s tests
+#     env -u WAYLAND_DISPLAY GDK_BACKEND=x11 CAPSPLUS_GUI=1 python3 -m unittest discover -s tests
 RUN_GUI = os.environ.get("CAPSPLUS_GUI") == "1"
+ALLOW_WAYLAND_DESKTOP = os.environ.get("CAPSPLUS_WAYLAND") == "1"
 
 if RUN_GUI:
     os.environ.setdefault("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}")   # 别处不一定是 1000
-    # 光 `-u WAYLAND_DISPLAY` 不够：libwayland 会退回连 `$XDG_RUNTIME_DIR/wayland-0` 套接字，
-    # 于是还是连到真实桌面（2026-10-16 实测）。调用者显式给了 DISPLAY（xvfb-run 就是这么进来的）
-    # 又没给 WAYLAND_DISPLAY，那就照他的意思锁 X11 —— 这是尊重调用者的选择，不是发明显示器。
-    if os.environ.get("DISPLAY") and not os.environ.get("WAYLAND_DISPLAY"):
-        os.environ.setdefault("GDK_BACKEND", "x11")
-    # 这里**不再**替调用者补 WAYLAND_DISPLAY。原先那行 setdefault 才是这次骚扰的根源：
-    # 即使外面用 xvfb-run 起了虚拟 X11，只要 WAYLAND_DISPLAY 被补上，GDK3 就优先走 Wayland，
-    # 窗口照样弹到明江的真实桌面上（2026-10-16 实测：我自己那两次"xvfb 验证"其实都弹了真窗）。
-    # 新规则：**测试绝不自己发明显示器** —— 给什么后端就用什么后端，什么都不给就 skip。
-    #   虚拟显示（默认用法，不打扰桌面，也是 CI 的跑法）：
-    #     xvfb-run -a env -u WAYLAND_DISPLAY CAPSPLUS_GUI=1 python3 -m unittest discover -s tests
-    #   要真 Wayland 证据（会弹窗，挑人不在用机器时跑）：
-    #     env -u DISPLAY WAYLAND_DISPLAY=wayland-0 CAPSPLUS_GUI=1 python3 -m unittest discover -s tests
 
 from capsplus import mapping_overrides as MO    # noqa: E402
 from capsplus.render import binding_rows        # noqa: E402

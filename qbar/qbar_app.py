@@ -248,7 +248,7 @@ class QbarWindow(Gtk.Window):
         return False
 
     def _on_focus_out(self, *_args):
-        """失焦 → 隐藏（明江的口径：跟再按一次 Caps+Q 等效）。
+        """失焦 → 隐藏（既定口径：跟再按一次 Caps+Q 等效）。
 
         `[general] hide_on_focus_out = false` 时保持老行为（不隐藏，
         下次 Caps+Q 走 toggle_action 的 raise 拉回前台）。
@@ -258,7 +258,7 @@ class QbarWindow(Gtk.Window):
         elapsed_ms = int((time.monotonic() - self._shown_at) * 1000) if self._shown_at else 10 ** 9
         # **别**把 self.is_active 当"还带焦点"传进去：GTK 是在默认类处理器里才清掉 active 标记的，
         # 我们连的回调跑在它前面 —— 于是 focus-out-event 触发的那一刻 is_active 仍然是 True，
-        # 传进去等于"永远不隐藏"，而且这条分支原先不打日志，就表现为"点别处没反应"（2026-10-15 明江实测）。
+        # 传进去等于"永远不隐藏"，而且这条分支原先不打日志，就表现为"点别处没反应"（2026-10-15 用户实测）。
         # 既然信号叫 focus-out，焦点就是要走了，focused 一律按 False 处理。
         log(f"focus-out visible={self.get_visible()} is_active={self.is_active()} "
             f"距显示={elapsed_ms}ms flag={flag}")

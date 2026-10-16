@@ -15,7 +15,7 @@ sys.path.insert(0, str(REPO))
 from capsplus import mapping_data as MD          # noqa: E402
 from capsplus.render import render, normalized_bindings  # noqa: E402
 
-# 参考文件（明江手工复刻的 v1 配置）；可用环境变量指向别处
+# 参考文件（早期手工复刻的 v1 配置，用来做渲染等价验收）；可用环境变量指向别处
 REF_CONF = Path(os.environ.get(
     "CAPSPLUS_REF_CONF",
     Path.home() / ".dsh/refs/capslock-v3.3.0/keyd-capslock-plus.conf"))

@@ -683,7 +683,7 @@ def should_hide_on_focus_out(visible: bool, focused: bool, ms_since_show: int,
                              flag: bool = True) -> bool:
     """窗口失焦时该不该 hide()（纯函数，便于单测）。
 
-    明江的口径（2026-10-15）：**点别处就真隐藏**，跟再按一次 Caps+Q 一个效果 ——
+    既定口径（2026-10-15）：**点别处就真隐藏**，跟再按一次 Caps+Q 一个效果 ——
     否则下次唤起要先"隐藏"再"显示"，得按两次。所以这里默认就是隐藏，而不是拉回前台。
 
     - flag=False            -> 保持老行为（不隐藏，交给 toggle 的 raise 去拉回前台）

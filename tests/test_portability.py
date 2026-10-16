@@ -141,6 +141,74 @@ class TestNoPersonalPathsInRepo(unittest.TestCase):
             self.assertIn("@REPO_DIR@", text, f"{path.name} 的 Icon 还是硬路径")
 
 
+class TestNoPersonalNames(unittest.TestCase):
+    """仓里不许留打包者的姓名/登录名 —— 公开分发前必须过这一关。
+
+    名单**不写死在代码里**（否则这条判据自己就是第二份个人痕迹，换台机器还失效）：
+      ① 自动取当前机器的登录名与 gecos（`getent passwd $(id -u)` 的第 5 段）；
+      ② 追加用 `CAPSPLUS_PERSONAL_MARKERS="张三;李四"`（中文全名走环境变量，不落仓）。
+    所以公开前的完整跑法是：
+        CAPSPLUS_PERSONAL_MARKERS=<你的名字> python3 -m unittest discover -s tests
+    """
+
+    EXEMPT = ("tests/", ".git")
+    SUFFIXES = {".py", ".sh", ".md", ".desktop", ".service", ".toml", ""}
+    SYSTEM_NAMES = {"root", "runner", "nobody", "www-data"}
+
+    def markers(self) -> list[str]:
+        import getpass
+        import pwd
+        out = {getpass.getuser()}
+        try:
+            out |= {t.strip() for t in re.split(r"[,;:]", pwd.getpwuid(os.getuid()).pw_gecos) if len(t.strip()) >= 2}
+        except KeyError:
+            pass
+        out |= {t.strip() for t in os.environ.get("CAPSPLUS_PERSONAL_MARKERS", "").split(";") if t.strip()}
+        return sorted(m for m in out if m and m not in self.SYSTEM_NAMES)
+
+    def tracked_files(self):
+        for path in sorted(REPO.rglob("*")):
+            if path.is_dir() or "__pycache__" in path.parts:
+                continue
+            rel = str(path.relative_to(REPO))
+            if rel.startswith(self.EXEMPT):
+                continue
+            if path.suffix not in self.SUFFIXES and path.name not in (
+                    "capsplus", "capsplus-qbar", "capsplus-settings", "capsplus-tray",
+                    "keyd-qbar-cmd"):
+                continue
+            yield rel, path
+
+    def test_no_personal_names_in_tracked_files(self):
+        marks = self.markers()
+        if not marks:
+            self.skipTest("本机取不到任何名字类标记，这条判据无从判起")
+        bad = []
+        for rel, path in self.tracked_files():
+            text = path.read_text(encoding="utf-8", errors="replace")
+            for marker in marks:
+                if marker in text:
+                    bad.append(f"{rel}: 出现 {marker!r}")
+        self.assertEqual(bad, [], "这些文件还写着个人名字：\n  " + "\n  ".join(bad))
+
+    def test_the_guard_really_catches_a_name(self):
+        """反例具型：判据不是摆设 —— 造一份带名字的仓，必须抓到。"""
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "evil.py").write_text("# 维护者：阿猫\nx = 1\n", encoding="utf-8")
+            hits = [p.name for p in root.glob("*.py") if "阿猫" in p.read_text(encoding="utf-8")]
+            self.assertEqual(hits, ["evil.py"], "个人名字扫不出来 = 这条判据是空的")
+
+    def test_markers_skip_system_names_and_take_env(self):
+        with mock.patch.dict(os.environ, {"CAPSPLUS_PERSONAL_MARKERS": "root;runner;阿狗"}), \
+             mock.patch("getpass.getuser", return_value="runner"):
+            marks = self.markers()
+        self.assertIn("阿狗", marks)
+        for ignored in ("root", "runner"):
+            self.assertNotIn(ignored, marks)
+
+
 class TestFdBinary(unittest.TestCase):
     def test_prefers_fdfind_then_fd(self):
         with mock.patch("capsplus.env.shutil.which", side_effect=lambda n: n == "fdfind"):

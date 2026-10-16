@@ -6,7 +6,7 @@
 
 按 现象 / 原因 / 建议 写在这儿，免得下一个人再把编辑控件塞回表格：
 
-  现象（明江实测截图定案）：GTK3/Wayland 下 TreeView 的 cell editor **不跟随滚动** ——
+  现象（2026-10-15 用户实测截图定案）：GTK3/Wayland 下 TreeView 的 cell editor **不跟随滚动** ——
         表格滚了、编辑框的像素坐标不动，于是编辑框视觉上落到别的行：高亮的是 `t` 行、
         编辑框落在 `k` 行、框里还是 `t` 的值。用户以为改的是 `t`，**写进去的是 `k`**。
   原因：cell editor（尤其 `CellRendererCombo` 的下拉）是独立 surface，父窗口滚动/移动时
