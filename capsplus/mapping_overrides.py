@@ -33,6 +33,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from . import mapping_data as MD
+from .env import find_keyd_bin, keyd_cli_hint
 
 # 覆盖层允许改的段：不含 [main]（那里是 Caps 的 overload 声明，改错就没法进层了）
 ALLOWED_SECTIONS = [MD.PRIMARY_LAYER, "capl+alt"]
@@ -40,7 +41,7 @@ ALLOWED_SECTIONS = [MD.PRIMARY_LAYER, "capl+alt"]
 CONFIG_DIR = Path.home() / ".config/capsplus"
 OVERRIDES_PATH = CONFIG_DIR / "mappings.toml"
 
-# keyd 里的动作词（`keyd.rvaiya list-keys` 之外的合法动作）
+# keyd 里的动作词（`list-keys` 列出的键名之外的合法动作）
 ACTION_WORDS = frozenset({
     "noop", "oneshot", "swap", "clear", "layer", "overload", "overloadt",
     "overloadi", "overloadt2", "timeout", "togglemouse", "toggle", "macro",
@@ -155,7 +156,7 @@ def validate_action(action: str, known_keys: set[str] | None = None) -> str | No
         return f"动作不能含空格（要连按就用 macro(up up)）: {text!r}"
     unknown = action_keys(text, known_keys)
     if unknown and known_keys is not None:
-        return f"不认识的键名: {unknown[0]}（见 keyd.rvaiya list-keys）"
+        return f"不认识的键名: {unknown[0]}（见 {keyd_cli_hint()} list-keys）"
     return None
 
 
@@ -305,9 +306,13 @@ def save_overrides(values: dict[str, dict[str, str]], path: Path | None = None) 
 
 
 def load_known_keys() -> set[str] | None:
-    """`keyd.rvaiya list-keys` 的输出（校验键名用）。取不到就返回 None = 不校验键名。"""
+    """`<keyd> list-keys` 的输出（校验键名用）。取不到就返回 None = 不校验键名。
+
+    二进制名走 `capsplus.env.find_keyd_bin()`（Debian 系装成改名版，其余发行版叫 keyd）。
+    这里原先只认 Debian 系那一个名字，换台机器就静默不校验键名了。
+    """
     import subprocess
-    binary = shutil.which("keyd.rvaiya")
+    binary = find_keyd_bin()
     if not binary:
         return None
     try:

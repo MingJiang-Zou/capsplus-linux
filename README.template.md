@@ -40,7 +40,8 @@ bash install.sh --no-autostart   # 不装开机自启（应用菜单入口照装
 装完会跑一次 `desktop-file-validate`；本机没有这个命令就跳过并打印说明。
 
 依赖（本机已装）：`python3-gi`、`gir1.2-gtk-3.0`、`gir1.2-ayatanaappindicator3-0.1`、
-`fdfind`（fd 的 Debian 名）、`keyd`（二进制名 `keyd.rvaiya`）、GNOME 扩展
+`fd`（Debian/Ubuntu 装出来叫 `fdfind`）、`keyd`（**Debian/Ubuntu 叫 `keyd.rvaiya`，
+Arch/Fedora/openSUSE 叫 `keyd`** —— 本仓两个名字都试，见 `capsplus/env.py`）、GNOME 扩展
 `ubuntu-appindicators@ubuntu.com`（托盘才有地方显示）。
 TOML 解析用 Python 3.11+ 自带的 `tomllib`，**不需要额外装包**。
 
@@ -127,11 +128,14 @@ keyd 报错时**自动回滚**到被本次替换掉的那一版、再 reload，�
 keyd 的 `command(...)` 是 **root** 执行的，拉 GUI 必须降权 + 带会话环境，包装脚本已经写好：
 
 ```
-command(/home/zmj/.local/bin/keyd-qbar-cmd)
+command(<你的 bin 目录>/keyd-qbar-cmd)     # 渲染时按 Path.home()/.local/bin 现算，仓里不写死
 ```
 
-`bin/keyd-qbar-cmd` 里就是这条（`runuser -u zmj -- env XDG_RUNTIME_DIR=… WAYLAND_DISPLAY=… DISPLAY=:0
-DBUS_SESSION_BUS_ADDRESS=… capsplus-qbar`）。**加进 keyd 配置要你自己做**，我不动 `/etc/keyd`。
+`capsplus render` 会把那条换成你机器上的实际路径（`CAPSPLUS_BINDIR` 指别的目录就跟着变）。
+`bin/keyd-qbar-cmd` 干的事：keyd 以 **root** 执行 `command(...)`，所以它先用 `runuser` **降权回
+这个脚本文件本身的属主**（用户名、uid、家目录都从脚本自身推出来，不写死任何人），再补上
+`XDG_RUNTIME_DIR` / `WAYLAND_DISPLAY` / `DISPLAY` / `DBUS_SESSION_BUS_ADDRESS` 起 Qbar。
+配置由 `capsplus apply` 装进去，本仓不替你动 `/etc/keyd`。
 
 ### 免密 sudo（可选，托盘按钮要它才好用）
 
@@ -139,10 +143,12 @@ DBUS_SESSION_BUS_ADDRESS=… capsplus-qbar`）。**加进 keyd 配置要你自�
 要免密就在 `/etc/sudoers.d/capsplus` 里放宽这几条**具体命令**（别用 `NOPASSWD: ALL`）：
 
 ```
-zmj ALL=(root) NOPASSWD: /usr/bin/keyd.rvaiya
-zmj ALL=(root) NOPASSWD: /usr/bin/systemctl start keyd, /usr/bin/systemctl stop keyd
-zmj ALL=(root) NOPASSWD: /usr/bin/cp * /etc/keyd/capslock-plus.conf
-zmj ALL=(root) NOPASSWD: /usr/bin/journalctl -u keyd *
+# <你> = 你自己的登录用户名（`id -un`）；keyd 那条按本机实际存在的名字填
+<你> ALL=(root) NOPASSWD: /usr/bin/keyd.rvaiya
+<你> ALL=(root) NOPASSWD: /usr/bin/keyd
+<你> ALL=(root) NOPASSWD: /usr/bin/systemctl start keyd, /usr/bin/systemctl stop keyd
+<你> ALL=(root) NOPASSWD: /usr/bin/cp * /etc/keyd/capslock-plus.conf
+<你> ALL=(root) NOPASSWD: /usr/bin/journalctl -u keyd *
 ```
 
 这文件归你自己按下去（它属于"动 sudo 面"），我不替你装。
@@ -171,7 +177,7 @@ zmj ALL=(root) NOPASSWD: /usr/bin/journalctl -u keyd *
 | `ghp` | 固定链接（模板里没有 `{q}`）→ 直接打开，不要关键词 |
 | `b ` / `b` | 只敲了前缀 → 提示「输入关键词」 |
 | `-> q 关键词` | 老写法，保留：等价于默认引擎搜索 |
-| 直接打字 | fuzzy 子序列匹配：`.desktop` 应用 + `~/project`、`~`、`/mnt/data`、`/mnt/back` 下的文件/目录（fdfind，1.5s 超时） |
+| 直接打字 | fuzzy 子序列匹配：`.desktop` 应用 + `~/project`、`~`、`/mnt/data`、`/mnt/back` 下的文件/目录（`fd`/`fdfind`，1.5s 超时；根目录不存在就跳过） |
 | `=` 开头 | 算术求值，如 `=1+2*3`；结果回车即复制。用 `ast` 白名单求值，**不用 eval** |
 | `-> date` / `-> time` | 日期 / 时间（回车复制） |
 | `-> calc <表达式>` | 算术，同上 |
@@ -291,7 +297,7 @@ url = "https://github.com/pulls"              # ghp      → 固定链接，直�
 **步长有两处受 keyd 宏上限压缩**（见下面「硬件与 keyd 的边界」）：选中 10 行 → 7 行；
 30 行 → 翻页键。
 
-多出来的部分：托盘（启停映射、重载、看日志）、Qbar 走 fdfind 搜真实文件、系统剪贴板直接可用、
+多出来的部分：托盘（启停映射、重载、看日志）、Qbar 走 fd/fdfind 搜真实文件、系统剪贴板直接可用、
 **可配置的网页搜索与快速链接**（原版 Qbar 的搜索是写死的）。
 
 ## 回滚
@@ -302,12 +308,15 @@ url = "https://github.com/pulls"              # ghp      → 固定链接，直�
    ```bash
    ls -t ~/.local/state/capsplus/keyd-conf-backup/ | head
    sudo cp ~/.local/state/capsplus/keyd-conf-backup/capslock-plus.conf.<时间戳> /etc/keyd/capslock-plus.conf
-   sudo keyd.rvaiya reload
+   sudo keyd reload            # Arch/Fedora；Ubuntu 这台上叫 keyd.rvaiya
    ```
 3. **整份撤掉**：`sudo mv /etc/keyd/capslock-plus.conf /tmp/attic-$(date +%Y%m%d)/ && sudo systemctl restart keyd`
 4. **救命组合**：同时按 `backspace` + `escape` + `enter` 会终止 keyd（配置改坏时不至于锁死机器）。
 
 ## 硬件与 keyd 的边界（都是 2026-10-15 用虚拟键盘实测出来的，不是推测）
+
+> 平台限制的完整清单（Wayland 没有置顶 API、`command()` 以 root 跑、`gi.require_version` 的坑、
+> 没装 python3-gi 时测试怎么降级……）在 [`docs/KNOWN-LIMITS.md`](docs/KNOWN-LIMITS.md)，每条都写了实测日期与复现方法。
 
 ### 宏长度上限：≤ 15 个按键事件
 

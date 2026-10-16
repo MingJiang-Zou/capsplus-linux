@@ -9,7 +9,8 @@
   2. 备份现有 /etc/keyd/capslock-plus.conf 到 ~/.local/state/capsplus/keyd-conf-backup/<时间戳>
      （保留最近 10 份，超出的 mv 进焚化炉 /tmp/attic-<日期>/）
   3. sudo cp 新配置过去
-  4. sudo keyd.rvaiya reload
+  4. sudo <keyd> reload（可执行文件名由 capsplus/env.py:resolve_keyd_bin() 定：
+     各发行版名字不同；选择顺序与实测记录见 capsplus/env.py 与 docs/KNOWN-LIMITS.md）
   5. 抓 sudo journalctl -u keyd --since '10 seconds ago'，出现 "ERROR:" 行 ->
      cp 回滚上一版 + 再 reload + 以非 0 退出码返回
 
@@ -28,11 +29,11 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 
+from .env import KEYD_UNIT, keyd_bin_origin, resolve_keyd_bin
 from .render import render, normalized_bindings
 from .mapping_overrides import OverrideError, load_and_merge, load_overrides
 
 KEYD_CONF = Path("/etc/keyd/capslock-plus.conf")
-KEYD_BIN = shutil.which("keyd.rvaiya") or "/usr/bin/keyd.rvaiya"
 BACKUP_DIR = Path.home() / ".local/state/capsplus/keyd-conf-backup"
 KEEP_BACKUPS = 10
 ERROR_RE = re.compile(r"^.*ERROR:.*$", re.M)
@@ -112,7 +113,7 @@ def previous_backup() -> Path | None:
 
 def keyd_log(since: str = "10 seconds ago") -> str:
     proc = subprocess.run(
-        ["sudo", "-n", "journalctl", "-u", "keyd", "--no-pager", "--since", since],
+        ["sudo", "-n", "journalctl", "-u", KEYD_UNIT, "--no-pager", "--since", since],
         capture_output=True, text=True,
     )
     # journalctl 在"没有匹配记录"时返回 1，不算错误
@@ -126,7 +127,7 @@ def parse_errors(log_text: str) -> list[str]:
 
 
 def reload_keyd() -> None:
-    _run([KEYD_BIN, "reload"], need_root=True, check=False)
+    _run([resolve_keyd_bin(), "reload"], need_root=True, check=False)
     # keyd reload 走的是 daemon 的 socket，退出码不完全可靠；真正判据是随后的 journal。
 
 
@@ -219,7 +220,7 @@ def _rollback(pre_install: Path | None) -> bool:
 # status
 # ---------------------------------------------------------------------------
 def service_state() -> str:
-    proc = subprocess.run(["systemctl", "is-active", "keyd"], capture_output=True, text=True)
+    proc = subprocess.run(["systemctl", "is-active", KEYD_UNIT], capture_output=True, text=True)
     return proc.stdout.strip() or proc.stderr.strip() or "unknown"
 
 
@@ -237,7 +238,7 @@ def config_summary(conf: Path = KEYD_CONF):
 
 def last_log_line() -> str:
     proc = subprocess.run(
-        ["sudo", "-n", "journalctl", "-u", "keyd", "--no-pager", "-n", "1"],
+        ["sudo", "-n", "journalctl", "-u", KEYD_UNIT, "--no-pager", "-n", "1"],
         capture_output=True, text=True,
     )
     if proc.returncode not in (0, 1):
@@ -264,6 +265,7 @@ def main(argv: list[str] | None = None) -> int:
         if cmd == "status":
             counts, conf, same = config_summary()
             print(f"keyd 服务: {service_state()}")
+            print(f"keyd 程序 : {keyd_bin_origin()}")
             print(f"配置文件 : {conf} ({'存在' if conf.exists() else '不存在'})")
             print(f"与渲染一致: {'是' if same else '否（有人手改过或没 apply）'}")
             print("段/条数  : " + ", ".join(f"{s}={n}" for s, n in counts))

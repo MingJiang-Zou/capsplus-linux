@@ -41,7 +41,7 @@ else:
     GI_ERROR = ""
 
 os.environ.setdefault("WAYLAND_DISPLAY", "wayland-0")
-os.environ.setdefault("XDG_RUNTIME_DIR", "/run/user/1000")
+os.environ.setdefault("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}")   # 别处不一定是 1000
 
 from capsplus import mapping_overrides as MO    # noqa: E402
 from capsplus.render import binding_rows        # noqa: E402
@@ -156,7 +156,8 @@ class TestSettingsWindow(unittest.TestCase):
         判据：能撑到超时（= 真起了窗口）或干净退出（单实例已在跑）都算过；
         stderr 里出现 Traceback 就是红。
         """
-        env = dict(os.environ, XDG_RUNTIME_DIR="/run/user/1000", WAYLAND_DISPLAY="wayland-0")
+        env = dict(os.environ, XDG_RUNTIME_DIR=f"/run/user/{os.getuid()}",
+                             WAYLAND_DISPLAY="wayland-0")
         for entry in ("capsplus-settings", "capsplus-qbar"):
             path = REPO / "bin" / entry
             self.assertTrue(path.exists(), f"入口不存在：{path}")

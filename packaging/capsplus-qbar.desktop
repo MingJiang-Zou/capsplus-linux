@@ -1,3 +1,4 @@
+# 模板：@BIN_DIR@ / @REPO_DIR@ 由 install.sh 换成实际路径后装到 ~/.local/share/applications/
 [Desktop Entry]
 Type=Application
 Version=1.0
@@ -5,8 +6,8 @@ Name=capsplus Qbar
 Name[zh_CN]=capsplus Qbar
 Comment=快速网页搜索 / 快速链接启动器（Caps+Q 唤起）
 Comment[zh_CN]=快速网页搜索 / 快速链接启动器（Caps+Q 唤起）
-Exec=/home/zmj/.local/bin/capsplus-qbar
-Icon=/home/zmj/project/private/capsplus-linux/assets/capsplus-on.svg
+Exec=@BIN_DIR@/capsplus-qbar
+Icon=@REPO_DIR@/assets/capsplus-on.svg
 Terminal=false
 Categories=Utility;
 Keywords=search;qbar;capsplus;搜索;快速链接;

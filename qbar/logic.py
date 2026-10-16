@@ -192,23 +192,41 @@ def browser_search_url(keyword: str, config: QbarConfig | None = None) -> str:
 
 BUILTIN_PREFIX = "->"
 
-# 设置窗口的入口名（install.sh 把它软链到 ~/.local/bin）
+# 入口脚本名（install.sh 把它们软链到 ~/.local/bin；见 capsplus/env.py:bindir()）
 SETTINGS_BIN = "capsplus-settings"
+QBAR_BIN = "capsplus-qbar"
 
 
-def settings_launch_command(repo_root: Path | None = None) -> list[str]:
-    """起设置窗口的命令：优先 PATH 里的 `capsplus-settings`（install.sh 装的软链）。
+def entry_command(bin_name: str, repo_root: Path | None = None) -> list[str]:
+    """起某个入口的命令：优先 PATH 里的 `bin_name`（install.sh 装的软链）。
 
-    找不到就回落到仓内 `bin/capsplus-settings` —— 没跑过 install.sh 也能从 Qbar 点开，
+    找不到就回落到仓内 `bin/<bin_name>` —— 没跑过 install.sh 也能点开，
     开发态少一个"改了代码但要重装才能试"的坑。两个都没有就返回 []（上层给提示）。
     """
     from shutil import which
-    found = which(SETTINGS_BIN)
+    found = which(bin_name)
     if found:
         return [found]
     root = Path(repo_root) if repo_root else Path(__file__).resolve().parent.parent
-    fallback = root / "bin" / SETTINGS_BIN
+    fallback = root / "bin" / bin_name
     return [str(fallback)] if fallback.exists() else []
+
+
+def settings_launch_command(repo_root: Path | None = None) -> list[str]:
+    """起设置窗口（`capsplus-settings`）的命令。"""
+    return entry_command(SETTINGS_BIN, repo_root)
+
+
+def qbar_launch_command(repo_root: Path | None = None) -> list[str]:
+    """起 Qbar（`capsplus-qbar`）的命令。
+
+    托盘自己就跑在用户的桌面会话里，**直接 fork 就带着 WAYLAND_DISPLAY / DBUS 环境**；
+    以前这里套了一层 `runuser -u <某个用户> -- env XDG_RUNTIME_DIR=/run/user/<写死的 uid> …`，
+    而 `runuser` 只有 root 能用（实测：普通用户跑 `runuser -u <某人> -- true` →
+    "非 root 用户不能使用"，退出码 1）—— 那层包装在托盘这边从来就没生效过，
+    还把用户名与 uid 写死了。降权那套只在 keyd 侧需要，见 `bin/keyd-qbar-cmd`。
+    """
+    return entry_command(QBAR_BIN, repo_root)
 
 
 def builtin_entries(text: str, config: QbarConfig | None = None) -> list[Entry]:
@@ -387,21 +405,28 @@ def desktop_index(apps: list[Entry]) -> dict[str, str]:
 
 
 # ---------------------------------------------------------------------------
-# fdfind 后端访问器
+# fd 文件搜索后端
 # ---------------------------------------------------------------------------
-FDFIND = "fdfind"
+FDFIND = "fdfind"          # Debian/Ubuntu 的名字；Arch/Fedora 叫 fd（口径见 capsplus/env.py）
 
 
 class FileFinder:
-    """用 fdfind 子在后台线程里搜文件。
+    """用 fd/fdfind 子在后台线程里搜文件。
 
     刻意用线程 + subprocess.run(timeout=) 而不是 GLib 子进程管线：
     实现短、超时语义明确（超时 = 杀进程、返回已拿到的部分结果），
     结果通过 GLib.idle_add 回主线程。窗口绝不会被搜索卡住。
     """
 
-    def __init__(self, roots: list[Path], binary: str = FDFIND,
+    def __init__(self, roots: list[Path], binary: str | None = None,
              max_entries: int = 40, timeout_s: float = 1.5):
+        """`binary=None` = 现查本机该用哪个名字（Debian 系叫 fdfind，别处叫 fd）；查不到留 fdfind
+        —— 反正 `available()` 会返回 False，上层据此提示"没装 fd"。
+        延迟 import `capsplus.env`：本层要保持不依赖包结构也能单测。
+        """
+        if binary is None:
+            from capsplus.env import find_fd_binary
+            binary = find_fd_binary() or FDFIND
         self.roots = [Path(r) for r in roots]
         self.binary = binary
         self.max_entries = max_entries

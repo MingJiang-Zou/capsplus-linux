@@ -11,6 +11,7 @@
 """
 
 from . import mapping_data as MD
+from .env import resolve_bindir_token
 
 HEADER = [
     "Capslock+ v3.3.0 -> Linux keyd（本文件由 capsplus render 生成，请勿手改）",
@@ -27,8 +28,14 @@ HEADER = [
 
 
 def _format_binding(key: str, action: str) -> str:
-    """渲染一条绑定。macro 行绝不带行尾注释 —— 这里是那条硬规矩的唯一落点。"""
-    return f"{key} = {action}"
+    """渲染一条绑定。
+
+    两条硬规矩的落点：
+      1. macro 行绝不带行尾注释 —— 唯一落点在这里；
+      2. `@CAPSPLUS_BINDIR@` 只在此刻换成真实目录（家目录不许写死在数据里），
+         顺带把"路径含空格"这种 keyd 装不下的情况当场报出来。
+    """
+    return f"{key} = {resolve_bindir_token(action)}"
 
 
 def render(mapping_data=None) -> str:
@@ -131,6 +138,9 @@ def binding_rows(which: str, mapping_data=None) -> list[tuple[str, str, str, str
     """一个层的绑定表：[(键, 动作, 说明, 来源)]，来源 = "默认" / "覆盖"。
 
     设置界面的「当前生效映射」表格直接用这个（不解析 Python 源码，也不解析 conf 文本）。
+
+    动作与渲染出来的一致（`@CAPSPLUS_BINDIR@` 已换成真实目录）—— 界面上看到什么，
+    keyd 配置里就是什么，不许出现"表格里是记号、配置里是路径"两套话。
     """
     mapping_data = MD if mapping_data is None else mapping_data
     sections = dict(getattr(mapping_data, "SECTIONS", MD.SECTIONS))
@@ -144,5 +154,5 @@ def binding_rows(which: str, mapping_data=None) -> list[tuple[str, str, str, str
             continue
         key, action = entry
         source = "默认" if default_map.get(key) == action else "覆盖"
-        out.append((key, action, notes.get(key, ""), source))
+        out.append((key, resolve_bindir_token(action), notes.get(key, ""), source))
     return out

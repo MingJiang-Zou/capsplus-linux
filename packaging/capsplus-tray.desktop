@@ -1,10 +1,11 @@
+# 模板：@BIN_DIR@ / @REPO_DIR@ 由 install.sh 换成实际路径后装到 ~/.local/share/applications/
 [Desktop Entry]
 Type=Application
 Name=capsplus 托盘
 Name[zh_CN]=capsplus 托盘
 Comment=Capslock+ (keyd) 托盘：启停映射 / 重载 / 唤起 Qbar
-Exec=/home/zmj/.local/bin/capsplus-tray
-Icon=/home/zmj/project/private/capsplus-linux/assets/capsplus-on.svg
+Exec=@BIN_DIR@/capsplus-tray
+Icon=@REPO_DIR@/assets/capsplus-on.svg
 Terminal=false
 Categories=Utility;
 X-GNOME-Autostart-enabled=true

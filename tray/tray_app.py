@@ -31,16 +31,14 @@ from gi.repository import AyatanaAppIndicator3 as AppIndicator  # noqa: E402
 from gi.repository import GLib, Gtk  # noqa: E402
 
 from capsplus import __version__, apply as cap_apply  # noqa: E402
-from qbar.logic import settings_launch_command  # noqa: E402
+from capsplus.env import KEYD_UNIT, find_keyd_bin, resolve_keyd_bin  # noqa: E402
+from qbar.logic import qbar_launch_command, settings_launch_command  # noqa: E402
 from qbar.search_config import ensure_config_file, shell_quote  # noqa: E402
 
 STATE_DIR = Path.home() / ".local/state/capsplus"
 LOCK_PATH = STATE_DIR / "tray.lock"
 ASSETS = REPO / "assets"
 KEYD_CONF = cap_apply.KEYD_CONF
-# keyd 以 root 运行，它要拉起 GUI 必须降权 + 带会话环境（明江已实测的那条包装串）
-USER_ENV = ("runuser -u zmj -- env XDG_RUNTIME_DIR=/run/user/1000 WAYLAND_DISPLAY=wayland-0 "
-            "DISPLAY=:0 DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus")
 
 
 def icon(name: str) -> str:
@@ -137,13 +135,14 @@ class Tray:
     # keyd listen：把 CAPS 层状态读出来（失败就静默降级）
     # ------------------------------------------------------------------
     def start_layer_listener(self):
-        if not shutil.which("keyd.rvaiya"):
+        keyd = find_keyd_bin()
+        if not keyd:
             return
 
         def worker():
             try:
                 proc = subprocess.Popen(
-                    ["sudo", "-n", "keyd.rvaiya", "listen"],
+                    ["sudo", "-n", keyd, "listen"],
                     stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
             except OSError:
                 return
@@ -204,13 +203,26 @@ class Tray:
         self.run_async(worker, done)
 
     def on_qbar(self, _item):
-        self.shell(f"{USER_ENV} capsplus-qbar")
+        """唤起 / 收起 Qbar。
+
+        与 on_settings 一样直接 fork：托盘本来就跑在用户的 Wayland 会话里，
+        环境是现成的；Qbar 自己的 socket 单实例负责"已开着就切换显示/隐藏"。
+        """
+        cmd = qbar_launch_command()
+        if not cmd:
+            self.notify("没找到 capsplus-qbar，先跑一次 ./install.sh")
+            return
+        try:
+            subprocess.Popen(cmd, stdin=subprocess.DEVNULL,
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except OSError as exc:
+            self.notify(f"打不开 Qbar: {exc}"[:80])
 
     def on_settings(self, _item):
         """设置窗口（三页：快速链接 / 通用 / 按键映射）。
 
-        与 on_qbar 不同，这里**不用** USER_ENV 包装：托盘本来就跑在明江的 Wayland 会话里，
-        直接 fork 就继承了会话环境；而 `runuser` 需要 root，非 root 调用只会失败。
+        这里**不套** runuser：托盘本来就跑在用户的 Wayland 会话里，直接 fork 就继承了
+        会话环境；而 `runuser` 只有 root 能用，非 root 调用只会失败（实测退出码 1）。
         窗口自带单实例（socket），重复点只是把已经开着的那扇拉到前台。
         """
         cmd = settings_launch_command()
@@ -237,21 +249,24 @@ class Tray:
         self.shell(f"xdg-open {KEYD_CONF}")
 
     def on_logs(self, _item):
-        cmd = f"sudo -n journalctl -u keyd --no-pager -n 100; echo; echo '(按回车关闭)'; read"
+        cmd = (f"sudo -n journalctl -u {KEYD_UNIT} --no-pager -n 100; "
+               "echo; echo '(按回车关闭)'; read")
         for term in ("ptyxis", "gnome-terminal", "kgx", "xterm"):
             if shutil.which(term):
                 flag = "--" if term == "gnome-terminal" else "-e"
                 self.shell(f'{term} {flag} bash -lc {shell_quote(cmd)}')
                 return
-        self.notify("没找到可用终端，请看 journalctl -u keyd")
+        self.notify(f"没找到可用终端，请看 journalctl -u {KEYD_UNIT}")
 
     def on_about(self, _item):
         dialog = Gtk.AboutDialog()
         dialog.set_program_name("capsplus-tray")
         dialog.set_version(__version__)
         dialog.set_comments("Linux 版 Capslock+ 托盘：keyd 映射启停 / 重载 / Qbar 唤起")
-        dialog.set_authors(["Echo（明江的专职代理）"])
-        dialog.set_license_type(Gtk.License.MIT_X11)
+        dialog.set_authors(["capsplus-linux contributors"])
+        dialog.set_website("https://github.com/wo52616111/capslock-plus")
+        dialog.set_wrap_license(True)
+        dialog.set_license_type(Gtk.License.GPL_2_0_ONLY)
         dialog.connect("response", lambda d, _r: d.destroy())
         dialog.show_all()
 

@@ -8,7 +8,9 @@
 set -euo pipefail
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-BIN_DIR="${HOME}/.local/bin"
+# 与 capsplus/env.py:bindir() 同一口径：CAPSPLUS_BINDIR 指哪儿就装哪儿（渲染出的 keyd
+# command(...) 路径也是它，两边必须一致，否则 keyd 找不到唤起 Qbar 的脚本）
+BIN_DIR="${CAPSPLUS_BINDIR:-${HOME}/.local/bin}"
 AUTOSTART_DIR="${HOME}/.config/autostart"
 APPS_DIR="${HOME}/.local/share/applications"
 WITH_AUTOSTART=1
@@ -32,9 +34,44 @@ check_runuser() {
   done
   echo "  ✗ 缺少 runuser（keyd 唤起 Qbar 需要它）"; missing=1
 }
-check_cmd python3
-check_cmd fdfind
-check_cmd keyd.rvaiya
+# keyd 的可执行名各发行版不一样：Debian/Ubuntu 因与 onak 撞名装成 keyd.rvaiya，
+# Arch / Fedora / openSUSE 就叫 keyd。两个都认；都没装只给命令，**不替你装**（它要动内核输入层）。
+check_keyd() {
+  for c in keyd.rvaiya keyd; do
+    if command -v "$c" >/dev/null 2>&1; then echo "  ✓ keyd -> $(command -v "$c")"; return; fi
+  done
+  echo "  ✗ 没找到 keyd / keyd.rvaiya —— 键位映射这块整个用不了。各发行版装法（自己挑一条）："
+  echo "      Debian/Ubuntu : sudo apt install keyd.rvaiya   （Debian 系；Ubuntu 也可用上游 .deb）"
+  echo "      Arch          : sudo pacman -S keyd"
+  echo "      Fedora        : sudo dnf install keyd"
+  echo "      openSUSE      : sudo zypper install keyd"
+  echo "      通用（上游源码）: https://github.com/rvaiya/keyd  README 的 Install 一节"
+  missing=1
+}
+# fd 也是同名不同物：Debian/Ubuntu 叫 fdfind，别处多半叫 fd（Qbar 的文件搜索要用）
+check_fd() {
+  for c in fdfind fd; do
+    if command -v "$c" >/dev/null 2>&1; then echo "  ✓ $c -> $(command -v "$c")（Qbar 文件搜索）"; return; fi
+  done
+  echo "  ✗ 没找到 fd/fdfind —— 只影响 Qbar 搜文件，其余功能不受影响"
+  echo "      Debian/Ubuntu: sudo apt install fd-find    Arch: sudo pacman -S fd    Fedora: sudo dnf install fd"
+  missing=1
+}
+# tomllib 是 3.11 才进标准库的，版本不够时快速链接配置根本读不了 —— 早点说清楚
+check_python() {
+  if ! command -v python3 >/dev/null 2>&1; then echo "  ✗ 缺少 python3"; missing=1; return; fi
+  if python3 -c 'import sys; sys.exit(0 if sys.version_info >= (3, 11) else 1)' 2>/dev/null; then
+    echo "  ✓ python3 -> $(command -v python3)（$(python3 -V 2>&1)）"
+  else
+    echo "  ✗ python3 版本太低：$(python3 -V 2>&1)。本项目用了标准库 tomllib，**需要 >= 3.11**"
+    echo "      Ubuntu 24.04 及更早: sudo apt install python3.11（或 python3.12），再用它跑 install.sh"
+    echo "      Fedora/Arch        : 系统 python3 已经够新，一般不用管"
+    missing=1
+  fi
+}
+check_python
+check_fd
+check_keyd
 check_runuser
 check_cmd desktop-file-validate
 
@@ -71,23 +108,20 @@ for name in capsplus capsplus-tray capsplus-qbar capsplus-settings keyd-qbar-cmd
 done
 
 echo "== 安装应用菜单入口 =="
-# Qbar 启动器 + 托盘：都装成"应用菜单版"（能在 GNOME 应用网格 / Dock 里搜到、固定住）。
-# 每项是「仓内模板文件:安装后的文件名:要绑的 bin 名」；Exec/Icon 按本机重写，
-# 免得模板里写死 /home/zmj 的绝对路径，换个用户就跑不起来。
+# 模板里的 @BIN_DIR@ / @REPO_DIR@ 换成本机实际路径再装 —— 仓里不许留任何具体用户的绝对路径。
+render_template() {    # $1=模板 $2=目标
+  sed -e "s#@BIN_DIR@#$BIN_DIR#g" -e "s#@REPO_DIR@#$REPO#g" "$1" > "$2"
+}
 mkdir -p "$APPS_DIR"
 # 装两条：Qbar 启动器 + 设置界面。
-# 托盘**不**装（它开机自启，应用菜单里再放一条是冗余 —— 2026-10-15 明江反馈"应用里面有两个"）；
+# 托盘**不**装（它开机自启，应用菜单里再放一条是冗余 —— 2026-10-15 用户实测反馈"应用里面有两个"）；
 # 设置界面要装，因为它是真能点的窗口，而且托盘图标的宿主扩展（ubuntu-appindicators）
 # 有可能处于 INACTIVE（本会话没加载），那时应用菜单是唯一不靠命令行的入口。
-for spec in "packaging/capsplus-qbar.desktop:capsplus-qbar.desktop:capsplus-qbar" \
-            "packaging/capsplus-settings.desktop:capsplus-settings.desktop:capsplus-settings"; do
-  src="$REPO/${spec%%:*}"
-  rest="${spec#*:}"
-  dst="$APPS_DIR/${rest%%:*}"
-  bin="${rest#*:}"
-  sed -e "s#^Exec=.*#Exec=$BIN_DIR/$bin#" \
-      -e "s#^Icon=.*#Icon=$REPO/assets/capsplus-on.svg#" \
-      "$src" > "$dst"
+for pair in "packaging/capsplus-qbar.desktop:capsplus-qbar.desktop" \
+            "packaging/capsplus-settings.desktop:capsplus-settings.desktop"; do
+  src="$REPO/${pair%%:*}"
+  dst="$APPS_DIR/${pair#*:}"
+  render_template "$src" "$dst"
   echo "  $dst"
 done
 if command -v desktop-file-validate >/dev/null 2>&1; then
@@ -109,9 +143,7 @@ fi
 if [ "$WITH_AUTOSTART" = 1 ]; then
   echo "== 安装 autostart =="
   mkdir -p "$AUTOSTART_DIR"
-  sed -e "s#^Exec=.*#Exec=$BIN_DIR/capsplus-tray#" \
-      -e "s#^Icon=.*#Icon=$REPO/assets/capsplus-on.svg#" \
-      "$REPO/packaging/capsplus-tray.desktop" > "$AUTOSTART_DIR/capsplus-tray.desktop"
+  render_template "$REPO/packaging/capsplus-tray.desktop" "$AUTOSTART_DIR/capsplus-tray.desktop"
   echo "  $AUTOSTART_DIR/capsplus-tray.desktop"
   echo "  （不想开机自启就删掉它，或下次加 --no-autostart）"
 else
@@ -133,7 +165,8 @@ cat <<EOF
   1) 看渲染结果:      capsplus render | less
   2) 应用（会备份+reload，出错自动回滚）:  capsplus apply
   3) 状态:            capsplus status
-  4) 托盘常驻:        capsplus-tray   （或 systemctl --user enable --now capsplus-tray）
+  4) 托盘常驻:        capsplus-tray   （autostart 已装；想用 systemd --user 就照
+                        packaging/capsplus-tray.service 头部那三行命令自己渲染+启用）
   5) Qbar:            capsplus-qbar   （keyd 侧用 bin/keyd-qbar-cmd 包装）
   6) 快速链接配置:    ${HOME}/.config/capsplus/qbar.toml
      （首次打开 Qbar 时自动生成；托盘右键「编辑快速链接」也能开）

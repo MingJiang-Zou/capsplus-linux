@@ -3,15 +3,51 @@
 # Copyright (c) 2026 capsplus-linux contributors
 # 本文件属 capsplus-linux —— CapsLock+ v3.3.0 的 Linux 移植（衍生作品）；按键映射数据译自上游：
 #   上游 https://github.com/wo52616111/capslock-plus （GPL-2.0，© wo52616111）；改动见 README「许可与上游」。
-# keyd 用：keyd 的 command(...) 以 root 执行，拉 GUI 必须降权 + 带用户会话环境。
-# 用法（keyd 配置里）：command(/home/zmj/.local/bin/keyd-qbar-cmd)
+# keyd 用：keyd 的 command(...) 是以 **root** 执行的，拉 GUI 必须降权 + 带上用户会话环境。
+#
+# 用法（keyd 配置里由 `capsplus render` 生成，不用手抄）：
+#     command(<你的 bin 目录>/keyd-qbar-cmd)      # 默认 ~/.local/bin/keyd-qbar-cmd
+#
 # 效果：Qbar 已开 -> 切换显示/隐藏（Qbar 自己的 socket 单实例负责）；没开 -> 起一个。
+#
+# 这里**不许**写死用户名 / uid / 家目录，只认两个来源：
+#   目标用户 = CAPSPLUS_USER（显式指定），否则取这个脚本文件本身的属主
+#              （install.sh 把软链装进用户自己的 ~/.local/bin，readlink -f 后落在仓内，
+#               属主就是装它的那个人；root 也 stat 得到）
+#   会话环境 = /run/user/<该用户 uid>；显示变量按 ${WAYLAND_DISPLAY:-wayland-0} 兜底
 set -eu
-RUNUSER="$(command -v runuser || true)"
-[ -n "$RUNUSER" ] || RUNUSER=/usr/sbin/runuser        # /usr/sbin 不在普通用户 PATH 里
-exec "$RUNUSER" -u zmj -- env \
-  XDG_RUNTIME_DIR=/run/user/1000 \
-  WAYLAND_DISPLAY=wayland-0 \
-  DISPLAY=:0 \
-  DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus \
-  /home/zmj/.local/bin/capsplus-qbar "$@"
+
+SELF="$(readlink -f "$0" 2>/dev/null || echo "$0")"
+BIN_DIR="$(dirname "$SELF")"
+
+USER_NAME="${CAPSPLUS_USER:-$(stat -Lc '%U' "$SELF" 2>/dev/null || id -un)}"
+USER_UID="$(id -u "$USER_NAME" 2>/dev/null || id -u)"
+USER_HOME="$(getent passwd "$USER_NAME" | cut -d: -f6)"
+RUN_DIR="/run/user/$USER_UID"
+
+# runuser 在 /usr/sbin，root 的 PATH 里也不一定带 —— 三个位置挨个试
+RUNUSER=""
+for c in "$(command -v runuser 2>/dev/null || true)" /usr/sbin/runuser /sbin/runuser; do
+    if [ -n "$c" ] && [ -x "$c" ]; then RUNUSER="$c"; break; fi
+done
+if [ -z "$RUNUSER" ]; then
+    echo "keyd-qbar-cmd: 找不到 runuser（属于 util-linux）" >&2
+    exit 1
+fi
+
+# Qbar 入口：先找本脚本旁边的 capsplus-qbar（install.sh 把两者软链到同一目录），
+# 再退回该用户的 ~/.local/bin
+QBAR="$BIN_DIR/capsplus-qbar"
+if [ ! -x "$QBAR" ]; then QBAR="$USER_HOME/.local/bin/capsplus-qbar"; fi
+if [ ! -x "$QBAR" ]; then
+    echo "keyd-qbar-cmd: 找不到 capsplus-qbar（先跑一次 ./install.sh）" >&2
+    exit 1
+fi
+
+exec "$RUNUSER" -u "$USER_NAME" -- env \
+  HOME="$USER_HOME" \
+  XDG_RUNTIME_DIR="$RUN_DIR" \
+  WAYLAND_DISPLAY="${WAYLAND_DISPLAY:-wayland-0}" \
+  DISPLAY="${DISPLAY:-:0}" \
+  DBUS_SESSION_BUS_ADDRESS="unix:path=$RUN_DIR/bus" \
+  "$QBAR" "$@"

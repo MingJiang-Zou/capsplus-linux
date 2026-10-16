@@ -4,9 +4,10 @@
 #   上游 https://github.com/wo52616111/capslock-plus （GPL-2.0，© wo52616111）；改动见 README「许可与上游」。
 """Capslock+ 键位映射的唯一真相源。
 
-搬自参考文件 /home/zmj/.dsh/refs/capslock-v3.3.0/keyd-capslock-plus.conf
-（该文件又逐条对照官方 Capslock+ v3.3.0 源码 lib/lib_keysSet.ahk 的
-keySchemeInit_capslox() 与 lib/lib_keysFunction.ahk 写成）。
+本表译自官方 Capslock+ v3.3.0（https://github.com/wo52616111/capslock-plus，GPL-2.0）
+源码 lib/lib_keysSet.ahk 的 keySchemeInit_capslox() 与 lib/lib_keysFunction.ahk；
+翻译过程中另有一份手抄的 keyd 参考配置用来做等价验收，位置由环境变量
+CAPSPLUS_REF_CONF 指（各人机器路径不同，仓里不写死；没有就跳过那条验收用例）。
 
 设计取舍：用 Python 常量而不是 TOML —— 注释可以直接贴在被注释的那一行旁边，
 而 `tomllib` 是只读的、无法把注释带回来，渲染时还得再维护一份注释表（=第二份真相）。
@@ -21,6 +22,8 @@ keySchemeInit_capslox() 与 lib/lib_keysFunction.ahk 写成）。
       把注释当成宏 token 报 `invalid key or action` —— 2026-10-15 实测踩过）
 """
 
+from .env import BINDIR_TOKEN
+
 # 短按 Caps = 原大小写切换（官方源码 line23 press_caps=toggleCapsLock），与原版一致
 MAIN_SECTION = "main"
 
@@ -34,7 +37,8 @@ def _macro(*keys: str) -> str:
     return "macro(" + " ".join(keys) + ")"
 
 
-# 按键名。keyd 的键名表见 `keyd.rvaiya list-keys`；这里只把用到的拎出来当常量，
+# 按键名。keyd 的键名表见 `<keyd> list-keys`（各发行版二进制名不同，见 capsplus/env.py）；
+# 这里只把用到的拎出来当常量，
 # 免得宏里手写错字（漏写一个 up 就是少走一行）。
 UP, DOWN, LEFT, RIGHT = "up", "down", "left", "right"
 S_UP, S_DOWN, S_LEFT, S_RIGHT = "S-up", "S-down", "S-left", "S-right"
@@ -100,7 +104,8 @@ CAPL = [
     ("x", "C-x"),
     ("v", "C-v"),
     "---- Qbar ----",
-    ("q", "command(/home/zmj/.local/bin/keyd-qbar-cmd)"),
+    # 家目录不写死：@CAPSPLUS_BINDIR@ 在渲染时换成当前用户的 bin 目录（capsplus/env.py）
+    ("q", f"command({BINDIR_TOKEN}/keyd-qbar-cmd)"),
     "---- 插入 ----",
     ("space", ENTER),
     ("enter", _macro(END, ENTER)),

@@ -1,3 +1,4 @@
+# 模板：@BIN_DIR@ / @REPO_DIR@ 由 install.sh 换成实际路径后装到 ~/.local/share/applications/
 [Desktop Entry]
 Type=Application
 Version=1.0
@@ -5,8 +6,8 @@ Name=capsplus 设置
 Name[zh_CN]=capsplus 设置
 Comment=配置快速链接 / 网站内搜索 / 按键映射
 Comment[zh_CN]=配置快速链接 / 网站内搜索 / 按键映射
-Exec=/home/zmj/.local/bin/capsplus-settings
-Icon=/home/zmj/project/private/capsplus-linux/assets/capsplus-on.svg
+Exec=@BIN_DIR@/capsplus-settings
+Icon=@REPO_DIR@/assets/capsplus-on.svg
 Terminal=false
 Categories=Settings;
 Keywords=capsplus;settings;qbar;keyd;按键;快速链接;搜索;设置;

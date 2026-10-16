@@ -22,6 +22,7 @@ from datetime import datetime
 from pathlib import Path
 
 from . import apply as cap_apply
+from .env import keyd_cli_hint
 from .mapping_overrides import (
     ALLOWED_SECTIONS, OverrideError, save_overrides, toml_table, validate_action,
 )
@@ -141,7 +142,7 @@ def validate_key_name(key: str, known_keys: set[str] | None = None) -> str:
     if any(ch.isspace() for ch in text):
         return f"键名不能含空格: {text!r}"
     if known_keys is not None and text not in known_keys:
-        return f"不认识的键名: {text}（见 keyd.rvaiya list-keys）"
+        return f"不认识的键名: {text}（见 {keyd_cli_hint()} list-keys）"
     return ""
 
 
