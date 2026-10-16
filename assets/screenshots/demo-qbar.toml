@@ -1,0 +1,35 @@
+# capsplus Qbar 配置（**公开演示用**，不含任何真实个人链接）
+[general]
+default_search = "s"
+browser = ""
+hide_on_focus_out = true
+
+[[link]]
+trigger = "s"
+name = "示例搜索"
+type = "search"
+url = "https://example.com/search?q={q}"
+
+[[link]]
+trigger = "docs"
+name = "示例站内文档"
+type = "search"
+url = "https://example.org/{}"
+
+[[link]]
+trigger = "home"
+name = "示例固定网址"
+type = "url"
+url = "https://example.com"
+
+[[link]]
+trigger = "term"
+name = "示例应用"
+type = "app"
+url = "org.gnome.Terminal"
+
+[[link]]
+trigger = "dl"
+name = "示例目录"
+type = "file"
+url = "~/Downloads"

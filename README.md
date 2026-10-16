@@ -13,11 +13,15 @@
 **许可**：GPL-2.0-only（本仓的按键映射表译自上游 CapsLock+，属衍生作品）——
 出处、改动清单与分发要求见下面「[许可与上游](#许可与上游)」一节，全文见 [`LICENSE`](LICENSE)。
 
-**截图**：还没有（`assets/screenshots/` 里只有一份该拍什么的清单，
-见 [`assets/screenshots/PLACEHOLDER.md`](assets/screenshots/PLACEHOLDER.md)）。
-要补的三张：① Qbar 敲 `b 关键词` 的搜索态；② 设置窗口「按键映射」页（只读表格 + 下方编辑条）；
-③ 托盘菜单。放图之前先读 [`docs/PRIVACY.md`](docs/PRIVACY.md) —— 截图里可能带着你搜过的词。
+**截图**（都是 `xvfb-run` 在虚拟显示里拍的，`python3 tools/make-screenshots.py` 可重拍）：
 
+| 快速链接 | 通用 | 按键映射 |
+|---|---|---|
+| ![快速链接页](assets/screenshots/links.png) | ![通用页](assets/screenshots/general.png) | ![按键映射页](assets/screenshots/keys.png) |
+
+界面数据来自 [`assets/screenshots/demo-qbar.toml`](assets/screenshots/demo-qbar.toml)（五条 example.com 假链接），
+不是任何人的真实配置。**你自己放截图之前先读** [`docs/PRIVACY.md`](docs/PRIVACY.md) —— 底部状态栏会写着配置文件路径，
+表格里 `q` 那行会写着 `command(<你的 bindir>/keyd-qbar-cmd)`，而 `qbar.log` 的 `activate` 行带搜索关键词。
 ## 依赖
 
 | 依赖 | 版本 / 说明 | 必需性 |
