@@ -50,7 +50,10 @@ function browserWindows() {
     if (id) {
         const app = Shell.AppSystem.get_default().lookup_app(id);
         if (app) {
-            for (const w of app.get_windows(false)) {
+            // GNOME 50 的 Shell.App.get_windows() 是 0 参：传 false 会在 journal 刷
+            // `Too many arguments … expected 0, got 1`（本机 18:47 实测）。要「当前工作区」
+            // 就自己按 workspace 过滤，别指望这个参数。
+            for (const w of app.get_windows()) {
                 out.push({ w, why: `app=${id}` });
             }
         }
@@ -126,13 +129,10 @@ export default class RaiseBrowserExtension {
             () => raiseBrowser());
         _subProbe = Gio.DBus.session.signal_subscribe(null, IFACE, M_PROBE, null, null, null,
             () => {
-                const rep = report('');
-                console.log(`[raise-browser] probe ${rep}`);
-                // 回一发 ProbeReport：信号本来没有回复通道，加一个反向成员就有"活着没"的应答，
-                // Qbar 因此知道该不该等那一帧，状态也能在 capsplus status 里显示实测值。
-                // GJS 的 emit_signal 是 5 个实参：destination, object_path, interface, member, parameters。
-                Gio.DBus.session.emit_signal(null, OBJ_PATH, IFACE, M_REPORT,
-                                             new GLib.Variant('(s)', [rep]));
+                // 只写 journal，不试图回 D-Bus 包：实测在 shell 进程里 `Gio.DBus.session.emit_signal`
+                // 不会把包送上总线（外部能收到 Probe、监视器抓 0 条 ProbeReport，且没有任何 JS ERROR）
+                // ⇒ 判活与取窗口数一律读 journal（2026-10-16）。
+                console.log(`[raise-browser] probe ${report('')}`);
             });
         console.log(`[raise-browser] ready ${report('')}`);
     }

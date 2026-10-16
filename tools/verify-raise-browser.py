@@ -43,6 +43,24 @@ def emit(member):
     from gi.repository import Gio
     conn = Gio.bus_get_sync(Gio.BusType.SESSION, None)
     conn.emit_signal(None, PATH, IFACE, member, None)
+    pump(150)
+
+
+def pump(ms: int) -> None:
+    """把 GLib 主循环真跑 ms 毫秒 —— **`emit_signal` 只是入队，靠主循环派发才写得出去**。
+
+    2026-10-16 实测三种写法：
+      * `time.sleep()`：送不到（睡过去主循环根本没转）；
+      * `MainContext.iteration(False)` 空转：也送不到；
+      * `GLib.MainLoop()` + `timeout_add` 退出：**每次都送到** ✓
+    所以别把这里"优化"回 sleep/iteration —— 那不是慢，那是没发。
+    """
+    import gi
+    gi.require_version("GLib", "2.0")
+    from gi.repository import GLib
+    loop = GLib.MainLoop()
+    GLib.timeout_add(max(20, int(ms)), loop.quit)
+    loop.run()
 
 
 def windows_since(when_iso):

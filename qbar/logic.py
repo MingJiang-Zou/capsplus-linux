@@ -776,8 +776,8 @@ RAISE_BUS_PATH = "/io/github/capsplus/RaiseBrowser"
 RAISE_BUS_IFACE = "io.github.capsplus.RaiseBrowser"
 RAISE_MEMBER = "RaiseBrowser"
 RAISE_PROBE_MEMBER = "Probe"
-RAISE_REPORT_MEMBER = "ProbeReport"      # 扩展回给我们的应答（"活着没"就靠它）
-RAISE_SETTLE_US = 80_000        # 激活落地约一帧；等满再打开，否则浏览器仍按"我没焦点"处理
+RAISE_SETTLE_MS = 150           # 发出信号后要把主循环跑这么久而非 sleep：见 qbar_app._pump
+RAISE_JOURNAL_WAIT_MS = 400     # 问一次 Probe 后，给 shell 写 journal 的时间
 
 
 def ext_state_payload(alive, info, now_ts: int) -> str:
@@ -837,16 +837,21 @@ def parse_probe_report(text: str) -> dict:
     return out
 
 
+def journal_probe_command(since_iso: str) -> list[str]:
+    """读用户 journal 的 argv（判活用得上；本机实测 shell 侧唯一可靠的出口就是 journal）。"""
+    return ["journalctl", "--user", "--since", since_iso, "-o", "cat", "--no-pager"]
+
+
+def latest_probe_report(text: str):
+    """从 journal 文本里取最后一条 `[raise-browser] probe …` 的报告串；没有返回 None。"""
+    found = None
+    for line in (text or "").splitlines():
+        if "[raise-browser] probe " in line:
+            found = line.split("[raise-browser] probe ", 1)[1].strip()
+    return found
+
+
 def should_settle(alive) -> bool:
     """已知扩展不在（False）就别再白等一帧；未知（None）与在（True）都等。"""
     return alive is not False
 
-
-def subscribe_probe_report(bus, callback, flags) -> int:
-    """订阅扩展应答。**本机实测的 PyGI 形状**：
-    `signal_subscribe(sender, interface_name, member, object_path, arg0, flags, callback, user_data=None)`
-    —— `flags` 必填（漏了报 "flag values must be strings, ints…"），回调在 flags **之后**，
-    与 GJS 那边"7 个实参、回调在最后"**不同**（GJS 是 sender, interface, member, path, arg0,
-    user_data, callback）⇒ 别把两边的参数顺序互相照抄。"""
-    return bus.signal_subscribe(None, RAISE_BUS_IFACE, RAISE_REPORT_MEMBER,
-                                None, None, flags, callback)

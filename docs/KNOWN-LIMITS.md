@@ -324,3 +324,27 @@ r = searchParams.get("q")?.trim() ?? e.get("prompt")
 其余失败由扩展自己的 `console.error` 写进 journal；排查一律
 `journalctl --user --since '-10 min' | grep raise-browser`。
 另外：改过扩展代码后 `disable/enable` **不会重新 import**（状态卡在 ERROR），必须重登。
+
+### 发信号必须**跑主循环**，`sleep` 等于没发（2026-10-16 实测，代价最大的一条）
+
+`Gio.DBusConnection.emit_signal()` 只是把消息**入队**，真正写出去靠 GLib 主循环派发。
+同一台机、同一段代码，三种写法的实测结果：
+
+| 写法 | 结果 |
+| --- | --- |
+| `emit_signal(...)` 之后 `GLib.usleep(80_000)` / `time.sleep(0.8)` | 扩展**收不到**，journal 里一条 `probe` 都没有 ⇒ 等于没发 |
+| `MainContext.iteration(False)` 空转 120ms | 同样收不到 |
+| `GLib.MainLoop()` + `timeout_add(ms, quit)` 跑起来 | **每次都收到** ✓ A/B 由此测出 +0（原窗口开标签页） |
+
+这条为什么值钱：Qbar 里原本写的就是第一种（`GLib.usleep`），所以扩展明明已经 ACTIVE、
+`capsplus status` 也说正常，明江手动测出来仍然是"新窗口"——**发送方自己把包咽回去了**。
+判据层面还有个教训：那条分支没人跑过，所以改名/改常量时工作树破了也全绿
+（现已加"未导入的大写常量"门 + 泵门，见 `tests/test_raise_browser.py`）。
+
+### 扩展在 shell 进程里 `emit_signal` 上不了总线（因此判活读 journal）
+
+实测：外部（Python-GI 或 gjs 进程）发 `Probe` → 扩展收得到并写 journal ✓
+但扩展内部回发 `ProbeReport` → `dbus-monitor` 抓 **0 条**，且 journal 无任何 `JS ERROR`。
+结论：**别把"活没活"的通道设计成扩展回包**，一律读 journal
+（`[raise-browser] probe default=… windows=N on-current=M`），Qbar 的判活就是这么做的
+（后台线程：发 Probe → 跑主循环 400ms → `journalctl --user --since …`）。

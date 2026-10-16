@@ -11,6 +11,22 @@ GitHub 仓库的 Releases 页。版本号唯一落点是 `capsplus/__init__.py` 
 
 ## 0.2.0 —— 2026-10-16
 
+### 19:00 追加：真正修好"还是新窗口"的那一刀在发送方
+
+- **根因**：Qbar 用 `GLib.usleep(80ms)` 等激活落地 —— 但 `emit_signal` 只是入队，
+  主线程睡过去 ⇒ 主循环不转 ⇒ **信号根本没发出去**。扩展早已 ACTIVE，用户实测仍是新窗口。
+  改成跑真主循环（`GLib.MainLoop` + `timeout_add`）后，A/B 实测：**A 轮 1→2（+1，复现老毛病），
+  B 轮 2→2（+0，原窗口开标签页）** ✓
+- 判活改走 **journal**（扩展在 shell 进程里 `emit_signal` 实测上不了总线：`dbus-monitor` 抓 0 条回包
+  且无 JS ERROR）：Qbar 后台线程发 Probe → 跑主循环 400ms → `journalctl --user --since …` 取
+  `[raise-browser] probe … windows=N`，写进 `raise-browser.json`，`capsplus status` 并排显示。
+- 扩展去掉 `ProbeReport` 回包代码（走不通的路不留半成品）；`get_windows(false)` 改无参调用
+  （GNOME 50 该方法是 0 参，带参会在 journal 刷 `Too many arguments`）。
+- 判据加两道门：**泵门**（`_raise_browser_window` 必须 `_pump(`、不许 `usleep`）与
+  **未导入大写常量门**（常量改名时 qbar_app 没跟上，工作树破到一走就 `NameError`，
+  而当时判据全绿——因为没人跑过那条分支）。另加 journal 助手、扩展不回包等 5 条。
+
+
 主题：**能问 AI、能复用浏览器窗口、静默失效能自检**。
 
 - `ask` 链接类型（复制问题 + 打开页面）、DeepSeek 预填引擎 `ds`/`dsp`（读它自己的 `main.js` 取证）、

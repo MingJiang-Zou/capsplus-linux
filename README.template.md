@@ -86,8 +86,12 @@ python3 tools/verify-raise-browser.py
 capsplus status | grep -E "浏览器扩展|Qbar 实测"
     # 两个读数都要看：
     #   浏览器扩展 = shell 的观点（ACTIVE / ERROR / missing / no-gnome）
-    #   Qbar 实测   = 链路的观点（扩展有没有真回 ProbeReport）
-    # shell 说 ACTIVE 而 Qbar 收不到应答，说明链路仍是断的 —— 反过来也一样。
+    #   Qbar 实测   = 链路的观点（Qbar 自己发 Probe 后从 journal 取回的窗口数）
+    # shell 说 ACTIVE 而 Qbar 取不到应答，说明链路仍是断的 —— 反过来也一样。
+"
+              "    # ⚠ 信号是"入队"语义：发送方必须让 GLib 主循环转起来，`sleep` 等于没发
+"
+              "    #    （本机实测，见 docs/KNOWN-LIMITS.md 的三种写法对照表）
 ```
 
 Qbar 打开网址前发 `RaiseBrowser` 信号，扩展回一发 `ProbeReport`（带 `windows=` / `on-current=`）。

@@ -42,9 +42,9 @@ from qbar.logic import (  # noqa: E402
     entry_history_payload, history_key,
     scan_desktop_files, settings_launch_command,
     window_width,
-    raise_browser_signal, RAISE_SETTLE_US,
-    RAISE_PROBE_MEMBER, RAISE_REPORT_MEMBER, parse_probe_report,
-    ext_state_payload, should_settle, subscribe_probe_report,
+    raise_browser_signal, RAISE_SETTLE_MS,
+    RAISE_JOURNAL_WAIT_MS, RAISE_PROBE_MEMBER, ext_state_payload,
+    journal_probe_command, latest_probe_report, parse_probe_report, should_settle,
 )
 from qbar.search_config import open_command  # noqa: E402
 
@@ -95,6 +95,19 @@ def app_dirs() -> list[Path]:
         if part.strip():
             dirs.append(Path(part.strip()) / "applications")
     return dirs
+
+
+def _pump(ms: int) -> None:
+    """把 GLib 主循环跑 ms 毫秒，让已入队的 D-Bus 消息真的写出去。
+
+    本机实测三种写法只有这一种行得通（别再改回去）：
+      * `GLib.usleep()` / `time.sleep()`：主循环不转 ⇒ **信号根本没发出**；
+      * `MainContext.iteration(False)` 空转 120ms：也没发出；
+      * `GLib.MainLoop()` + `timeout_add(ms, quit)`：**每次都发出** ✓（A/B 实测 +0 就是它）
+    """
+    loop = GLib.MainLoop()
+    GLib.timeout_add(max(20, int(ms)), loop.quit)
+    loop.run()
 
 
 def _session_bus():
@@ -425,30 +438,34 @@ class QbarWindow(Gtk.Window):
         except OSError as exc:
             log(f"扩展状态写不了：{exc}")
 
-    def _on_probe_report(self, _conn, _sender, _path, _iface, _member, params):
-        """扩展回 ProbeReport ⇒ 它在跑。顺带把窗口数记一行，方便事后对账。"""
-        text = params.unpack()[0] if params is not None else ""
-        info = parse_probe_report(text)
-        first = self._ext_alive is not True
-        self._ext_alive = True
-        if info.get("windows") is not None:
-            log(f"扩展应答：windows={info['windows']} on-current={info['on_current']} "
-                f"default={info['default']}")
-        self._write_ext_state(True, info)
-        if first:
-            log("raise-browser 扩展在跑（打开网址前会先激活浏览器窗口）")
-
     def _start_ext_watch(self):
-        """订阅扩展应答 + 问一次 Probe。装不上不影响别的（Qbar 正事是打开网址）。"""
-        try:
-            bus = _session_bus()
-            self._ext_sub = subscribe_probe_report(bus, self._on_probe_report,
-                                                   Gio.DBusSignalFlags.NONE)
-            raise_browser_signal(bus, RAISE_PROBE_MEMBER)
-            self._write_ext_state(None, {})
-            log("已向扩展问 Probe（没应答就是扩展没加载：capsplus status 能看状态）")
-        except Exception as exc:
-            log(f"扩展应答订阅失败（不影响打开）：{type(exc).__name__} {exc}")
+        """问一次 Probe，再从 **journal** 判活（后台线程，绝不卡界面）。
+
+        为什么不走 D-Bus 应答：扩展在 shell 进程里 `emit_signal` 实测上不了总线
+        （外部发 Probe 它收得到、journal 有 probe 行，但监视器抓 0 条回包，且没有任何
+        JS ERROR）⇒ journal 是唯一可靠的出口，窗口数也从那儿读。
+        """
+        def worker():
+            stamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            try:
+                raise_browser_signal(_session_bus(), RAISE_PROBE_MEMBER)
+                _pump(RAISE_JOURNAL_WAIT_MS)          # 发出去 + 给 shell 时间写 journal
+                proc = subprocess.run(journal_probe_command(stamp),
+                                      capture_output=True, text=True, timeout=6)
+                rep = latest_probe_report(proc.stdout)
+            except Exception as exc:
+                log(f"扩展判活失败（按未知处理）：{type(exc).__name__} {exc}")
+                return
+            if rep is None:
+                self._ext_alive = False
+                self._write_ext_state(False, {})
+                log("扩展没应答 Probe ⇒ 判为不在：打开网址不再等那一帧")
+            else:
+                self._ext_alive = True
+                self._write_ext_state(True, parse_probe_report(rep))
+                log(f"扩展应答：{rep}")
+
+        threading.Thread(target=worker, daemon=True).start()
 
     def _raise_browser_window(self):
         """发一发 D-Bus 信号，请 GNOME 扩展把浏览器现有窗口激活（失败绝不拦下打开动作）。
@@ -472,9 +489,12 @@ class QbarWindow(Gtk.Window):
             self._ext_alive = False
             self._write_ext_state(False, {})
             return
-        # 已知扩展不在就别白等；未知（第一次）与确认在，都等这一帧。
+        # 已知扩展不在就别白等；未知（第一次）与确认在，都要等。
+        # ⚠ 必须是**跑主循环**，不能是 sleep：`emit_signal` 只入队，主线程睡过去
+        # ⇒ 循环不转 ⇒ 信号根本没发出去（2026-10-16 用户实测"还是一样"就是这个原因，
+        # 而 A/B 工具跑真主循环测出 +0）。
         if should_settle(self._ext_alive):
-            GLib.usleep(RAISE_SETTLE_US)
+            _pump(RAISE_SETTLE_MS)
 
     def _open_url(self, url: str):
         """开网址：配了 `general.browser` 就用那条命令，否则系统默认浏览器（xdg-open）。"""

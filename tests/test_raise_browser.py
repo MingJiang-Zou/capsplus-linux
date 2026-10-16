@@ -30,10 +30,10 @@ REPO = pathlib.Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO))
 
 from qbar import search_config as SC          # noqa: E402
-from qbar.logic import (RAISE_BUS_IFACE, RAISE_BUS_PATH, RAISE_MEMBER,   # noqa: E402
-                        RAISE_PROBE_MEMBER, RAISE_REPORT_MEMBER, RAISE_SETTLE_US,
-                        parse_probe_report, raise_browser_signal, should_settle,
-                        subscribe_probe_report)
+from qbar.logic import (RAISE_BUS_IFACE, RAISE_BUS_PATH, RAISE_JOURNAL_WAIT_MS,   # noqa: E402
+                        RAISE_MEMBER, RAISE_PROBE_MEMBER, RAISE_SETTLE_MS,
+                        journal_probe_command, latest_probe_report, parse_probe_report,
+                        raise_browser_signal, should_settle)
 
 from capsplus.extcheck import EXT_UUID, extension_status  # noqa: E402  体检函数（不碰 gi）
 _HAS_EXE = lambda _x: "/usr/bin/gnome-extensions"          # 假装系统里有 gnome-extensions
@@ -70,7 +70,8 @@ class TestSignalSender(unittest.TestCase):
         self.assertNotEqual(RAISE_MEMBER, RAISE_PROBE_MEMBER, "Probe 与 Raise 不能同名")
 
     def test_settle_is_a_frame_not_a_second(self):
-        self.assertLess(RAISE_SETTLE_US, 200_000, "等太久用户会觉得 Caps+Enter 变慢")
+        self.assertLess(RAISE_SETTLE_MS, 200, "单位是毫秒：超过 200ms 用户会觉得 Caps+Enter 变慢")
+        self.assertLess(RAISE_JOURNAL_WAIT_MS, 2_000, "判活那一下在后台线程，但也不许拖到秒级")
 
 
 class TestConfigKey(unittest.TestCase):
@@ -178,6 +179,15 @@ class TestExtensionShape(unittest.TestCase):
                          "两处订阅（Raise / Probe）都必须是「7 个实参、回调在最后」那一形；"
                          f"实际匹配到 {len(hits)} 处")
 
+    def test_get_windows_is_called_without_arguments(self):
+        """GNOME 50 的 `Shell.App.get_windows()` 是 0 参：带参数会在 journal 刷
+        `Too many arguments … expected 0, got 1`（本机 18:47 实测），噪音之外还可能漏掉窗口。"""
+        js = (EXT_DIR / "extension.js").read_text(encoding="utf-8")
+        compact = js.replace(" ", "").replace("\n", "")
+        self.assertNotIn("get_windows(false", compact, "get_windows 又带参数了")
+        self.assertNotIn("get_windows(true", compact, "同上")
+        self.assertIn("get_windows()", compact, "应该是无参调用")
+
     def test_only_touches_current_workspace_windows(self):
         self.assertIn("get_workspace", self.js, "必须只激活当前工作区的窗口（不许把人从别处拽来）")
         self.assertIn("off-current-workspace", self.js, "不在当前工作区时要有明确的拒绝路径")
@@ -266,9 +276,12 @@ class TestExtensionAwareness(unittest.TestCase):
     收不到应答，链路照样是断的（反之亦然）⇒ 两个读数都要有，别用一个替代另一个。
     """
 
-    def test_report_member_and_constants(self):
-        self.assertEqual(RAISE_REPORT_MEMBER, "ProbeReport")
-        self.assertNotIn(RAISE_REPORT_MEMBER, (RAISE_MEMBER, RAISE_PROBE_MEMBER))
+    def test_the_dead_reply_path_is_gone(self):
+        """`ProbeReport` 那条路实测走不通 ⇒ 符号必须真的不存在，别留半成品。"""
+        import qbar.logic as L
+        self.assertFalse(hasattr(L, "RAISE_REPORT_MEMBER"), "死常量还留着")
+        self.assertFalse(hasattr(L, "subscribe_probe_report"), "发不通的订阅助手还留着")
+        self.assertNotIn("ProbeReport", (RAISE_MEMBER, RAISE_PROBE_MEMBER))
 
     def test_parse_probe_report_reads_numbers(self):
         info = parse_probe_report("default=microsoft-edge.desktop windows=3 on-current=2")
@@ -285,21 +298,16 @@ class TestExtensionAwareness(unittest.TestCase):
         self.assertTrue(should_settle(True))
         self.assertFalse(should_settle(False), "已知没扩展还等 80ms，就是白等")
 
-    def test_subscribe_uses_pygi_shape(self):
-        """PyGI 的形状是 (…, arg0, **flags**, callback)，和 GJS 的"回调在最后"**不同**：
-        照抄另一边的顺序会得到 'flag values must be strings…' 或 'callback got null'。"""
-        class Bus:
-            def signal_subscribe(self, *a):
-                self.args = a
-                return 11
-
-        bus = Bus()
-        cb = lambda *_a: None      # noqa: E731
-        self.assertEqual(subscribe_probe_report(bus, cb, 0), 11)
-        self.assertEqual(bus.args[0], None, "sender=None（谁发都收）")
-        self.assertEqual(bus.args[2], RAISE_REPORT_MEMBER, "订阅的成员必须是 ProbeReport")
-        self.assertEqual(bus.args[5], 0, "第 6 个实参是 flags")
-        self.assertIs(bus.args[6], cb, "回调在 flags 之后")
+    def test_journal_helpers_are_pure_and_lenient(self):
+        """判活改走 journal：命令 argv 与"取最后一条 probe 行"都必须是纯函数、不抛。"""
+        argv = journal_probe_command("2026-10-16 18:00:00")
+        self.assertEqual(argv[:3], ["journalctl", "--user", "--since"])
+        self.assertIn("-o", argv)
+        text = ("噪声\n[raise-browser] probe windows=1 on-current=1\n"
+                "[raise-browser] probe windows=3 on-current=2\n")
+        self.assertEqual(latest_probe_report(text), "windows=3 on-current=2")
+        self.assertIsNone(latest_probe_report(""))
+        self.assertIsNone(latest_probe_report(None))
 
     def test_open_url_still_asks_then_opens(self):
         tree = ast.parse(APP.read_text(encoding="utf-8"))
@@ -309,11 +317,13 @@ class TestExtensionAwareness(unittest.TestCase):
         self.assertIn("RAISE_PROBE_MEMBER", src, "发完激活还得问一次活着没")
         self.assertIn("should_settle(", src, "等不等要按实测状态，不许写死")
 
-    def test_extension_replies_with_probe_report(self):
+    def test_extension_does_not_try_to_reply_from_inside_the_shell(self):
+        """扩展侧不许再 `emit_signal`：本机实测在 shell 进程里发不出包
+        （外部发的 Probe 它收得到、journal 也有 probe 行，但 dbus-monitor 抓 0 条回包，
+        且没有任何 JS ERROR）⇒ 判活一律读 journal，别留一条走不通的路在里面。"""
         js = (EXT_DIR / "extension.js").read_text(encoding="utf-8")
-        self.assertIn("ProbeReport", js, "扩展不应答，Qbar 就永远不知道该等多久")
-        self.assertIn("emit_signal(", js, "应答要用 emit_signal（本机实测可用）")
-        self.assertIn("Variant('(s)'", js, "报告是字符串，参数类型要写对")
+        self.assertNotIn("emit_signal(", js, "扩展里不要试图发 D-Bus 包（实测上不了总线）")
+        self.assertIn("journal", js.lower(), "应答路径要写清楚：靠 journal")
 
     def test_state_payload_is_valid_json_and_roundtrips(self):
         """写盘格式必须能被读回来 —— 之前手拼 JSON 把 None 写进去，status 直接读不了。
@@ -358,6 +368,71 @@ class TestExtensionAwareness(unittest.TestCase):
         f.write_text("{坏掉的 json", encoding="utf-8")
         state, text = qbar_observed(path=str(f))
         self.assertIsNone(state, "读不了也要给一句人话，不能抛")
+
+
+class TestPumpNotSleep(unittest.TestCase):
+    """信号要发得出去，必须**跑主循环**；`GLib.usleep` 那种写法等于没发。
+
+    2026-10-16 血案：A/B 工具用真 MainLoop 测出 +0（原窗口开标签页），
+    而 Qbar 里写的是 `GLib.usleep(80_000)` —— 主线程睡过去，主循环不转，
+    队列里的信号一条都没写出去，所以明江重登后手动测"还是一样"。
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tree = ast.parse(APP.read_text(encoding="utf-8"))
+        cls.src = APP.read_text(encoding="utf-8")
+
+    def test_raise_path_pumps_instead_of_sleeping(self):
+        helper = _functions(self.tree, "_raise_browser_window")[0]
+        body = ast.unparse(helper)
+        self.assertIn("_pump(", body, "激活之后要跑主循环把信号发出去")
+        self.assertNotIn("usleep", body, "GLib.usleep 等于没发：不许回到那种写法")
+        self.assertIn("RAISE_SETTLE_MS", body)
+
+    def test_pump_helper_exists_and_uses_mainloop(self):
+        pump = _functions(self.tree, "_pump")
+        self.assertTrue(pump, "少了 _pump")
+        body = ast.unparse(pump[0])
+        self.assertIn("GLib.MainLoop()", body)
+        self.assertIn("loop.run()", body)
+        self.assertIn("timeout_add", body, "要有超时退出，否则主循环回不来")
+
+    def test_liveness_reads_journal_not_dbus_reply(self):
+        helper = _functions(self.tree, "_start_ext_watch")
+        self.assertTrue(helper, "判活方法不见了")
+        body = ast.unparse(helper[0])
+        for needed in ("journal_probe_command", "latest_probe_report", "threading.Thread"):
+            self.assertIn(needed, body, f"判活里少了 {needed}")
+        self.assertNotIn("signal_subscribe", body, "不要再订阅 D-Bus 应答（扩展回不了包）")
+
+    def test_no_uppercase_constant_used_without_import(self):
+        """引用了 `RAISE_*` 这类大写常量却没导入/没定义 ⇒ 一走到那条分支就 NameError。
+
+        今天真实发生过：常量改名（RAISE_SETTLE_US → RAISE_SETTLE_MS）时 qbar_app 没跟上，
+        工作树是破的，而当时所有判据都还是绿的 —— 因为没人执行过那条分支。
+        """
+        tree = ast.parse(self.src)
+        defined = set()
+        imported = set()
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.Assign, ast.AnnAssign)):
+                targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+                for tg in targets:
+                    if isinstance(tg, ast.Name):
+                        defined.add(tg.id)
+            elif isinstance(node, (ast.Import, ast.ImportFrom)):
+                for al in node.names:
+                    imported.add(al.asname or al.name)
+            elif isinstance(node, ast.FunctionDef) or isinstance(node, ast.ClassDef):
+                defined.add(node.name)
+        logic_names = {n for n in dir(__import__("qbar.logic", fromlist=["x"]))}
+        bad = []
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Name) and node.id.isupper() and len(node.id) > 4:
+                if node.id not in defined and node.id not in imported and node.id not in logic_names:
+                    bad.append((node.id, node.lineno))
+        self.assertFalse(bad, f"这些大写常量既没定义也没导入（一走到就是 NameError）：{bad}")
 
 
 class TestTools(unittest.TestCase):
