@@ -44,3 +44,32 @@ jobs:
 
       - name: 全量单测（无 python3-gi / 无显示服务器 / 无 sudo）
         run: python3 -m unittest discover -s tests -v
+
+  # ── 界面测试专用 job ────────────────────────────────────────────────
+  # 为什么单开一个：上面那个 job 刻意不装 python3-gi（守"没有 gi 也要能收集"的契约），
+  # 代价是 35 条真起窗的界面用例在 CI 里全 skip —— 那等于界面行为从来没被 CI 验过。
+  # 这里装上 gi + GTK3 的 gir，在 Xvfb 虚拟显示里把它们**真跑一遍**（拿覆盖率，不是假绿）。
+  #
+  # 两个必须是"外部设置"的细节（进程内补救都太晚，实测过）：
+  #   - `env -u WAYLAND_DISPLAY`：不摘掉它，libwayland 会连真实 Wayland 桌面。
+  #   - `GDK_BACKEND=x11` 必须在启动解释器**之前**设进环境：GDK 读它比 Python 早。
+  gui-tests:
+    name: 界面测试（Xvfb + PyGObject）
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: 装 PyGObject 与 GTK3 的 gir（界面测试要用）
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends python3-gi gir1.2-gtk-3.0 gir1.2-pango-1.0
+
+      - name: 虚拟显示里真跑界面测试
+        run: |
+          xvfb-run -a --server-args="-screen 0 1280x800x24" \
+            env -u WAYLAND_DISPLAY GDK_BACKEND=x11 CAPSPLUS_GUI=1 \
+            python3 -m unittest discover -s tests -v
