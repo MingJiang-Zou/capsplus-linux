@@ -274,6 +274,18 @@ class QbarWindow(Gtk.Window):
     # ------------------------------------------------------------------
     # 打开
     # ------------------------------------------------------------------
+    def _launch_context(self):
+        """**每次打开东西都要带上激活上下文**（AppLaunchContext + 当前事件时间戳）。
+
+        原先四处全传 `None` —— 等于对合成器/浏览器说"这不是一次用户主动启动"，
+        于是默认浏览器（本机是 Edge）**另起一个窗口**而不是回到现有窗口开标签页，
+        之后 Qbar 打开的页面全都堆在那个新窗口里；只有焦点恰好在本机上时看起来才"正常"
+        （2026-10-16 用户实测）。Wayland 下的正当姿势是带时间戳的 launch context。
+        """
+        context = Gdk.Display.get_default().get_app_launch_context()
+        context.set_timestamp(Gtk.get_current_event_time())
+        return context
+
     def _activate(self, entry: Entry):
         log(f"activate kind={entry.kind} title={entry.title!r}")
         try:
@@ -281,9 +293,9 @@ class QbarWindow(Gtk.Window):
                 info = Gio.DesktopAppInfo.new_from_filename(entry.payload)
                 if info is None:
                     raise RuntimeError("desktop 文件无法解析")
-                info.launch(None, None)
+                info.launch(None, self._launch_context())
             elif entry.kind in ("file", "dir"):
-                Gio.AppInfo.launch_default_for_uri(Path(entry.payload).as_uri(), None)
+                Gio.AppInfo.launch_default_for_uri(Path(entry.payload).as_uri(), self._launch_context())
             elif entry.kind == "exec":
                 # 快速链接 type="app" 但目标带了参数 / 不是 .desktop 名 → 当命令跑
                 self._run_command(entry.payload)
@@ -349,7 +361,7 @@ class QbarWindow(Gtk.Window):
         if not target.exists():
             self.entry.set_placeholder_text(f"文件不存在：{target}")
             return
-        Gio.AppInfo.launch_default_for_uri(target.as_uri(), None)
+        Gio.AppInfo.launch_default_for_uri(target.as_uri(), self._launch_context())
 
     def _open_url(self, url: str):
         """开网址：配了 `general.browser` 就用那条命令，否则系统默认浏览器（xdg-open）。"""
@@ -357,7 +369,7 @@ class QbarWindow(Gtk.Window):
             return
         cmd = open_command(self.engine.config.browser, url)
         if cmd.startswith("xdg-open "):
-            Gio.AppInfo.launch_default_for_uri(url, None)
+            Gio.AppInfo.launch_default_for_uri(url, self._launch_context())
             return
         threading.Thread(
             target=lambda: subprocess.run(["bash", "-lc", cmd], capture_output=True),

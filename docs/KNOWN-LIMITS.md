@@ -182,3 +182,22 @@
 | `capsplus render` / `capsplus apply --dry-run` | 无 | 只渲染 + 归一化自检 |
 | `capsplus apply` | `sudo -n`（免密或能输密码） | 要写 `/etc/keyd/` 并 reload keyd |
 | `sudo python3 tools/e2e/check_mappings.py` | root + `/dev/uinput` | 造虚拟键盘 |
+
+## 打开 URL 必须带激活上下文，否则浏览器另起窗口（2026-10-16 实测）
+
+**症状**：Qbar 打开网页时默认浏览器（本机 Microsoft Edge）**不回到现有窗口**，而是新起一个窗口，
+之后 Qbar 打开的页面全堆在那个新窗口里；只有焦点恰好在浏览器上时，才像"正常地在原窗口开标签页"。
+
+**根因**：`Gio.AppInfo.launch_default_for_uri(uri, None)` 的第二个实参是 launch context。传 `None`
+等于这次启动不带 activation 上下文（时间戳/令牌），桌面侧无法把它当成"用户主动点开"，浏览器就按
+外部新起处理。修法见 `qbar/qbar_app.py::_launch_context()`：
+`Gdk.Display.get_default().get_app_launch_context()` + `set_timestamp(Gtk.get_current_event_time())`，
+四处打开动作（`url` / `file` / `dir` / `.desktop` 应用）全部带上。
+
+**判据**：`tests/test_launch_context.py`（AST 扫描，headless 也跑）。把任何一处改回传 `None`
+立刻判红，实测红字：`line 372: launch_default_for_uri() 的 launch context 是 None`。
+
+**还没验的**：Chromium 系常见的"强制新标签页"开关在本机 Edge 上查不到 ——
+`microsoft-edge-stable --help` 只列了 `--new-window`（那恰恰是反效果），`--new-tab` 不在帮助里，
+**所以没写进默认行为**。真要拿它当硬保证，得在各自机器上实测后再用 `[general] browser = "…"` 显式配
+（模板里 `{url}` 会被替换）。若上面这个激活上下文的修法在你机器上没能完全解决，就按这条继续查开关。
