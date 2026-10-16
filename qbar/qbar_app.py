@@ -43,6 +43,8 @@ from qbar.logic import (  # noqa: E402
     scan_desktop_files, settings_launch_command,
     window_width,
     raise_browser_signal, RAISE_SETTLE_US,
+    RAISE_PROBE_MEMBER, RAISE_REPORT_MEMBER, parse_probe_report,
+    ext_state_payload, should_settle, subscribe_probe_report,
 )
 from qbar.search_config import open_command  # noqa: E402
 
@@ -127,6 +129,9 @@ class QbarWindow(Gtk.Window):
         self.results: list[Entry] = []
         self._gen = 0
         self._debounce_id = 0
+        self._ext_alive = None        # None=还没问过 / True=应答过 / False=确认不在
+        self._ext_sub = 0             # 信号订阅 id（本机 GJS/PyGI 都没有 signal_remove，留着不碍事）
+        GLib.idle_add(self._start_ext_watch)   # 起来先问一次 Probe，别等用户按下才摸黑
         # 窗口这一轮显示的时刻（monotonic 秒）：失焦防抖要靠它算"显示多久了"
         self._shown_at = 0.0
 
@@ -405,6 +410,46 @@ class QbarWindow(Gtk.Window):
             return
         Gio.AppInfo.launch_default_for_uri(target.as_uri(), self._launch_context())
 
+    def _ext_state_path(self):
+        """扩展应答的实测状态文件（给 `capsplus status` 与人看，别只写在进程记忆里）。"""
+        return Path.home() / ".local/state/capsplus/raise-browser.json"
+
+    def _write_ext_state(self, alive, info):
+        try:
+            p = self._ext_state_path()
+            p.parent.mkdir(parents=True, exist_ok=True)
+            payload = ext_state_payload(alive, info, time.time())
+            tmp = p.with_name(p.name + ".tmp")
+            tmp.write_text(payload, encoding="utf-8")
+            tmp.replace(p)
+        except OSError as exc:
+            log(f"扩展状态写不了：{exc}")
+
+    def _on_probe_report(self, _conn, _sender, _path, _iface, _member, params):
+        """扩展回 ProbeReport ⇒ 它在跑。顺带把窗口数记一行，方便事后对账。"""
+        text = params.unpack()[0] if params is not None else ""
+        info = parse_probe_report(text)
+        first = self._ext_alive is not True
+        self._ext_alive = True
+        if info.get("windows") is not None:
+            log(f"扩展应答：windows={info['windows']} on-current={info['on_current']} "
+                f"default={info['default']}")
+        self._write_ext_state(True, info)
+        if first:
+            log("raise-browser 扩展在跑（打开网址前会先激活浏览器窗口）")
+
+    def _start_ext_watch(self):
+        """订阅扩展应答 + 问一次 Probe。装不上不影响别的（Qbar 正事是打开网址）。"""
+        try:
+            bus = _session_bus()
+            self._ext_sub = subscribe_probe_report(bus, self._on_probe_report,
+                                                   Gio.DBusSignalFlags.NONE)
+            raise_browser_signal(bus, RAISE_PROBE_MEMBER)
+            self._write_ext_state(None, {})
+            log("已向扩展问 Probe（没应答就是扩展没加载：capsplus status 能看状态）")
+        except Exception as exc:
+            log(f"扩展应答订阅失败（不影响打开）：{type(exc).__name__} {exc}")
+
     def _raise_browser_window(self):
         """发一发 D-Bus 信号，请 GNOME 扩展把浏览器现有窗口激活（失败绝不拦下打开动作）。
 
@@ -417,15 +462,19 @@ class QbarWindow(Gtk.Window):
         可用且跨实现跑通过（Python-GI 发、GJS 收）。信号没有回复通道 ⇒ 这里不假设成功，
         只等一帧（80ms）再打开；扩展没装时这一步没有任何副作用。
         """
+        bus = None
         try:
-            raise_browser_signal(_session_bus())
+            bus = _session_bus()
+            raise_browser_signal(bus)
+            raise_browser_signal(bus, RAISE_PROBE_MEMBER)   # 顺便问一下活着没/几扇窗
         except Exception as exc:                      # 连不上会话总线这类极端情况
             log(f"raise-browser 跳过：{type(exc).__name__} {exc}")
+            self._ext_alive = False
+            self._write_ext_state(False, {})
             return
-        log("raise-browser 信号已发（扩展没装时这一步无副作用）")
-        # 激活落地约一帧；不等就打开，浏览器仍会按"我没焦点"处理 ⇒ 又新画一扇窗。
-        # 最多阻塞 80ms，而这一步之后 Qbar 马上隐藏，用户感觉不到。
-        GLib.usleep(RAISE_SETTLE_US)
+        # 已知扩展不在就别白等；未知（第一次）与确认在，都等这一帧。
+        if should_settle(self._ext_alive):
+            GLib.usleep(RAISE_SETTLE_US)
 
     def _open_url(self, url: str):
         """开网址：配了 `general.browser` 就用那条命令，否则系统默认浏览器（xdg-open）。"""

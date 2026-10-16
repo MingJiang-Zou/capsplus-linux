@@ -61,3 +61,39 @@ def extension_status(runner=None, which=None):
     else:
         state = "missing" if "不存在" in info or "does not exist" in info or not info.strip() else "disabled"
     return state, HINTS.get(state, HINTS["unknown"])
+
+
+QBAR_STATE = "~/.local/state/capsplus/raise-browser.json"
+
+
+def qbar_observed(path=None):
+    """Qbar 跑起来会问一次 Probe，扩展应答与否写在 raise-browser.json 里。
+
+    这是**现场实测**，和 `gnome-extensions info` 的"shell 说它 ACTIVE"是两回事：
+    shell 说 ACTIVE 但 Qbar 收不到应答，才说明链路真断了（反过来也一样）。两个都报出来最好查。
+    """
+    import json
+    import os
+    target = os.path.expanduser(path or QBAR_STATE)
+    if not os.path.exists(target):
+        return None, "还没问过（Qbar 没起来过？）"
+    try:
+        data = json.loads(open(target, encoding="utf-8").read())
+    except (OSError, ValueError) as exc:
+        return None, f"读不了：{type(exc).__name__}"
+    alive = data.get("alive")
+    if alive is True:
+        return True, ("应答过：windows=%s on-current=%s default=%s（%s 秒前）"
+                      % (data.get("windows"), data.get("on_current"),
+                         data.get("default"), _age(data.get("at"))))
+    if alive is False:
+        return False, "Qbar 确认扩展没应答（发信号没报错，但没人回）"
+    return None, "问过但还没等到应答（扩展大概没加载）"
+
+
+def _age(ts):
+    import time
+    try:
+        return int(time.time() - float(ts))
+    except (TypeError, ValueError):
+        return -1

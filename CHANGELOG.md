@@ -47,6 +47,13 @@
   三条可行修法与成本写进 `docs/KNOWN-LIMITS.md`；扩展方案需在 GNOME 上重启 shell 才能装新扩展。
   ⚠ 过程中我自己把 `bash` 数组写进了 `#!/bin/sh`（dash）脚本 → **Caps+Q 直接失灵**（keyd 不报错，只是没反应）；
   已改回 POSIX 变量，并把判据从 `bash -n` 升级为**按 shebang 选解释器**（`tests/test_portability.py`）。
+- **扩展可见性（A 方案）**：扩展收到 `Probe` 会回一发 `ProbeReport` 信号（带 `windows=` /
+  `on-current=`），Qbar 据此判断扩展在不在——确认不在时**不再白等那一帧**；实测状态写进
+  `~/.local/state/capsplus/raise-browser.json`，`capsplus status` 现在并排两个读数
+  （shell 的观点 + 链路的观点）。修掉一个真 bug：状态文件原本手拼 JSON 把 Python `None` 写进去
+  ⇒ 非法 JSON、status 读不了；改用 `json.dumps` 并补了**写→读闭环**判据（原来只测了读那一半）。
+  CI 新增 `assets-check` job：扩展 JS 走 `node --check` + 强制 `export default class`、
+  metadata 的 uuid 必须等于目录名、`tools/*.sh` 按**自己的 shebang** 过 `-n`、systemd 单元形状检查。
 - **新增 GNOME 扩展 `raise-browser`（可选）**：Qbar 打开网址前先用 D-Bus 请扩展把浏览器现有窗口激活，
   再打开 —— 针对「焦点不在浏览器时另起一扇窗」。配套 `tools/install-extension.sh`（装；需**注销重登一次**
   才生效，GNOME 只在启动时扫用户扩展目录）与 `tools/verify-raise-browser.py`（A/B 实测：用扩展 `Probe`

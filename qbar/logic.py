@@ -776,7 +776,24 @@ RAISE_BUS_PATH = "/io/github/capsplus/RaiseBrowser"
 RAISE_BUS_IFACE = "io.github.capsplus.RaiseBrowser"
 RAISE_MEMBER = "RaiseBrowser"
 RAISE_PROBE_MEMBER = "Probe"
+RAISE_REPORT_MEMBER = "ProbeReport"      # 扩展回给我们的应答（"活着没"就靠它）
 RAISE_SETTLE_US = 80_000        # 激活落地约一帧；等满再打开，否则浏览器仍按"我没焦点"处理
+
+
+def ext_state_payload(alive, info, now_ts: int) -> str:
+    """扩展应答状态的 JSON 文本（给 `capsplus status` 读）。
+
+    必须用 json.dumps：手拼字符串会把 Python 的 `None` 原样写进去，产出**非法 JSON**
+    （2026-10-16 就这么坏过一次，判据当时只测了读、没测写，所以没拦住）。
+    """
+    import json
+    return json.dumps({
+        "alive": alive,                                  # True / False / None(问过还没应答)
+        "windows": (info or {}).get("windows"),
+        "on_current": (info or {}).get("on_current"),
+        "default": (info or {}).get("default") or "",
+        "at": int(now_ts),
+    }, ensure_ascii=False, sort_keys=True)
 
 
 def raise_browser_signal(publisher, member=RAISE_MEMBER):
@@ -793,3 +810,43 @@ def raise_browser_signal(publisher, member=RAISE_MEMBER):
     # 这一层刻意不碰 gi —— `tests/test_settings_window.py::test_the_two_pure_layers_really_do_not_import_gi`
     # 就是钉这条的，我上一版在函数里写 `from gi.repository import Gio`，被它当场判红。
     publisher.emit_signal(None, RAISE_BUS_PATH, RAISE_BUS_IFACE, member, None)
+
+
+def parse_probe_report(text: str) -> dict:
+    """把扩展的报告串解成结构化值：`default=microsoft-edge.desktop windows=3 on-current=2`。
+
+    解析**不许抛**：拿不到就返回 None 字段，调用方按"没应答"处理。
+    """
+    out = {"default": None, "windows": None, "on_current": None, "raw": text or ""}
+    for piece in (text or "").split():
+        key, sep, val = piece.partition("=")
+        if not sep:
+            continue
+        if key == "default":
+            out["default"] = val
+        elif key == "windows":
+            try:
+                out["windows"] = int(val)
+            except ValueError:
+                pass
+        elif key == "on-current":
+            try:
+                out["on_current"] = int(val)
+            except ValueError:
+                pass
+    return out
+
+
+def should_settle(alive) -> bool:
+    """已知扩展不在（False）就别再白等一帧；未知（None）与在（True）都等。"""
+    return alive is not False
+
+
+def subscribe_probe_report(bus, callback, flags) -> int:
+    """订阅扩展应答。**本机实测的 PyGI 形状**：
+    `signal_subscribe(sender, interface_name, member, object_path, arg0, flags, callback, user_data=None)`
+    —— `flags` 必填（漏了报 "flag values must be strings, ints…"），回调在 flags **之后**，
+    与 GJS 那边"7 个实参、回调在最后"**不同**（GJS 是 sender, interface, member, path, arg0,
+    user_data, callback）⇒ 别把两边的参数顺序互相照抄。"""
+    return bus.signal_subscribe(None, RAISE_BUS_IFACE, RAISE_REPORT_MEMBER,
+                                None, None, flags, callback)

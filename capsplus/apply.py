@@ -281,9 +281,11 @@ def main(argv: list[str] | None = None) -> int:
             print(f"最近日志 : {last_log_line()}")
             # 局部 import：状态体检挂了也不能把 status 本身弄崩（它常被脚本与托盘调用）
             try:
-                from .extcheck import extension_status
+                from .extcheck import extension_status, qbar_observed
                 ext_state, ext_hint = extension_status()
                 print(f"浏览器扩展: {ext_state} —— {ext_hint}")
+                obs_state, obs_text = qbar_observed()
+                print(f"Qbar 实测 : {obs_text}")
             except Exception as exc:
                 print(f"浏览器扩展: 体检跳过（{type(exc).__name__}）")
             return 0

@@ -79,3 +79,71 @@ jobs:
           xvfb-run -a --server-args="-screen 0 1280x800x24" \
             env -u WAYLAND_DISPLAY GDK_BACKEND=x11 CAPSPLUS_GUI=1 \
             python3 -m unittest discover -s tests -v
+
+  # 扩展与装机件：这些是 **JS / shell / systemd 单元**，Python 判据碰不到它们。
+  # 2026-10-16 出过两次现场事故都属这一类：
+  #   * 扩展写成模块级 `export function enable`（GNOME 45+ 要 `export default class`）
+  #     ⇒ shell 报 `not a constructor`，扩展**静默不加载**，用户只看到"还是新窗口"；
+  #   * Qbar 手拼 JSON 把 Python 的 None 写进状态文件 ⇒ status 读不了。
+  # 语法与形状这一层 CI 拦得住，运行时行为（GNOME 版本差异）拦不住 —— 别指望它替代重登验收。
+  assets-check:
+    name: 扩展与装机件体检
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 扩展 JS 必须是合法 ESM，且用 GNOME 45+ 的默认类导出
+        run: |
+          set -eu
+          for f in extensions/*/extension.js; do
+            cp "$f" /tmp/ext-check.mjs
+            node --check /tmp/ext-check.mjs
+            grep -q 'export default class' "$f" || { echo "✗ $f 少了 export default class（GNOME 50 会静默不加载）"; exit 1; }
+            if grep -qE '^export function (enable|disable)' "$f"; then
+              echo "✗ $f 用了模块级 export function —— 旧形态，shell 会报 not a constructor"; exit 1; fi
+            echo "✓ $f"
+          done
+
+      - name: metadata.json 合法、uuid 等于目录名、shell-version 非空
+        run: |
+          python3 - <<'EOF'
+          import json, pathlib, sys
+          bad = 0
+          for d in sorted(pathlib.Path("extensions").glob("*")):
+              if not d.is_dir():
+                  continue
+              meta = json.loads((d / "metadata.json").read_text(encoding="utf-8"))
+              if meta.get("uuid") != d.name:
+                  print(f"✗ uuid {meta.get('uuid')!r} != 目录名 {d.name!r}"); bad += 1
+              if not meta.get("shell-version"):
+                  print(f"✗ {d}: shell-version 空着"); bad += 1
+              print(f"✓ {d.name}: uuid 对、shell-version={meta['shell-version']}")
+          sys.exit(1 if bad else 0)
+          EOF
+
+      - name: 装机脚本按自己的 shebang 过语法检查（dash 不是 bash，数组会炸）
+        run: |
+          set -eu
+          for f in tools/*.sh; do
+            interp=$(head -1 "$f" | sed 's/^#!//' | tr -d ' ')
+            case "$interp" in *sh) ;; *) continue ;; esac
+            "$interp" -n "$f" && echo "✓ $f（$interp -n）"
+          done
+
+      - name: systemd 单元至少是 key=value 的形状（装上去起不来更难查）
+        run: |
+          python3 - <<'EOF'
+          import pathlib, sys
+          bad = 0
+          for f in sorted(pathlib.Path("packaging").glob("*.service")):
+              for ln, line in enumerate(f.read_text(encoding="utf-8").splitlines(), 1):
+                  t = line.strip()
+                  if not t or t.startswith("#"):
+                      continue
+                  if t.startswith("[") and t.endswith("]"):
+                      continue
+                  if "=" not in t:
+                      print(f"✗ {f}:{ln} 不像单元行：{t}"); bad += 1
+              print(f"✓ {f}")
+          sys.exit(1 if bad else 0)
+          EOF

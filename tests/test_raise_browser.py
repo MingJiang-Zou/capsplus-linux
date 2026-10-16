@@ -31,7 +31,9 @@ sys.path.insert(0, str(REPO))
 
 from qbar import search_config as SC          # noqa: E402
 from qbar.logic import (RAISE_BUS_IFACE, RAISE_BUS_PATH, RAISE_MEMBER,   # noqa: E402
-                        RAISE_PROBE_MEMBER, RAISE_SETTLE_US, raise_browser_signal)
+                        RAISE_PROBE_MEMBER, RAISE_REPORT_MEMBER, RAISE_SETTLE_US,
+                        parse_probe_report, raise_browser_signal, should_settle,
+                        subscribe_probe_report)
 
 from capsplus.extcheck import EXT_UUID, extension_status  # noqa: E402  体检函数（不碰 gi）
 _HAS_EXE = lambda _x: "/usr/bin/gnome-extensions"          # 假装系统里有 gnome-extensions
@@ -255,6 +257,107 @@ class TestExtensionStatusReport(unittest.TestCase):
         t = (REPO / "tools" / "install-extension.sh").read_text(encoding="utf-8")
         self.assertIn('"$1" = "--quiet"', t, "install-extension.sh 不支持 --quiet，unit 会刷屏")
         self.assertIn("say()", t, "输出没走 say()，--quiet 就是假的")
+
+
+class TestExtensionAwareness(unittest.TestCase):
+    """A 方案：扩展能应答（ProbeReport），Qbar 据此决定要不要等那一帧，并把实测状态写盘。
+
+    为什么不能只靠 `gnome-extensions info`：那说的是 shell 的观点。shell 说 ACTIVE 而 Qbar
+    收不到应答，链路照样是断的（反之亦然）⇒ 两个读数都要有，别用一个替代另一个。
+    """
+
+    def test_report_member_and_constants(self):
+        self.assertEqual(RAISE_REPORT_MEMBER, "ProbeReport")
+        self.assertNotIn(RAISE_REPORT_MEMBER, (RAISE_MEMBER, RAISE_PROBE_MEMBER))
+
+    def test_parse_probe_report_reads_numbers(self):
+        info = parse_probe_report("default=microsoft-edge.desktop windows=3 on-current=2")
+        self.assertEqual((info["default"], info["windows"], info["on_current"]),
+                         ("microsoft-edge.desktop", 3, 2))
+
+    def test_parse_probe_report_never_raises(self):
+        for junk in ("", None, "garbage", "windows=abc", "windows="):
+            info = parse_probe_report(junk)
+            self.assertIsInstance(info, dict)
+
+    def test_no_blind_wait_when_extension_known_absent(self):
+        self.assertTrue(should_settle(None), "还没问过要等一帧（第一次不能赌）")
+        self.assertTrue(should_settle(True))
+        self.assertFalse(should_settle(False), "已知没扩展还等 80ms，就是白等")
+
+    def test_subscribe_uses_pygi_shape(self):
+        """PyGI 的形状是 (…, arg0, **flags**, callback)，和 GJS 的"回调在最后"**不同**：
+        照抄另一边的顺序会得到 'flag values must be strings…' 或 'callback got null'。"""
+        class Bus:
+            def signal_subscribe(self, *a):
+                self.args = a
+                return 11
+
+        bus = Bus()
+        cb = lambda *_a: None      # noqa: E731
+        self.assertEqual(subscribe_probe_report(bus, cb, 0), 11)
+        self.assertEqual(bus.args[0], None, "sender=None（谁发都收）")
+        self.assertEqual(bus.args[2], RAISE_REPORT_MEMBER, "订阅的成员必须是 ProbeReport")
+        self.assertEqual(bus.args[5], 0, "第 6 个实参是 flags")
+        self.assertIs(bus.args[6], cb, "回调在 flags 之后")
+
+    def test_open_url_still_asks_then_opens(self):
+        tree = ast.parse(APP.read_text(encoding="utf-8"))
+        helper = _functions(tree, "_raise_browser_window")[0]
+        src = ast.unparse(helper)
+        self.assertIn("raise_browser_signal(", src)
+        self.assertIn("RAISE_PROBE_MEMBER", src, "发完激活还得问一次活着没")
+        self.assertIn("should_settle(", src, "等不等要按实测状态，不许写死")
+
+    def test_extension_replies_with_probe_report(self):
+        js = (EXT_DIR / "extension.js").read_text(encoding="utf-8")
+        self.assertIn("ProbeReport", js, "扩展不应答，Qbar 就永远不知道该等多久")
+        self.assertIn("emit_signal(", js, "应答要用 emit_signal（本机实测可用）")
+        self.assertIn("Variant('(s)'", js, "报告是字符串，参数类型要写对")
+
+    def test_state_payload_is_valid_json_and_roundtrips(self):
+        """写盘格式必须能被读回来 —— 之前手拼 JSON 把 None 写进去，status 直接读不了。
+        这条是**写→读闭环**，只测读的那一半拦不住。"""
+        import json
+        sys.path.insert(0, str(REPO))
+        from capsplus.extcheck import qbar_observed
+        from qbar.logic import ext_state_payload
+
+        for alive, info in ((True, {"windows": 3, "on_current": 2, "default": "microsoft-edge.desktop"}),
+                            (False, {}), (None, {})):
+            text = ext_state_payload(alive, info, 1700000000)
+            data = json.loads(text)                    # 非法 JSON 在这一步就炸
+            self.assertEqual(data["alive"], alive)
+            self.assertIn("at", data)
+
+        d = pathlib.Path(tempfile.mkdtemp()) / "raise-browser.json"
+        d.write_text(ext_state_payload(True, {"windows": 7, "on_current": 1,
+                                              "default": "microsoft-edge.desktop"}, 1700000000),
+                     encoding="utf-8")
+        state, shown = qbar_observed(path=str(d))
+        self.assertTrue(state)
+        self.assertIn("windows=7", shown)
+
+    def test_status_shows_both_readings(self):
+        src = (REPO / "capsplus" / "apply.py").read_text(encoding="utf-8")
+        self.assertIn("qbar_observed()", src, "status 只有 shell 的观点，链路断了看不见")
+        self.assertIn("Qbar 实测", src)
+
+    def test_qbar_observed_reads_state_file(self):
+        sys.path.insert(0, str(REPO))
+        from capsplus.extcheck import qbar_observed
+        d = pathlib.Path(tempfile.mkdtemp())
+        f = d / "raise-browser.json"
+        state, text = qbar_observed(path=str(f))
+        self.assertIsNone(state, "文件不存在要报'还没问过'，不能瞎猜 True")
+        f.write_text('{"alive": true, "windows": 2, "on-current": 0, "on_current": 1, '
+                     '"default": "microsoft-edge.desktop", "at": 1}', encoding="utf-8")
+        state, text = qbar_observed(path=str(f))
+        self.assertTrue(state)
+        self.assertIn("windows=2", text)
+        f.write_text("{坏掉的 json", encoding="utf-8")
+        state, text = qbar_observed(path=str(f))
+        self.assertIsNone(state, "读不了也要给一句人话，不能抛")
 
 
 class TestTools(unittest.TestCase):

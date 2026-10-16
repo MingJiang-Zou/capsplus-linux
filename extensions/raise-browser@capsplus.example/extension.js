@@ -32,6 +32,7 @@ const OBJ_PATH = '/io/github/capsplus/RaiseBrowser';
 const IFACE = 'io.github.capsplus.RaiseBrowser';
 const M_RAISE = 'RaiseBrowser';
 const M_PROBE = 'Probe';
+const M_REPORT = 'ProbeReport';
 
 let _ownId = 0;
 let _subRaise = 0;
@@ -124,7 +125,15 @@ export default class RaiseBrowserExtension {
         _subRaise = Gio.DBus.session.signal_subscribe(null, IFACE, M_RAISE, null, null, null,
             () => raiseBrowser());
         _subProbe = Gio.DBus.session.signal_subscribe(null, IFACE, M_PROBE, null, null, null,
-            () => console.log(`[raise-browser] probe ${report('')}`));
+            () => {
+                const rep = report('');
+                console.log(`[raise-browser] probe ${rep}`);
+                // 回一发 ProbeReport：信号本来没有回复通道，加一个反向成员就有"活着没"的应答，
+                // Qbar 因此知道该不该等那一帧，状态也能在 capsplus status 里显示实测值。
+                // GJS 的 emit_signal 是 5 个实参：destination, object_path, interface, member, parameters。
+                Gio.DBus.session.emit_signal(null, OBJ_PATH, IFACE, M_REPORT,
+                                             new GLib.Variant('(s)', [rep]));
+            });
         console.log(`[raise-browser] ready ${report('')}`);
     }
 

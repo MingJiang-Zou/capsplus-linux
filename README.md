@@ -83,10 +83,18 @@ python3 tools/verify-raise-browser.py
     # A/B 实测：A 轮不激活（预期 +1 扇窗），B 轮先激活（预期 0）——
     # 窗口数由扩展报进 journal，不需要人眼数窗口
 
-capsplus status | grep 浏览器扩展
-    # 现场体检：ACTIVE=正常；ERROR=改过代码没重登（disable/enable 不会重新 import）；
-    # missing=没装；no-gnome=这台机不是 GNOME，该功能不适用（Qbar 照常打开网址）
+capsplus status | grep -E "浏览器扩展|Qbar 实测"
+    # 两个读数都要看：
+    #   浏览器扩展 = shell 的观点（ACTIVE / ERROR / missing / no-gnome）
+    #   Qbar 实测   = 链路的观点（扩展有没有真回 ProbeReport）
+    # shell 说 ACTIVE 而 Qbar 收不到应答，说明链路仍是断的 —— 反过来也一样。
 ```
+
+Qbar 打开网址前发 `RaiseBrowser` 信号，扩展回一发 `ProbeReport`（带 `windows=` / `on-current=`）。
+**为什么用信号而不是"导出对象 + 等方法调用"**：本机 GJS 的 `export_object_path` / `return_value`
+已是 `undefined`，`register_object` 只剩原始 C 绑定（vtable 是 C 结构，JS 造不出来）——见
+[`docs/KNOWN-LIMITS.md`](docs/KNOWN-LIMITS.md) 的实测表。信号没有回复通道，所以"活着没"用
+一个反向成员解决；扩展确认不在时 Qbar **不再白等那一帧**（`should_settle`）。
 
 **不想每次改扩展都手工拷文件**：仓里带了一个登录同步 unit（oneshot），装上之后每次登录自动把
 仓里的 `extension.js` / `metadata.json` 同步进用户扩展目录 —— 于是"改代码 → 重登 → 生效"，
