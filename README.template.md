@@ -7,7 +7,9 @@
 <!-- 徽章纪律：没有真跑过的 CI 就不许放假徽章（这条注释留着提醒后来人） -->
 [![tests](https://github.com/517477981/capsplus-linux/actions/workflows/tests.yml/badge.svg)](https://github.com/517477981/capsplus-linux/actions/workflows/tests.yml)
 [![license: GPL-2.0-only](https://img.shields.io/badge/license-GPL--2.0--only-blue.svg)](LICENSE)
-[![Python](https://img.shields.io/badge/python-3.11%20%7C%203.12-green.svg)](#依赖)*许可**：GPL-2.0-only（本仓的按键映射表译自上游 CapsLock+，属衍生作品）——
+[![Python](https://img.shields.io/badge/python-3.11%20%7C%203.12-green.svg)](#依赖)
+
+**许可**：GPL-2.0-only（本仓的按键映射表译自上游 CapsLock+，属衍生作品）——
 出处、改动清单与分发要求见下面「[许可与上游](#许可与上游)」一节，全文见 [`LICENSE`](LICENSE)。
 
 **截图**（都是 `xvfb-run` 在虚拟显示里拍的，`python3 tools/make-screenshots.py` 可重拍）：
