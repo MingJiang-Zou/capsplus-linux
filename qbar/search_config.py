@@ -139,6 +139,13 @@ BUILTIN_LINKS = [
     SearchLink("bl", "B站", "https://search.bilibili.com/all?keyword=" + QUOTED_PLACEHOLDER),
     SearchLink("tb", "淘宝", "https://s.taobao.com/search?q=" + QUOTED_PLACEHOLDER),
     SearchLink("xy", "闲鱼", "https://www.goofish.com/search?q=" + QUOTED_PLACEHOLDER),
+    # AI 问答（网页端预填）。参数名不是猜的 —— 从 chat.deepseek.com 的 main.js 里抠出来的：
+    #   r = searchParams.get("q")?.trim() ?? e.get("prompt") → {prompt: r, autoSend: "1"===get("autosend")
+    #   && r.length<=800, ...}，且只在根路径 "/" 生效（2026-10-16 实测）。
+    # 所以 `ds` 一条回车就问完；怕误发的话用 `dsp`（只预填，你自己按回车）。
+    # 千问/通义没能验到：chat.qwen.ai 的 HTML 只暴露埋点脚本，应用包是运行时注入的，抓不到可 grep 的静态 chunk。
+    SearchLink("ds", "DeepSeek（直接问）", "https://chat.deepseek.com/?q=" + QUOTED_PLACEHOLDER + "&autosend=1"),
+    SearchLink("dsp", "DeepSeek（只预填）", "https://chat.deepseek.com/?q=" + QUOTED_PLACEHOLDER),
     SearchLink("tr", "翻译（有道）", "https://dict.youdao.com/search?q=" + QUOTED_PLACEHOLDER),
     SearchLink("ghcli", "GitHub CLI 仓库", "https://github.com/cli/" + RAW_PLACEHOLDER),
     SearchLink("ghp", "GitHub 我的仓库", "https://github.com/pulls"),

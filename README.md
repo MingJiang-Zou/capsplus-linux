@@ -339,6 +339,13 @@ url = "https://github.com/pulls"              # ghp      → 固定链接，直�
 | `bd` | 百度 | `tr` | 翻译（有道） |
 | `w` | 维基中文 | `ghcli` | GitHub CLI 仓库（`ghcli cli` → github.com/cli/cli） |
 | `gh` | GitHub | `ghp` | GitHub 我的仓库（固定链接） |
+| `tb` | 淘宝 | `xy` | 闲鱼 |
+| `ds` | **DeepSeek 直接问**（`?q=…&autosend=1`，一条回车就出答案） | `dsp` | DeepSeek 只预填（自己按回车） |
+
+
+> `ds` 那两个参数是从 chat.deepseek.com 自己的 `main.js` 里读出来的（见 `qbar/search_config.py` 注释），
+> 不是猜的：**只有根路径 `/` 生效**，且 `autosend` 仅在问题**长度 ≤ 800 字**时才自动发送。
+> 千问/通义暂时没做进来：抓不到它可静态分析的入口包，**没验过就不写进默认引擎**。
 
 **单字母 trigger 只在带空格时当前缀**：`b 关键词` 是搜索，而 `beta` 是普通输入
 （否则任何以 b/g/w 开头的词都会被当成"前缀 + 关键词"，用户就再也搜不到这些词和应用了）。

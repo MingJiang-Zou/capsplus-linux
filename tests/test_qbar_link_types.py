@@ -371,3 +371,25 @@ class TestDefaultSearchChoices(TempConfigMixin, unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestBuiltinDocsMatchCode(unittest.TestCase):
+    """内置引擎改了，README 里那张表必须跟着改（别让文档成为第二份过期的真相）。
+
+    2026-10-16 加：README 那张表当时就漏了 `tb` / `xy` —— 说明"靠人记得"这条路不可信。
+    """
+
+    def test_every_builtin_trigger_is_listed_in_readme(self):
+        readme = (Path(__file__).resolve().parent.parent / "README.md").read_text(encoding="utf-8")
+        missing = [l.trigger for l in BUILTIN_LINKS if f"`{l.trigger}`" not in readme]
+        self.assertEqual(missing, [], "这些内置引擎没在 README 的表里出现：\n  " + "\n  ".join(missing))
+
+    def test_the_guard_catches_an_unlisted_trigger(self):
+        """反例具型：从内置表里挑一个 trigger 把 README 里那一处删掉，判据必须红。"""
+        readme = (Path(__file__).resolve().parent.parent / "README.md").read_text(encoding="utf-8")
+        target = BUILTIN_LINKS[0].trigger
+        # 注意要**全部**替换：同一个 trigger 在示例文字里也出现，只删第一处会删到示例、
+        # 表格那行还在 —— 我第一版就这么写歪过，反例不成立不等于判据没牙。
+        thinned = readme.replace(f"`{target}`", "`__消掉了__`")
+        missing = [l.trigger for l in BUILTIN_LINKS if f"`{l.trigger}`" not in thinned]
+        self.assertIn(target, missing, "README 里抹掉一个 trigger 都没被抓到，这判据是摆设")
