@@ -33,13 +33,15 @@ if str(REPO) not in sys.path:
 import gi  # noqa: E402
 gi.require_version("Gtk", "3.0")
 gi.require_version("Gdk", "3.0")
-from gi.repository import Gdk, Gio, GLib, Gtk  # noqa: E402
+gi.require_version("Pango", "1.0")
+from gi.repository import Gdk, Gio, GLib, Gtk, Pango  # noqa: E402
 
 from qbar.logic import (  # noqa: E402
     toggle_action, should_hide_on_focus_out,
     Entry, FileFinder, History, SearchEngine, browser_search_url,
     entry_history_payload, history_key,
     scan_desktop_files, settings_launch_command,
+    window_width,
 )
 from qbar.search_config import open_command  # noqa: E402
 
@@ -100,7 +102,13 @@ class QbarWindow(Gtk.Window):
         self.set_skip_taskbar_hint(True)
         self.set_type_hint(Gdk.WindowTypeHint.DIALOG)
         self.set_position(Gtk.WindowPosition.CENTER)
-        self.set_default_size(680, 420)
+        # 宽度按屏幕算，别写死：长历史 URL / 提示文字会把 TreeView 的自然宽度顶爆（2026-10-16 实测超屏）
+        _widths = []
+        _disp = Gdk.Display.get_default()
+        if _disp is not None:
+            for _i in range(_disp.get_n_monitors()):
+                _widths.append(_disp.get_monitor(_i).get_geometry().width)
+        self.set_default_size(window_width(_widths), 420)
 
         self.history = History(HISTORY_PATH)
         self.finder = FileFinder(SEARCH_ROOTS, max_entries=ENTRY_LIMIT, timeout_s=1.5)
@@ -129,7 +137,15 @@ class QbarWindow(Gtk.Window):
         for title, idx in (("类型", 0), ("标题", 1)):
             renderer = Gtk.CellRendererText()
             renderer.set_property("xpad", 10)
-            self.view.append_column(Gtk.TreeViewColumn(title, renderer, text=idx))
+            # 尾部省略：没有这两行，一条长历史 URL 就能让整扇窗横向撑到屏外
+            renderer.set_property("ellipsize", Pango.EllipsizeMode.END)
+            renderer.set_property("width-chars", 6 if idx == 0 else 24)
+            renderer.set_property("max-width-chars", 6 if idx == 0 else 80)
+            col = Gtk.TreeViewColumn(title, renderer, text=idx)
+            if idx == 1:
+                col.set_expand(True)          # 标题列吃满剩余宽度，而不是反过来要求窗口变宽
+                col.set_min_width(260)
+            self.view.append_column(col)
         self.view.connect("row-activated", self._on_row_activated)
 
         scroll = Gtk.ScrolledWindow()

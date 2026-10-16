@@ -202,6 +202,29 @@
 **所以没写进默认行为**。真要拿它当硬保证，得在各自机器上实测后再用 `[general] browser = "…"` 显式配
 （模板里 `{url}` 会被替换）。若上面这个激活上下文的修法在你机器上没能完全解决，就按这条继续查开关。
 
+### 2026-10-16 追加：光有激活上下文还不够，别再同时报两个显示后端
+
+用户实测：带上下文的修法之后，Qbar 打开网址**仍然另起一个新的 Edge 窗口**。继续查出来的事实：
+
+- Edge 主进程命令行**没有任何参数**（`/proc/<pid>/cmdline` 只有一个词），靠环境自己选了 Wayland，
+  并把 `--ozone-platform=wayland` 传给 22 个子进程 ⇒ 它是**原生 Wayland 实例**。
+- 本机 Edge **二进制里没有 `new-tab` 这个开关**（`strings` 只找到 `new-window`；`--help` 也只列 `--new-window`），
+  所以没法用命令行强行"新标签页"。
+- 我们自己的降权包装（`bin/keyd-qbar-cmd`，keyd 的 `command()` 走它）原先**同时**注入
+  `WAYLAND_DISPLAY=wayland-0` **和** `DISPLAY=:0` ⇒ 子进程面对两个后端，与原生 Wayland 的浏览器实例
+  容易走到不同显示服务上（Chromium 的窗口合并/实例复用都以同一后端为前提）。
+  ⇒ 改成 **只报一个后端，且按实际存在的东西决定**：调用者已导出 `WAYLAND_DISPLAY` 就沿用；
+  没有但 `$XDG_RUNTIME_DIR/wayland-0` 这个 socket 真存在 → 报 `WAYLAND_DISPLAY=wayland-0`；
+  否则沿用 `DISPLAY`，最后才兜底 `:0`。四种场景实测：
+  `wayland-1` / (环境空但 socket 在) `wayland-0` / 纯 Xorg `:1` / 全都没有 `:0` ✓
+  判据：`tests/test_portability.py::TestQbarLauncherReportsOneDisplayBackend`
+  （不许再出现无条件双注入，且脚本必须 `bash -n` 过）。
+
+**状态**：这一步是我这边的根因修复，但"是不是因此在原窗口开标签页"**只有用户的眼睛能确认**
+（Wayland 下我拿不到窗口，也不该往真屏幕注入按键）。若仍旧另起窗口，剩下的可能性集中在
+Edge 自身的窗口策略（`edge://settings` 里"打开链接的方式"）与合成器的 activation 行为，
+那时候的兜底是显式配 `[general] browser = "…"` 用固定命令打开。
+
 ## 网页端"把问题塞进 URL 就自动问"只有站方给口子才成立（2026-10-16 实测）
 
 这条决定了 Qbar 为什么要有第五种链接类型 `ask`（`问 AI（复制+打开）`）。

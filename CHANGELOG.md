@@ -35,6 +35,13 @@
   原本都传 `None`（不带激活上下文），桌面无法把它当成「用户主动点开」，Edge 于是新起窗口并把后续
   页面全堆进去。改为带 `Gdk.AppLaunchContext` + 事件时间戳；判据 `tests/test_launch_context.py`
   （AST 扫描，headless 也跑，改回 `None` 立刻红），详见 `docs/KNOWN-LIMITS.md`。
+- 修「Qbar 太宽、超出屏幕」（2026-10-16 用户实测）：结果列表的 `CellRendererText` 原先没有 ellipsize、
+  标题列也没 expand，所以一条长历史 URL 就能把窗口自然宽度顶爆。现在：标题列 `expand` + 尾部省略，
+  窗口宽度按 `logic.window_width()` 钳到**最窄那块屏**的 90%（默认 680 的上限不变）；
+  判据 `tests/test_qbar_width.py`（钳位算法 + 源码级防回退 + Pango 必须 require_version）
+  与 `test_qbar_window_is_not_wider_than_the_screen`（真构造窗口断宽度，500px 虚拟屏实测 450）。
+- 改 `bin/keyd-qbar-cmd`：**Wayland 优先，有 Wayland 就不再注入 `DISPLAY`**（原先两个后端一起报，
+  是浏览器另起窗口的温床；细节与未确认部分见 `docs/KNOWN-LIMITS.md`）。
 - 默认引擎模板加淘宝 / 闲鱼（两个搜索端点实测 HTTP 200，中文关键词走 `{q}` URL 编码）。
 - AI 问答进默认引擎（2026-10-16）：`ds` / `dsp` 走 `search`（DeepSeek 网页端**支持** URL 预填与
   自动发送，参数名与 `≤800 字` 那条限制是从它 `main.js` 里读出来的）；`qw`（千问）走新加的

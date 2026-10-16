@@ -14,7 +14,9 @@
 #   目标用户 = CAPSPLUS_USER（显式指定），否则取这个脚本文件本身的属主
 #              （install.sh 把软链装进用户自己的 ~/.local/bin，readlink -f 后落在仓内，
 #               属主就是装它的那个人；root 也 stat 得到）
-#   会话环境 = /run/user/<该用户 uid>；显示变量按 ${WAYLAND_DISPLAY:-wayland-0} 兜底
+#   会话环境 = /run/user/<该用户 uid>；Wayland 优先。**有 Wayland 就不报 DISPLAY**：
+#   同时给出两个后端会让 Chromium 系（本机 Edge）另起实例/新窗口，而不是在原窗口开标签页
+#   （2026-10-16 实测：Edge 主进程命令行无参数、靠环境选了 wayland，子进程带 --ozone-platform=wayland）
 set -eu
 
 SELF="$(readlink -f "$0" 2>/dev/null || echo "$0")"
@@ -44,10 +46,25 @@ if [ ! -x "$QBAR" ]; then
     exit 1
 fi
 
+# ── 显示后端：只报一个，且不凭空造 ────────────────────────────────────────────
+# keyd 以 root 跑，它的服务环境里 WAYLAND_DISPLAY / DISPLAY **通常两个都没有**，
+# 所以早先这里写成 `${WAYLAND_DISPLAY:-wayland-0}` + `${DISPLAY:-:0}` 兜底 ——
+# 后果是两个后端一起报给子进程，Chromium 系（本机 Edge，原生 Wayland 实例）容易另起窗口
+# 而不是在原窗口开标签页（2026-10-16 用户实测）。现在按"合成器 socket 在不在"决定，
+# 只传一个；Xorg 会话也不再被塞一个不存在的 wayland-0。
+if [ -n "${WAYLAND_DISPLAY:-}" ]; then
+  DISPLAY_ARGS=(WAYLAND_DISPLAY="$WAYLAND_DISPLAY")
+elif [ -S "$RUN_DIR/wayland-0" ]; then
+  DISPLAY_ARGS=(WAYLAND_DISPLAY=wayland-0)
+elif [ -n "${DISPLAY:-}" ]; then
+  DISPLAY_ARGS=(DISPLAY="$DISPLAY")
+else
+  DISPLAY_ARGS=(DISPLAY=:0)
+fi
+
 exec "$RUNUSER" -u "$USER_NAME" -- env \
   HOME="$USER_HOME" \
   XDG_RUNTIME_DIR="$RUN_DIR" \
-  WAYLAND_DISPLAY="${WAYLAND_DISPLAY:-wayland-0}" \
-  DISPLAY="${DISPLAY:-:0}" \
+  "${DISPLAY_ARGS[@]}" \
   DBUS_SESSION_BUS_ADDRESS="unix:path=$RUN_DIR/bus" \
   "$QBAR" "$@"

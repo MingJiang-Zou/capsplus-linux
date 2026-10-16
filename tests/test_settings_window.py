@@ -40,7 +40,8 @@ sys.path.insert(0, str(REPO / "settings"))   # settings_app 是按目录路径�
 try:
     import gi
     gi.require_version("Gtk", "3.0")
-    from gi.repository import Gtk
+    gi.require_version("Gdk", "3.0")
+    from gi.repository import Gdk, Gtk
 except Exception as exc:                        # noqa: BLE001
     gi = None
     GI_ERROR = str(exc)
@@ -752,6 +753,39 @@ class TestSettingsWindow(unittest.TestCase):
         self.assertIn("覆盖层里有几条被跳过", self.status_text())
         self.assertEqual(len(page.store), len(binding_rows("capl")) + len(binding_rows("capl+alt")))
 
+
+    def test_qbar_window_is_not_wider_than_the_screen(self):
+        """真构造一次 Qbar，断言它的宽度被屏幕钳住（2026-10-16 用户实测「超出屏幕」）。
+
+        用子进程 + 临时 `HOME`：Qbar 会在 `~/.local/state/capsplus/` 绑 `qbar.sock`，
+        不隔离就会去抢真人那份（同上一条入口判据的教训）。
+        """
+        sb = tempfile.mkdtemp(prefix="capsplus-qbar-sb-")
+        self.addCleanup(shutil.rmtree, sb, True)
+        probe = Path(sb) / "probe.py"
+        probe.write_text(
+            "import sys\n"
+            f"sys.path.insert(0, {str(REPO)!r})\n"
+            f"sys.path.insert(0, {str(REPO / 'qbar')!r})\n"
+            "import gi; gi.require_version('Gtk','3.0'); gi.require_version('Gdk','3.0')\n"
+            "from gi.repository import Gdk, Gtk\n"
+            "import qbar_app\n"
+            "w = qbar_app.QbarWindow()\n"
+            "w.show_all(); Gtk.main_iteration_do(False); Gtk.main_iteration_do(False)\n"
+            "print('WIDTH=%d' % w.get_size()[0])\n",
+            encoding="utf-8")
+        env = dict(os.environ, HOME=sb)
+        proc = subprocess.run([sys.executable, str(probe)], env=env, cwd=str(REPO),
+                              capture_output=True, text=True, timeout=25)
+        self.assertEqual(proc.returncode, 0, f"探针没跑起来：{proc.stderr[-400:]}")
+        out = proc.stdout.strip().splitlines()
+        widths = [int(x.split("=")[1]) for x in out if x.startswith("WIDTH=")]
+        self.assertTrue(widths, f"探针没打印宽度：{proc.stdout!r}")
+        d = Gdk.Display.get_default()
+        narrowest = min(d.get_monitor(i).get_geometry().width for i in range(d.get_n_monitors()))
+        self.assertLessEqual(widths[0], narrowest,
+                             f"Qbar 宽 {widths[0]} > 最窄屏 {narrowest} —— 又会超出屏幕")
+        self.assertLessEqual(widths[0], 680, "宽度上限被谁放宽了？logic.window_width 的默认值")
 
 class TestNoDisplayHelpers(unittest.TestCase):
     """没有显示服务器也能跑的部分：设置窗口用的纯函数不许依赖 gi。"""

@@ -63,6 +63,19 @@ class Entry:
 # ---------------------------------------------------------------------------
 # fuzzy 子序列匹配
 # ---------------------------------------------------------------------------
+
+def window_width(monitor_widths, default: int = 680, ratio: float = 0.9) -> int:
+    """Qbar 的窗口宽度：不超过 `default`，也不超过**最窄那块屏**的 `ratio` 倍。
+
+    为什么按最窄的算：本机三块屏（1920 / 1920 / 960），窗口被合成器放哪儿不由我们决定；
+    按最宽算就可能一整块屏都盖不住（2026-10-16 用户实测「太宽了，超出屏幕」）。
+    拿不到显示器信息（None / 空列表 / 非正数）就退回 default，别把界面搞崩。
+    """
+    widths = [w for w in (monitor_widths or []) if isinstance(w, int) and w > 0]
+    if not widths:
+        return default
+    cap = int(min(widths) * ratio)
+    return max(240, min(default, cap))     # 240 是下限：再窄就没法看结果了
 def fuzzy_score(query: str, text: str) -> float | None:
     """子序列匹配打分：命中返回分数，未命中返回 None。
 

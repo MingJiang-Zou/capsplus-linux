@@ -15,6 +15,7 @@
 
 import os
 import re
+import subprocess
 import sys
 import unittest
 from pathlib import Path
@@ -272,3 +273,26 @@ class TestApplyUsesSingleEntry(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+class TestQbarLauncherReportsOneDisplayBackend(unittest.TestCase):
+    """判据：keyd 的降权包装**不许同时**报 WAYLAND_DISPLAY 和 DISPLAY。
+
+    2026-10-16 用户实测：Qbar 打开网址时 Edge 另起新窗口而不是在原窗口开标签页。
+    包装脚本原先写成 `WAYLAND_DISPLAY=${WAYLAND_DISPLAY:-wayland-0}` 外加
+    `DISPLAY=${DISPLAY:-:0}`（keyd 以 root 跑，两个变量通常都没有，于是双双凭空造出来），
+    子进程面对两个显示后端就容易被当成"另一次启动"。现在按 socket 探测，只传一个。
+    """
+
+    SCRIPT = REPO / "bin" / "keyd-qbar-cmd"
+
+    def test_no_unconditional_double_injection(self):
+        text = self.SCRIPT.read_text(encoding="utf-8")
+        for bad in ('DISPLAY="${DISPLAY:-:0}"', 'WAYLAND_DISPLAY="${WAYLAND_DISPLAY:-wayland-0}"'):
+            self.assertNotIn(bad, text, f"包装脚本又回到无条件注入两个后端了：{bad}")
+        self.assertIn('DISPLAY_ARGS', text, "显示后端应该由那段探测逻辑算进 DISPLAY_ARGS 数组")
+        self.assertIn('-S "$RUN_DIR/wayland-0"', text, "得真的去探 Wayland socket，否则判断没有依据")
+
+    def test_script_stays_bash_parseable(self):
+        proc = subprocess.run(["bash", "-n", str(self.SCRIPT)], capture_output=True, text=True)
+        self.assertEqual(proc.returncode, 0, f"bash -n 失败：{proc.stderr}")
