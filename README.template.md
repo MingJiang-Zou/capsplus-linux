@@ -82,6 +82,20 @@ journalctl --user --since "-10 min" | grep raise-browser
 python3 tools/verify-raise-browser.py
     # A/B 实测：A 轮不激活（预期 +1 扇窗），B 轮先激活（预期 0）——
     # 窗口数由扩展报进 journal，不需要人眼数窗口
+
+capsplus status | grep 浏览器扩展
+    # 现场体检：ACTIVE=正常；ERROR=改过代码没重登（disable/enable 不会重新 import）；
+    # missing=没装；no-gnome=这台机不是 GNOME，该功能不适用（Qbar 照常打开网址）
+```
+
+**不想每次改扩展都手工拷文件**：仓里带了一个登录同步 unit（oneshot），装上之后每次登录自动把
+仓里的 `extension.js` / `metadata.json` 同步进用户扩展目录 —— 于是"改代码 → 重登 → 生效"，
+不再出现"仓里已修、机器上还是坏的"这种错位：
+
+```sh
+sed "s#@REPO_DIR@#$(pwd)#" packaging/capsplus-extension-sync.service \
+    > ~/.config/systemd/user/capsplus-extension-sync.service
+systemctl --user daemon-reload && systemctl --user enable capsplus-extension-sync.service
 ```
 
 **这台机（Ubuntu 26.04 / GNOME 50.1 / GJS）的实测事实，写下来免得再踩**：

@@ -1,0 +1,22 @@
+# capsplus raise-browser 扩展的**登录同步**：oneshot，每次登录把仓里的 extension.js/metadata.json
+# 拷进 ~/.local/share/gnome-shell/extensions，并保证 uuid 在 enabled-extensions 里。
+#
+# 为什么要有它：GNOME Shell 只在启动时扫描用户扩展目录，改过代码后 disable/enable 不会重新 import
+# （状态卡在 ERROR，2026-10-16 实测）⇒ 唯一生效路径是重登。这个 unit 让"重登"成为**唯一**要做的事，
+# 不必再手工 cp，也不会出现"仓里已修、机器上还是坏的"这种错位。
+#
+# install.sh 不主动 enable 它（动 systemctl --user enable 属于自启决策）。要装就：
+#   sed "s#@REPO_DIR@#$HOME/project/private/capsplus-linux#" \
+#       packaging/capsplus-extension-sync.service > ~/.config/systemd/user/capsplus-extension-sync.service
+#   systemctl --user daemon-reload && systemctl --user enable capsplus-extension-sync.service
+[Unit]
+Description=capsplus raise-browser 扩展登录同步
+After=graphical-session.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=@REPO_DIR@/tools/install-extension.sh --quiet
+
+[Install]
+WantedBy=graphical-session.target

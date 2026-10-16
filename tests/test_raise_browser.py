@@ -33,6 +33,10 @@ from qbar import search_config as SC          # noqa: E402
 from qbar.logic import (RAISE_BUS_IFACE, RAISE_BUS_PATH, RAISE_MEMBER,   # noqa: E402
                         RAISE_PROBE_MEMBER, RAISE_SETTLE_US, raise_browser_signal)
 
+from capsplus.extcheck import EXT_UUID, extension_status  # noqa: E402  体检函数（不碰 gi）
+_HAS_EXE = lambda _x: "/usr/bin/gnome-extensions"          # 假装系统里有 gnome-extensions
+_NO_EXE = lambda _x: None
+
 APP = REPO / "qbar" / "qbar_app.py"
 EXT_DIR = REPO / "extensions" / "raise-browser@capsplus.example"
 
@@ -183,6 +187,74 @@ class TestExtensionShape(unittest.TestCase):
     def test_actually_calls_activate_and_resolves_default_browser(self):
         for needed in ("get_tab_list", "activate(", "x-scheme-handler/https", "lookup_app"):
             self.assertIn(needed, self.js, f"扩展里少了 {needed} —— 它就不干这活了")
+
+
+class TestExtensionStatusReport(unittest.TestCase):
+    """`capsplus status` 的扩展体检：状态要读得到，且每种状态都带下一步动作。
+
+    存在理由：扩展加载失败是**静默**的（只在 journal 留一行），Qbar 走信号又没有回复通道，
+    用户只能看到"还是新窗口"。2026-10-16 我因此白让明江重登了一次 —— 现场必须能自己说清。
+    """
+
+    # 判据用的是模块级名字，不写 `cls.fn = extension_status`：
+    # 函数赋给类属性会走描述符协议变成绑定方法，调用时 self 抢占第一个形参，
+    # 报 "got multiple values for argument 'runner'"（`lambda` 包一层也一样会被绑定）。
+
+    def fake(self, mode):
+        def runner(argv):
+            if argv[1] == "list":
+                # missing 那种现场 uuid 本来就不在启用列表里 —— 夹具不能自相矛盾
+                # （第一版三种 mode 都返回"已启用"，于是"不存在"被读成 unknown）。
+                return "" if mode == "missing" else EXT_UUID + "\n"
+            if argv[1] == "info":
+                if mode == "active":
+                    return "  已启用: 是\n  状态: ACTIVE\n"
+                if mode == "error":
+                    return "  已启用: 是\n  状态: ERROR\n"
+                return '扩展"%s"不存在\n' % EXT_UUID
+            return ""
+        return runner
+
+    def test_active_reads_active(self):
+        state, hint = extension_status(runner=self.fake("active"), which=_HAS_EXE)
+        self.assertEqual(state, "ACTIVE")
+        self.assertIn("正常", hint)
+
+    def test_error_state_points_at_the_relogin_trap(self):
+        """ERROR 是最坑的一种：disable/enable 不会重新 import，必须提示重登与 journal。"""
+        state, hint = extension_status(runner=self.fake("error"), which=_HAS_EXE)
+        self.assertEqual(state, "ERROR")
+        for needed in ("重登", "journalctl"):
+            self.assertIn(needed, hint, f"提示里少了「{needed}」，用户就不知道该干什么")
+
+    def test_missing_extension_says_install_and_relogin(self):
+        state, hint = extension_status(runner=self.fake("missing"), which=_HAS_EXE)
+        self.assertEqual(state, "missing")
+        self.assertIn("install-extension.sh", hint)
+        self.assertIn("重登", hint)
+
+    def test_non_gnome_is_not_an_error(self):
+        state, hint = extension_status(runner=self.fake("active"), which=_NO_EXE)
+        self.assertEqual(state, "no-gnome")
+        self.assertIn("不适用", hint)
+
+    def test_status_prints_the_row(self):
+        src = (REPO / "capsplus" / "apply.py").read_text(encoding="utf-8")
+        self.assertIn("extension_status()", src, "status 里没有扩展体检行 —— 静默失效又看不见了")
+        self.assertIn("浏览器扩展", src)
+
+    def test_sync_unit_exists_and_is_oneshot(self):
+        p = REPO / "packaging" / "capsplus-extension-sync.service"
+        self.assertTrue(p.exists(), "登录同步 unit 不见了 ⇒ 改过扩展又得手工 cp")
+        t = p.read_text(encoding="utf-8")
+        self.assertIn("Type=oneshot", t)
+        self.assertIn("install-extension.sh --quiet", t)
+        self.assertIn("WantedBy=graphical-session.target", t)
+
+    def test_install_script_honours_quiet(self):
+        t = (REPO / "tools" / "install-extension.sh").read_text(encoding="utf-8")
+        self.assertIn('"$1" = "--quiet"', t, "install-extension.sh 不支持 --quiet，unit 会刷屏")
+        self.assertIn("say()", t, "输出没走 say()，--quiet 就是假的")
 
 
 class TestTools(unittest.TestCase):

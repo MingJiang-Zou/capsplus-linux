@@ -12,6 +12,11 @@
 # 用法：sh tools/install-extension.sh
 set -eu
 
+# --quiet：只报错误与"下一步该干什么"，给 systemd oneshot 用
+QUIET=0
+[ "$1" = "--quiet" ] && QUIET=1
+say() { [ "$QUIET" = 1 ] || printf '%s\n' "$1"; }
+
 UUID="raise-browser@capsplus.example"
 SRC_DIR="$(cd "$(dirname "$0")/.." && pwd)/extensions/$UUID"
 DST_DIR="$HOME/.local/share/gnome-shell/extensions/$UUID"
@@ -23,7 +28,7 @@ fi
 
 mkdir -p "$DST_DIR"
 cp "$SRC_DIR/metadata.json" "$SRC_DIR/extension.js" "$DST_DIR/"
-echo "✓ 已复制到 $DST_DIR"
+say "✓ 已复制到 $DST_DIR"
 
 # 追加进已启用列表（保留用户原有的，不覆盖）
 if command -v gsettings >/dev/null 2>&1; then
@@ -33,7 +38,7 @@ if command -v gsettings >/dev/null 2>&1; then
         *)
             NEW="$(printf '%s' "$CUR" | sed "s#\]\$#, '$UUID']#")"
             gsettings set org.gnome.shell enabled-extensions "$NEW"
-            echo "✓ 已加进 enabled-extensions：$(gsettings get org.gnome.shell enabled-extensions)"
+            say "✓ 已加进 enabled-extensions：$(gsettings get org.gnome.shell enabled-extensions)"
             ;;
     esac
 else
@@ -41,13 +46,13 @@ else
 fi
 
 echo
-echo "下一步：**注销再登录**（或重启）。之后自检："
-echo "  gdbus call --session --dest io.github.capsplus.RaiseBrowser \\"
-echo "    --object-path /io/github/capsplus/RaiseBrowser \\"
-echo "    --method io.github.capsplus.RaiseBrowser.Probe"
-echo "  # 期望输出形如 (true, 'default=microsoft-edge.desktop windows=1 on-current=1 …')"
+say "下一步：**注销再登录**（或重启）。之后自检："
+say "  gdbus call --session --dest io.github.capsplus.RaiseBrowser \\"
+say "    --object-path /io/github/capsplus/RaiseBrowser \\"
+say "    --method io.github.capsplus.RaiseBrowser.Probe"
+say "  # 期望输出形如 (true, 'default=microsoft-edge.desktop windows=1 on-current=1 …')"
 echo
-echo "要撤销：gsettings set org.gnome.shell enabled-extensions \"<去掉这个 uuid 的列表>\""
-echo "         再把目录移进回收处（别直接 rm -rf，便于反悔）："
-echo "           mkdir -p /tmp/attic-\$(date +%Y%m%d) && \\"
-echo "             mv ~/.local/share/gnome-shell/extensions/$UUID /tmp/attic-\$(date +%Y%m%d)/"
+say "要撤销：gsettings set org.gnome.shell enabled-extensions \"<去掉这个 uuid 的列表>\""
+say "         再把目录移进回收处（别直接 rm -rf，便于反悔）："
+say "           mkdir -p /tmp/attic-\$(date +%Y%m%d) && \\"
+say "             mv ~/.local/share/gnome-shell/extensions/$UUID /tmp/attic-\$(date +%Y%m%d)/"
