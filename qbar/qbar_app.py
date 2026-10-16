@@ -37,7 +37,8 @@ from gi.repository import Gdk, Gio, GLib, Gtk  # noqa: E402
 
 from qbar.logic import (  # noqa: E402
     toggle_action, should_hide_on_focus_out,
-    Entry, FileFinder, History, SearchEngine, browser_search_url, history_key,
+    Entry, FileFinder, History, SearchEngine, browser_search_url,
+    entry_history_payload, history_key,
     scan_desktop_files, settings_launch_command,
 )
 from qbar.search_config import open_command  # noqa: E402
@@ -66,7 +67,7 @@ HISTORY_PATH = STATE_DIR / "qbar-history.json"
 SEARCH_ROOTS = [Path.home() / "project", Path.home(), Path("/mnt/data"), Path("/mnt/back")]
 DEBOUNCE_MS = 130
 ENTRY_LIMIT = 40
-PLACEHOLDER = "搜网页（b 关键词 / gh 关键词）/ 应用 / 文件 / -> 命令 / = 算术"
+PLACEHOLDER = "搜网页（b / gh 关键词）/ 问 AI（qw 问题 = 复制+打开）/ 应用 / 文件 / -> 命令 / = 算术"
 
 CSS = b"""
 #qbarbox {
@@ -303,6 +304,19 @@ class QbarWindow(Gtk.Window):
                 self._open_file(entry.payload)
             elif entry.kind == "url":
                 self._open_url(entry.payload)
+            elif entry.kind == "ask":
+                # 「复制 + 打开」两条动作，**顺序是刻意的**：先落剪贴板再叫浏览器 ——
+                # 反过来做的话浏览器一起来就抢走了焦点/时序，用户回来粘贴时可能还是旧内容。
+                # 剪贴板放的是 `entry.clip` = 用户输入的**问题原文**（不是 URL、不是编码串）；
+                # 打开的是 `entry.payload` = 目标网址。走 `_open_url` 而不是自己 launch，
+                # 因为激活上下文（`_launch_context()`）在那一头，别在这儿绕过它。
+                if entry.clip:
+                    Gtk.Clipboard.get(Gdk.SELECTION_CLIPBOARD).set_text(entry.clip, -1)
+                    self.entry.set_placeholder_text("问题已复制，粘贴（Ctrl+V）后回车")
+                else:
+                    # 光敲了 trigger 没问题可给：别动剪贴板（把人家原来的内容洗掉更糟）
+                    self.entry.set_placeholder_text("没问题可复制：先敲问题再回车")
+                self._open_url(entry.payload)
             elif entry.kind == "hist":
                 if entry.payload and not entry.payload.startswith("http"):
                     self._open_url(browser_search_url(entry.title, self.engine.config))
@@ -319,7 +333,9 @@ class QbarWindow(Gtk.Window):
                     self._open_url(browser_search_url(entry.title, self.engine.config))
         except (GLib.Error, RuntimeError) as exc:
             print(f"打开失败 {entry.title}: {exc}", file=sys.stderr)
-        self.history.bump(history_key(entry.kind, entry.payload or entry.title))
+        # `entry_history_payload`：ask 型要把「网址 + 问题原文」一起写进历史键，
+        # 否则下次点这条只打得开网页、复制不出那个问题（其余类型行为不变）。
+        self.history.bump(history_key(entry.kind, entry_history_payload(entry)))
         self.hide()
 
     def _run_builtin(self, payload: str) -> bool:

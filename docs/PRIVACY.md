@@ -21,7 +21,7 @@
 | 文件 / 目录 | 谁写的 | 里面是什么 | 含不含"你输入的内容" | 保留策略 |
 | --- | --- | --- | --- | --- |
 | `qbar.log` | Qbar（`qbar/qbar_app.py`） | 诊断事件：`map` / `focus-in` / `focus-out` / `show(...)` / `hide` / `activate` | **平时不含输入本身，但有一条例外**：`activate kind=… title=…` 这行记的是**被激活条目的标题**，搜索结果标题长这样：「必应搜索：<你的关键词>」——关键词就跟着进去了（`qbar/search_config.py:entry_title`，实测 2026-10-16） | 只留**最后 200 行**，每次写整体重写 |
-| `qbar-history.json` | Qbar | 使用历史，用来把常用项往前排。**键 = `kind<TAB>payload`**，`payload` 是最终 URL / 路径 / 命令 | **含**。键的格式是 `url<TAB>最终 URL`，例如 `url<TAB>https://www.bing.com/search?q=keyd+%E9%85%8D%E7%BD%AE`（= 搜过「keyd 配置」）—— URL 编码过的关键词明明白白写在里面，另外还会记你打开过的本地路径 | 最多 **200 条**，按最近时间裁（`qbar/logic.py:History(max_items=200)`） |
+| `qbar-history.json` | Qbar | 使用历史，用来把常用项往前排。**键 = `kind<TAB>payload`**，`payload` 是最终 URL / 路径 / 命令 | **含**。键的格式是 `url<TAB>最终 URL`，例如 `url<TAB>https://www.bing.com/search?q=keyd+%E9%85%8D%E7%BD%AE`（= 搜过「keyd 配置」）—— URL 编码过的关键词明明白白写在里面，另外还会记你打开过的本地路径。**`ask` 类型（2026-10-16 加）记的是 `ask<TAB>["最终 URL", "问题原文"]`**：问题**不编码**、**原样**落盘（一句五千字的中文长句就整句写进去）。格式是 JSON 数组，不是分隔符拼接（见 `qbar/logic.py:ask_payload_text`） | 最多 **200 条**，按最近时间裁（`qbar/logic.py:History(max_items=200)`） |
 | `keyd-conf-backup/` | `capsplus apply` | 每次替换 `/etc/keyd/capslock-plus.conf` 之前的原件副本 | 间接含：里面是你的键位（个人习惯，不含文字内容） | 最近 **10 份**；更旧的 `mv` 进焚化炉 `/tmp/attic-<日期>/`（不用 `rm`，所以**重启即清空**） |
 | `config-backup/<时间戳>/` | 设置窗口写回 `qbar.toml` 前 | 快速链接配置的原件快照 | **含**：`qbar.toml` 里是你自己加的网址、本地路径、命令 | 每次保留 **20 份**（`capsplus/settings_logic.py:snapshot_config(keep=20)`） |
 | `qbar.toml`（`~/.config/capsplus/`） | 你 / 首次打开 Qbar 自动生成 / 设置界面 | 快速链接与搜索引擎、默认引擎、`browser`、`hide_on_focus_out` | **含**：你的个人网址、`app` 类型的命令行、`file` 类型的本地路径 | 无自动清理（是你的配置，删了就没） |
@@ -74,11 +74,38 @@ grep -c . ~/.config/capsplus/mappings.toml 2>/dev/null
   有**你的家目录绝对路径**与 `/etc/keyd` 路径 —— 贴终端截图前先想想。
 - **提 issue 附带的日志**：`qbar.log` 里的 `activate` 行已经够定位问题，贴之前把带关键词的
   那几行删掉（或者只贴焦点相关那几行：`map` / `focus-in` / `focus-out` / `hide` / `show`）。
+- **剪贴板本身**：最后一次 `qw 你的问题` 回车之后，问题原文就留在系统剪贴板里（截图、
+  共享屏幕、以及任何"粘贴一下看看"都会把它带出去）。要清就随便拷点无关文本盖掉。
 
-## 四、本项目**不**做的事
+## 四、剪贴板：只写、不读（2026-10-16 说清楚）
+
+Qbar 会**往系统剪贴板里放东西**（原先这句写在"本项目不做的事"里，那是不准的 —— 早就有三处在写），
+但**从不读**剪贴板内容，也不保存历史剪贴板。写入的三处：
+
+| 触发 | 写进剪贴板的内容 | 代码位置 |
+| --- | --- | --- |
+| `=1+2*3` 回车 | 算出来的结果（`4`） | `qbar/qbar_app.py::_activate` 的 `calc` 支 |
+| `-> date` / `-> time` | 日期 / 时间字符串 | `qbar/qbar_app.py::_run_builtin` |
+| **`qw 我的问题` 回车**（`ask` 类型） | **你输入的问题原文**，一字不改（不是 URL、不是 URL 编码串） | `qbar/qbar_app.py::_activate` 的 `ask` 支 |
+
+`ask` 这一条是本次新增，副作用要说透：
+
+- 回车之后剪贴板里原来那块内容**被覆盖**（GTK/X11/Wayland 的剪贴板就是一份，没有"独立第二块"，
+  上游 Capslock+ 的第二剪贴板在 Linux 上得靠 copyq）。所以别在拷了密码之类敏感内容之后
+  去敲 `qw 问题`。
+- 同一个问题原文还会**落两处盘**：`qbar-history.json`（见第一节那张表，最多 200 条）与
+  `qbar.log` 的 `activate kind=ask title='千问（复制+打开）：<你的问题>'`。
+  日志只留最后 200 行，但**问题原文就在里面**。
+- 光敲 `qw` 没跟问题：**不动剪贴板**（只打开网页）—— 免得把人家原有的内容洗成空串。
+- 想彻底不留痕迹：按第二节的办法把 `qbar.log` 与 `qbar-history.json` 挪进焚化炉。
+  关掉 `ask` 的复制行为则要在源码层改，目前没有开关（这是实话）。
+
+## 五、本项目**不**做的事
 
 - 不联网、不上报、不埋点、不自更新；没有任何远端请求。
+  （`ask` 只把网址交给**你自己的默认浏览器**，本仓代码自己不发一个字节到任何站点；
+  问题原文是你在网页输入框里 `Ctrl+V` 之后由你按回车发出去的，发不发、发给谁都在你手里。）
 - 不记录按键流（除显式 `CAPSPLUS_QBAR_DEBUG=1`）。
-- 不动 `~/.bash_history`、剪贴板、其他应用的数据；剪贴板相关只做 `Ctrl+C/V` 按键转发，
-  本仓代码不读剪贴板内容。
+- **不读剪贴板内容**、不维护剪贴板历史（写的那三处见第五节）。
+- 不动 `~/.bash_history`、其他应用的数据。
 - 不改系统配置：`/etc/keyd/` 只在你自己跑 `capsplus apply` 时写，且写之前一定先备份。

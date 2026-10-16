@@ -18,11 +18,15 @@ from datetime import datetime
 from pathlib import Path
 
 try:                                      # 作为包导入（bin/ 与单测的调用方式）
-    from .search_config import QbarConfig, load_config, open_plan, parse_search_cmd
+    from .search_config import (
+        ASK_HINT, QbarConfig, load_config, open_plan, parse_search_cmd,
+    )
 except ImportError:                       # 兜底：直接按文件路径跑时
     import sys
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-    from qbar.search_config import QbarConfig, load_config, open_plan, parse_search_cmd
+    from qbar.search_config import (
+        ASK_HINT, QbarConfig, load_config, open_plan, parse_search_cmd,
+    )
 
 # ---------------------------------------------------------------------------
 # 条目模型
@@ -35,6 +39,7 @@ KIND_LABEL = {
     "cmd": "命令",
     "calc": "计算",
     "url": "网址",
+    "ask": "问 AI",
     "hist": "历史",
     "cfg": "配置",
 }
@@ -48,6 +53,7 @@ class Entry:
     score: float = 0.0
     subtitle: str = ""
     payload: str = ""          # 应用=desktop 文件路径 / 文件=绝对路径 / 命令=命令名 / url=URL
+    clip: str = ""             # 要复制进剪贴板的**原文**；只有 ask 型用（问题本身，不是 URL）
 
     @property
     def label(self) -> str:
@@ -97,7 +103,8 @@ def fuzzy_filter(query: str, candidates: list[Entry], limit: int = 60) -> list[E
         best = hit if hit is not None else alt
         if best is None:
             continue
-        scored.append(Entry(entry.title, entry.kind, entry.score + best, entry.subtitle, entry.payload))
+        scored.append(Entry(entry.title, entry.kind, entry.score + best,
+                            entry.subtitle, entry.payload, entry.clip))
     scored.sort(key=lambda e: (-e.score, e.title))
     return scored[:limit]
 
@@ -290,6 +297,41 @@ def builtin_entries(text: str, config: QbarConfig | None = None) -> list[Entry]:
 def history_key(kind: str, payload: str) -> str:
     """历史条目的键 = 类型 + \\t + 载荷（载荷里不会有 \\t）。"""
     return f"{kind}\t{payload}"
+
+
+# --- ask 型的历史载荷：两个字段，**不用分隔符拼字符串** -----------------------
+# 为什么不用 `url|问题`、`url\t问题` 这类写法：问题里出现换行 / 逗号 / `|` / 中文长句
+# 是常态（本仓的单测就是这么打的），任何分隔符方案都有"切回去串位"的那一天。
+# JSON 数组 `["<url>", "<问题原文>"]` 由 json 负责转义，且 `json.dumps` 的输出里
+# **不可能出现裸换行与裸制表符**，所以 `history_key` 那个 `kind<TAB>payload` 的
+# 拆法照样安全（这条有单测锁住）。
+def ask_payload_text(url: str, clip: str) -> str:
+    """ask 型写进历史键的载荷 = `JSON([网址, 问题原文])`。"""
+    return json.dumps([url, clip], ensure_ascii=False)
+
+
+def split_ask_payload(payload: str) -> tuple[str, str]:
+    """解 `ask_payload_text` → `(网址, 问题原文)`。
+
+    解不开（用户手改过历史文件 / 别的格式）就返回 `("", "")`：**不猜、不把垃圾当网址**，
+    由调用方决定跳过这一条。绝不抛异常 —— 历史文件坏了不该把 Qbar 拖崩。
+    """
+    try:
+        value = json.loads(payload)
+    except ValueError:
+        return ("", "")
+    if isinstance(value, list) and len(value) == 2 and all(isinstance(x, str) for x in value):
+        return (value[0], value[1])
+    return ("", "")
+
+
+def entry_history_payload(entry: Entry) -> str:
+    """这条 Entry 存历史时用哪个载荷：ask 型要把「网址 + 问题原文」两件事一起存下去，
+    其余类型照旧（`payload` 空就退化成 `title`，和以前一样）。
+    """
+    if entry.kind == "ask":
+        return ask_payload_text(entry.payload, entry.clip)
+    return entry.payload or entry.title
 
 
 class History:
@@ -517,6 +559,15 @@ class SearchEngine:
         out = []
         for key, item in self.history.data.items():
             kind, _, payload = key.partition("\t")
+            if kind == "ask":
+                # 历史里存的是 `JSON([网址, 问题原文])`，两条都要还原：
+                # 标题显**问题原文**（用户就是靠它找回这条的），载荷显网址、clip 显问题。
+                url, clip = split_ask_payload(payload)
+                if not url and not clip:
+                    continue          # 解不开的空壳（手改过的历史文件）就不列出来碍眼
+                out.append(Entry(clip or url, "ask", self.history.score(key),
+                                 f"{ASK_HINT} → {url}", url, clip))
+                continue
             out.append(Entry(payload or key, kind or "hist", self.history.score(key),
                              "最近使用", payload))
         return out
@@ -551,10 +602,14 @@ class SearchEngine:
         return str(path) if path.suffix == ".desktop" and path.is_file() else ""
 
     def _entry_from_match(self, hit) -> Entry:
-        """把一条快速链接的命中变成**能打开**的 Entry（四种类型四条路）。"""
+        """把一条快速链接的命中变成**能打开**的 Entry（五种类型五条路）。"""
         kind, payload = open_plan(hit.link, hit.keyword)
         if kind == "url":
             return Entry(hit.entry_title, "url", 200.0, hit.subtitle, hit.url)
+        if kind == "ask":
+            # `payload` = 要打开的网址；`clip` = **用户输入的原始问题**（不是 URL、不是编码串）。
+            # 两件东西分两个字段带，谁也不许从谁那儿"推"出来。
+            return Entry(hit.entry_title, "ask", 200.0, hit.subtitle, payload, hit.keyword)
         if kind == "app":
             desktop = self._desktop_path(payload)
             if desktop:
@@ -646,7 +701,11 @@ class SearchEngine:
         merged = fuzzy_filter(text, current + files)
         seen, uniq = set(), []
         for entry in merged:
-            key = (entry.kind, entry.payload or entry.title)
+            # `clip` 也要进键：ask 型两条历史可能是**同一个网址、两个不同的问题**
+            # （都用 qw 问过两句），只比网址会把其中一条悄悄吃掉 —— 而"点回来还能
+            # 复制同一个问题"正是 ask 型的历史存在的理由。非 ask 型 clip 恒为空串，
+            # 加了它去重行为逐字节不变。
+            key = (entry.kind, entry.clip, entry.payload or entry.title)
             if key in seen:
                 continue
             seen.add(key)

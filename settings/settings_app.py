@@ -5,7 +5,7 @@
 #   上游 https://github.com/wo52616111/capslock-plus （GPL-2.0，© wo52616111）；改动见 README「许可与上游」。
 """capsplus-settings —— Capslock+ 的设置窗口（GTK3，中文，三页）。
 
-    ① 快速链接   只读表格 + 表格下方的**表单条**：增/删/上下移动 + 四种类型 + 实时预览，
+    ① 快速链接   只读表格 + 表格下方的**表单条**：增/删/上下移动 + 五种类型 + 实时预览，
                  写回 `qbar.toml`
     ② 通用       default_search / browser / hide_on_focus_out
     ③ 按键映射   只读生效表（层/键/动作/说明/来源）+ 表格下方的**编辑条**，
@@ -74,7 +74,8 @@ GENERAL_HELP = {
     "hide_on_focus_out": "点别处就收起 Qbar（等价于再按一次 Caps+Q，下次按一下就能唤起）",
 }
 
-VERB = {"search": "浏览器搜", "url": "浏览器开", "app": "启动", "file": "打开"}
+VERB = {"search": "浏览器搜", "url": "浏览器开", "app": "启动", "file": "打开",
+        "ask": "复制问题并浏览器开"}
 
 
 def markup(text: str, color: str = "") -> str:
@@ -329,9 +330,11 @@ class LinksPage(Gtk.Box):
         hint.set_line_wrap(True)
         hint.set_markup(markup(
             "表格只读：选中一行 → 下面表单条填的是**那一行**，双击行直接把焦点送进对应输入框。"
-            "四种类型：search = 网站内搜索（目标里要有 {q} 或 {q_raw}）；"
+            "五种类型：search = 网站内搜索（目标里要有 {q} 或 {q_raw}）；"
             "url = 固定网址；app = 本地应用（.desktop 名或一条命令，命令里 {q} 当参数）；"
-            "file = 文件或目录路径（~ 会展开，固定路径不支持 {q}）。", GREY))
+            "file = 文件或目录路径（~ 会展开，固定路径不支持 {q}）；"
+            "ask = 问 AI（复制+打开）：url 必须是 http(s) 网址，回车把问题原文拷进剪贴板、"
+            "同时打开那个网页，粘贴后回车。", GREY))
         self.pack_start(hint, False, False, 0)
 
         self.form_index: int | None = None
@@ -540,9 +543,14 @@ class LinksPage(Gtk.Box):
             self.preview_label.set_markup(markup("这条先改对：" + "；".join(problems), RED))
             return
         text, result = SC.preview_pair(link, self.sample.get_text())
-        self.preview_label.set_markup(
-            f'输入 <b>{GLib.markup_escape_text(text)}</b> → {VERB[link.resolved_type]} '
-            f'<tt>{GLib.markup_escape_text(result)}</tt>')
+        # ask 的第二项是「网址 \n 两步动作」：拆成两行画，网址走等宽、说明走灰字，
+        # 免得那句人话被塞进 <tt> 里变成一条又长又等宽的串（换行在 pango 里不会被 wrap 掉）
+        head, sep, tail = result.partition("\n")
+        line = (f'输入 <b>{GLib.markup_escape_text(text)}</b> → {VERB[link.resolved_type]} '
+                f'<tt>{GLib.markup_escape_text(head)}</tt>')
+        if sep:
+            line += "\n" + markup(tail, GREY)
+        self.preview_label.set_markup(line)
 
 
 # ===========================================================================

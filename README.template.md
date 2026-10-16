@@ -34,7 +34,8 @@
 **实测平台**：Ubuntu 26.04.1 LTS + GNOME Shell 50.1 + 纯 Wayland（`loginctl show-session … -p Type` → `wayland`）。
 其余发行版做的是"名字与路径可移植"的功课，**还没在别的发行版上真装过一遍** ——
 硬要列支持面的话：`keyd` 支持的 Linux 都算潜在可用，桌面侧限制一律见
-[`docs/KNOWN-LIMITS.md`](docs/KNOWN-LIMITS.md)（13 条，每条带实测日期与复现方法）。
+[`docs/KNOWN-LIMITS.md`](docs/KNOWN-LIMITS.md)（13 条编号 + 按日期追加的实测记录，
+每条都带**实测日期**与**复现方法**）。
 
 ## 快速上手（三条命令）
 
@@ -65,13 +66,13 @@ capsplus/       CLI 与映射真相源（render / apply / status）
 tray/           GTK3 + AyatanaAppIndicator3 托盘（capsplus-tray）
 qbar/           GTK3 浮层启动器（capsplus-qbar）
   logic.py          不依赖 gi 的纯逻辑层（fuzzy / 算术 / 历史 / 搜索编排）
-  search_config.py  快速链接的 TOML 配置层：四种类型、校验、预览、表单条取值、写回（同样不 import gi）
+  search_config.py  快速链接的 TOML 配置层：五种类型、校验、预览、表单条取值、写回（同样不 import gi）
 settings/       GTK3 设置窗口（capsplus-settings）—— **只摆控件，两页表格一律只读**；算法都在上面那两个纯层里
 bin/            capsplus / capsplus-tray / capsplus-qbar / capsplus-settings / keyd-qbar-cmd
 assets/         自画的两个托盘 SVG（启用/暂停）
 packaging/      应用菜单 .desktop（只放 Qbar 与设置两条）、autostart .desktop、systemd --user unit
               —— 模板里一律用 @BIN_DIR@ / @REPO_DIR@，由 install.sh 换成实际路径
-docs/           KNOWN-LIMITS.md（实测平台限制 13 条）/ PRIVACY.md（本机留什么、分享前清什么）
+docs/           KNOWN-LIMITS.md（实测平台限制，逐条带日期与复现方法）/ PRIVACY.md（本机留什么、分享前清什么）
 tests/          标准库 unittest（无 pytest 依赖）
 tools/gen-readme.py  由模板 + 映射数据生成 README
 tools/e2e/      真机端到端验收（虚拟键盘逐条比对，要 root）
@@ -121,7 +122,7 @@ capsplus-settings        # 设置窗口（GTK3，三页）：快速链接 / 通�
 
 | 页 | 管的东西 | 写到哪个文件 |
 | --- | --- | --- |
-| **快速链接** | **只读**表格（前缀 / 名称 / 类型 / 目标 / 备注）+ 表格下方**表单条**（`前缀` `名称` `类型`下拉四选一 `目标`）；按钮 `保存这一条` `新增` `删除（带确认）` `上移` `下移` `重读文件` `保存快速链接`。选中/输入即更新**实时预览**（`输入 b 关键词 → 最终 URL`，`file`/`app` 显示展开 `~` 后的真实目标）；前缀完全重复 = 红字拦下、**拒绝写盘** | `~/.config/capsplus/qbar.toml` |
+| **快速链接** | **只读**表格（前缀 / 名称 / 类型 / 目标 / 备注）+ 表格下方**表单条**（`前缀` `名称` `类型`下拉五选一 `目标`）；按钮 `保存这一条` `新增` `删除（带确认）` `上移` `下移` `重读文件` `保存快速链接`。选中/输入即更新**实时预览**（`输入 b 关键词 → 最终 URL`，`file`/`app` 显示展开 `~` 后的真实目标，`ask` 多一行灰字写清"回车做哪两件事"）；前缀完全重复 = 红字拦下、**拒绝写盘** | `~/.config/capsplus/qbar.toml` |
 | **通用** | `default_search`（下拉只列 search 类）、`browser`（留空=系统默认）、`hide_on_focus_out` 开关；每项右侧一行灰字解释 | 同上（两页写同一个文件，任一页点保存都会整体写回） |
 | **按键映射** | **只读**生效表（层/键/动作/说明/**来源=默认\|覆盖**，覆盖行加粗）+ 表格下方**编辑条**：`目标：capl / t`（加粗）+ 该行说明 + `动作：`下拉（`ComboBox.new_with_entry`，常用动作可点选也能自由输入）+ `改这一格` `恢复默认（删这条覆盖）`。单击行同步编辑条，**双击行焦点进输入框**，框内回车 = 点「改这一格」；当场用 `validate_action` + `load_known_keys` 校验（非法 = 红字不写盘），宏超 15 事件 = 黄字。「改这一格」立刻写覆盖层并刷表（来源变「覆盖」），但**不碰系统**；「应用」才装进 `/etc/keyd` | `~/.config/capsplus/mappings.toml`（覆盖层） |
 
@@ -229,6 +230,7 @@ command(<你的 bin 目录>/keyd-qbar-cmd)     # 渲染时按 Path.home()/.local
 | `gh 关键词` | **最长前缀优先**：`gh` 命中 GitHub，不会被 `g` 抢走 |
 | `纯关键词` | 不带前缀 → 用 `general.default_search` 指的引擎搜索（这条排第一，应用/文件紧随其后）|
 | `ghp` | 固定链接（模板里没有 `{q}`）→ 直接打开，不要关键词 |
+| `qw 问题` | **`ask` 类型（复制 + 打开）**：回车把**问题原文**放进剪贴板 + 打开千问，粘贴（`Ctrl+V`）后回车即可。站方不给 URL 预填的口子，只能这样 |
 | `b ` / `b` | 只敲了前缀 → 提示「输入关键词」 |
 | `-> q 关键词` | 老写法，保留：等价于默认引擎搜索 |
 | 直接打字 | fuzzy 子序列匹配：`.desktop` 应用 + `~/project`、`~`、`/mnt/data`、`/mnt/back` 下的文件/目录（`fd`/`fdfind`，1.5s 超时；根目录不存在就跳过） |
@@ -262,10 +264,10 @@ url = "https://github.com/search?q={q}"     # {q} = 关键词做 URL 编码填�
 | `hide_on_focus_out` | `[general]` | 默认 `true`：点别处就收起 Qbar（等价于再按一次 Caps+Q，这样下次一次就能唤起）。改成 `false` 则失焦不隐藏，被盖住时靠 `Caps+Q` 拉回前台 |
 | `trigger` | `[[link]]` | 前缀，**不许重复、不许含空格**；重复的会被跳过并在结果里提示 |
 | `name` | `[[link]]` | 结果行里的引擎名，如「必应搜索：关键词」 |
-| `type` | `[[link]]` | 链接类型：`search` / `url` / `app` / `file`。**可以不写**：不写就按老规则推断（有 `{q}` = `search`，没有 = `url`），所以老配置一行都不用改；`app` / `file` **必须显式写**（`code` 这种目标既像命令又像路径，猜错就会去开浏览器）。设置界面写回时会把四种都显式写出来 |
+| `type` | `[[link]]` | 链接类型：`search` / `url` / `app` / `file` / `ask`。**可以不写**：不写就按老规则推断（有 `{q}` = `search`，没有 = `url`），所以老配置一行都不用改；`app` / `file` / `ask` **必须显式写**（`code` 这种目标既像命令又像路径；`ask` 的动作和普通固定网址差得远，猜错就等于什么也没复制）。设置界面写回时会把五种都显式写出来 |
 | `url` | `[[link]]` | 目标。`{q}` = 关键词 URL 编码（空格变 `+`）；`{q_raw}` = 原样嵌入（给 `ghcli cli` 这类要保留空格的路径）；**两个都不放 = 固定链接**，整条直接打开。`target =` 是它的别名，两个键都认、只存一份 |
 
-### 四种类型（`type`）
+### 五种类型（`type`）
 
 | 类型 | 目标写法 | 敲 `trigger` 之后发生什么 |
 | --- | --- | --- |
@@ -273,6 +275,7 @@ url = "https://github.com/search?q={q}"     # {q} = 关键词做 URL 编码填�
 | `url` | 固定网址（**不许**带 `{q}`） | 直接开这条地址，不要关键词（如 `ghp`） |
 | `app` | `.desktop` 名（`firefox` / `firefox.desktop`）**或一条命令** | 名字能对上 `.desktop` 就走桌面启动器；**带了参数就走 shell 命令**（`code --diff {q}`）—— 桌面启动器不吃参数，硬套会把参数丢掉。命令里的 `{q}` 按**原样**填（URL 编码在参数里没意义） |
 | `file` | 文件或目录路径，`~` 会展开；相对路径按家目录算 | 用系统默认程序打开该文件 / 目录。路径不存在也照样列出并写明「（路径不存在）」，不会静默消失 |
+| `ask` | **必须**以 `http://` / `https://` 开头的网址（`{q}` 可带可不带） | **两条动作**：① 回车把**你输入的原始问题**写进剪贴板（不是 URL、不是编码串）；② 同时打开那个网页（带 `{q}` 就打开填好的地址）。然后 Qbar 收起，你在网页输入框 `Ctrl+V` 回车。**历史里两条都存**：老问题点一下 = 重新复制同一个问题 + 重新打开 |
 
 ```toml
 [[link]]
@@ -286,6 +289,12 @@ trigger = "no"
 name = "笔记目录"
 type = "file"
 url = "~/notes"                  # no → 打开 /home/<你>/notes
+
+[[link]]
+trigger = "qw"
+name = "千问（复制+打开）"
+type = "ask"
+url = "https://www.qianwen.com/chat"          # qw 我的问题 → 问题进剪贴板 + 打开千问
 ```
 
 三种 `url` 各举一例（默认配置里都能看到）：
@@ -307,11 +316,18 @@ url = "https://github.com/pulls"              # ghp      → 固定链接，直�
 | `gh` | GitHub | `ghp` | GitHub 我的仓库（固定链接） |
 | `tb` | 淘宝 | `xy` | 闲鱼 |
 | `ds` | **DeepSeek 直接问**（`?q=…&autosend=1`，一条回车就出答案） | `dsp` | DeepSeek 只预填（自己按回车） |
+| `qw` | **千问（复制+打开）** = `ask` 类型：问题进剪贴板 + 打开网页 | | |
 
-
-> `ds` 那两个参数是从 chat.deepseek.com 自己的 `main.js` 里读出来的（见 `qbar/search_config.py` 注释），
-> 不是猜的：**只有根路径 `/` 生效**，且 `autosend` 仅在问题**长度 ≤ 800 字**时才自动发送。
-> 千问/通义暂时没做进来：抓不到它可静态分析的入口包，**没验过就不写进默认引擎**。
+> **为什么千问走 `ask` 而 DeepSeek 走 `search`**（都是 2026-10-16 实测，证据全文见
+> [`docs/KNOWN-LIMITS.md`](docs/KNOWN-LIMITS.md)）：
+> - **DeepSeek 支持**：它的 `main.js` 里写的是 `searchParams.get("q") ?? get("prompt")`，
+>   `autoSend` 只在**根路径**且问题**长度 ≤ 800 字**时为真 —— 参数名是从它代码里读出来的，不是猜的。
+> - **千问不支持**：扒 `www.qianwen.com/chat` 的 `@ali/qianwen-web/4.10.0` async chunk，三条证据 ——
+>   ① 业务侧只读夸克集成参数（`biz_id/channel_id/file/filename/qk_biz/qk_module/qk_params`）；
+>   ② 唯一的 `?q=` 是拼 `quark.cn/s?q=` 的**搜索**构造器，不是聊天输入框；
+>   ③ 代码里明确抛 `"Workbench URL auto-send is not supported"`。
+>   ChatGPT / Gemini / ChatGLM 同理没有这个口子。
+> - 所以"免费网页端问 AI"想要一条**不依赖站点配合**的路，就是 `ask`：复制 + 打开，剩一步 `Ctrl+V`。
 
 **单字母 trigger 只在带空格时当前缀**：`b 关键词` 是搜索，而 `beta` 是普通输入
 （否则任何以 b/g/w 开头的词都会被当成"前缀 + 关键词"，用户就再也搜不到这些词和应用了）。
@@ -460,7 +476,7 @@ keyd 的一条 `macro(...)` 里累计发出的按键事件**超过 15 个就不�
 | 适配 keyd 的硬边界 | keyd 的 `macro(...)` 一条最多 15 个按键事件，超了**整条静默丢掉**：原版"上/下 30 行"改成 `pageup`/`pagedown`，"选中 10 行"（=20 事件）压到 7 行（=14 事件）。见「硬件与 keyd 的边界」 |
 | 渲染 / 应用 / 回滚链路 | `capsplus apply`：备份 → 装 `/etc/keyd` → reload → 抓 `ERROR:` → 出错自动回滚，`--dry-run` 只渲染自检 |
 | 用户键位覆盖层 | 上游是改源码；本仓是 `~/.config/capsplus/mappings.toml` 只存"改过的那几条"，没改的键跟着仓库走 |
-| Qbar | 上游 Qbar 是 AHK 实现的启动器；本仓用 GTK3 重写，并把搜索改成**可配置**（`qbar.toml` 四种链接类型） |
+| Qbar | 上游 Qbar 是 AHK 实现的启动器；本仓用 GTK3 重写，并把搜索改成**可配置**（`qbar.toml` 五种链接类型） |
 | 托盘 | 上游没有；本仓新增（GTK3 + AyatanaAppIndicator3：启停映射 / 重载 / 唤起 Qbar / 看日志） |
 | 设置界面 | 上游没有；本仓新增 `capsplus-settings`（GTK3 三页：快速链接 / 通用 / 按键映射） |
 | 明确没做的 | 独立剪贴板 B 组、WinBind 切窗口、热字符串、F2/F3/F4/F6/F12 —— 原因是 Wayland / keyd 层面做不到，见「与原版 Capslock+ 的差异」 |
@@ -477,9 +493,9 @@ keyd 的一条 `macro(...)` 里累计发出的按键事件**超过 15 个就不�
 ## 开发
 
 ```bash
-python3 -m unittest discover -s tests        # 294 个用例，纯标准库（无 pytest）；默认 0.1s 跑完
-xvfb-run -a env -u WAYLAND_DISPLAY GDK_BACKEND=x11 CAPSPLUS_GUI=1   python3 -m unittest discover -s tests      # 加跑 35 条真窗口用例（8~9s）；不加 CAPSPLUS_GUI 就 skip
-PYTHONPATH=tools/ci/nogi python3 -m unittest discover -s tests   # 复现"没装 python3-gi"的 CI
+python3 -m unittest discover -s tests        # 纯标准库（无 pytest）一条命令跑全量；默认快、0 起窗（界面用例跳过）
+xvfb-run -a env -u WAYLAND_DISPLAY GDK_BACKEND=x11 CAPSPLUS_GUI=1   python3 -m unittest discover -s tests      # 显式要求才真跑界面用例（慢十几秒）；连着真实 Wayland 会整类拒跑
+PYTHONPATH=tools/ci/nogi python3 -m unittest discover -s tests   # 复现"没装 python3-gi"的 CI（再跳 6 条动作层 mock 用例）
 python3 -m compileall -q .                   # CI 的另一半：全仓语法过一遍
 python3 tools/gen-readme.py                  # 改了映射/模板就重新生成 README
 ```

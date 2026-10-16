@@ -201,3 +201,49 @@
 `microsoft-edge-stable --help` 只列了 `--new-window`（那恰恰是反效果），`--new-tab` 不在帮助里，
 **所以没写进默认行为**。真要拿它当硬保证，得在各自机器上实测后再用 `[general] browser = "…"` 显式配
 （模板里 `{url}` 会被替换）。若上面这个激活上下文的修法在你机器上没能完全解决，就按这条继续查开关。
+
+## 网页端"把问题塞进 URL 就自动问"只有站方给口子才成立（2026-10-16 实测）
+
+这条决定了 Qbar 为什么要有第五种链接类型 `ask`（`问 AI（复制+打开）`）。
+
+### DeepSeek 网页端：**支持**（所以 `ds` / `dsp` 走 `search`）
+
+从 `chat.deepseek.com` 自己的 `main.js` 里读出来的（不是猜的参数名）：
+
+```js
+r = searchParams.get("q")?.trim() ?? e.get("prompt")
+{ prompt: r, autoSend: "1" === searchParams.get("autosend") && r.length <= 800, ... }
+```
+
+三个条件都成立才会自动发送：**只有根路径 `/` 生效**、`autosend=1`、**问题长度 ≤ 800 字**。
+所以内置 `ds` = `https://chat.deepseek.com/?q={q}&autosend=1`（一条回车就问完），
+`dsp` = 同一地址不带 `autosend`（只预填，你自己按回车）。
+
+### 千问（通义）网页端：**不支持**（所以 `qw` 走 `ask`）
+
+扒 `https://www.qianwen.com/chat` 的 `@ali/qianwen-web/4.10.0` async chunk，三条证据：
+
+1. **业务侧只读夸克集成参数**：能从代码里认出来的入参是
+   `biz_id` / `channel_id` / `file` / `filename` / `qk_biz` / `qk_module` / `qk_params`
+   —— 那是"从夸克客户端跳过来"的集成通道，不是给外部链接预填问题用的。
+2. **唯一的 `?q=` 是搜索构造器**：代码里拼的是 `https://www.quark.cn/s?q=…`，
+   也就是"拿 q 去夸克搜索"，跟聊天输入框没有半点关系。
+3. **明确写死不支持**：代码里直接抛
+   `"Workbench URL auto-send is not supported"`。
+
+补一条口径：`chat.qwen.ai` 那边也拿不到 —— 它的 HTML 只暴露埋点脚本，应用包是运行时注入的，
+抓不到可静态分析的 chunk（2026-10-16 试过）。ChatGPT / Gemini / ChatGLM 同理没有这个口子。
+
+### 于是本仓的做法：不依赖站点配合的那条路
+
+`ask` 类型 = **回车把问题原文写进剪贴板 + 打开目标网页**，用户在输入框 `Ctrl+V` 再回车。
+多按一下粘贴，但**换掉了对站方的依赖**，站方哪天加了预填也不用改行为（把那条改成 `search` 即可）。
+
+代码落点：`qbar/search_config.py`（`LINK_TYPES` / `open_plan` / `link_problems` / `preview_pair`）、
+`qbar/logic.py`（`Entry.clip` + `ask_payload_text` / `split_ask_payload` 的历史建模）、
+`qbar/qbar_app.py`（`_activate` 的 `ask` 支）。判据：`tests/test_qbar_ask_type.py`
+（含"问题里带换行 / 逗号 / `|` / 中文长句"的往返、`_activate` 分支的源码级体检、
+以及 mock 掉 GTK 之后的"剪贴板收到问题原文 + `_open_url` 收到期望 URL"）。
+
+**隐私副作用**：`ask` 会把问题原文写进剪贴板，并且原样（不 URL 编码）落进
+`qbar-history.json` 与 `qbar.log` —— 见 `docs/PRIVACY.md` 第一节表格与第四节。

@@ -31,16 +31,28 @@ Python 3.11+ 自带），所以在没有显示服务器的环境里也能直接�
 
 配置语法坏了**不许崩**：`QbarConfig.error` 带上原因，`links` 退回内置默认，界面照常能搜。
 
-## 四种链接类型（`type`，2026-10-15 加）
+## 五种链接类型（`type`，2026-10-15 加四种，2026-10-16 加 `ask`）
 
     type = "search"  # 网站内搜索：目标里必须有 {q} 或 {q_raw}
     type = "url"     # 固定网址：目标里不许有 {q}
     type = "app"     # 本地应用：.desktop 名（firefox / firefox.desktop）或一条命令；
                      #          命令里可以用 {q} 当参数（原样，不做 URL 编码）
     type = "file"    # 文件或目录路径：`~` 会展开；固定路径，不支持 {q}
+    type = "ask"     # 复制 + 打开：url 是要打开的网页（**必须** http:// 或 https:// 开头，
+                     #          可以带 {q}），回车做两件事 —— 把**用户输入的原始问题**写进
+                     #          剪贴板 + 打开那个网页，用户在输入框 Ctrl+V 再回车。
+                     #          剪贴板里永远是问题**原文**，不是 URL、不是编码串
+
+`ask` 为什么存在（2026-10-16 实测，证据全文见 `docs/KNOWN-LIMITS.md`）：
+「把问题塞进网址让网页端自己问」**只有站方给了口子才成立**。DeepSeek 给了（`?q=…&autosend=1`，
+所以它走 `search`）；千问 `qianwen.com/chat` 没给 —— 业务侧只读夸克集成参数
+（`biz_id/channel_id/file/filename/qk_biz/qk_module/qk_params`）、唯一的 `?q=` 是拼
+`quark.cn/s?q=` 的搜索构造器、代码里还明确抛 `"Workbench URL auto-send is not supported"`。
+ChatGPT / Gemini / ChatGLM 同理。所以"免费网页端问 AI"需要一条**不依赖站点配合**的路径 = `ask`。
 
 **老文件不写 `type` 也能用**（`resolved_type` 推断：有占位符=search，没有=url），
-所以这次改动对现有配置逐字节无感；设置界面会把 `type` 显式写出来，读的人不用猜。
+所以那次改动对现有配置逐字节无感；设置界面会把 `type` 显式写出来，读的人不用猜。
+`ask` **不参与推断**：它和"固定网址"差的是整条动作链，猜错就等于什么也没复制，必须显式写。
 """
 
 from __future__ import annotations
@@ -57,19 +69,31 @@ RAW_PLACEHOLDER = "{q_raw}"
 CONFIG_PATH = Path.home() / ".config/capsplus/qbar.toml"
 
 # 链接类型：界面下拉、写盘、校验共用这一份（别在 GUI 里再抄一遍）
-LINK_TYPES = ("search", "url", "app", "file")
+LINK_TYPES = ("search", "url", "app", "file", "ask")
 LINK_TYPE_LABEL = {
     "search": "网站内搜索",
     "url": "固定网址",
     "app": "本地应用",
     "file": "文件或目录",
+    "ask": "问 AI（复制+打开）",
 }
+
+# `ask` 的两步动作怎么说才看得懂（预览、结果行、README 都用这一句，别各写一份）
+ASK_HINT = "回车：问题进剪贴板 + 打开网页，粘贴后回车"
+
+# `ask` 的 url 必须是真的要打开的网页，否则"打开"那一步毫无意义
+HTTP_PREFIXES = ("http://", "https://")
+
+
+def is_http_url(target: str) -> bool:
+    """`http://` / `https://` 开头（大小写不敏感，先去掉首尾空格）。"""
+    return (target or "").strip().lower().startswith(HTTP_PREFIXES)
 
 @dataclass(frozen=True)
 class SearchLink:
     """一条快速链接：trigger + 显示名 + 目标 + 类型。
 
-    字段名 `url` 是历史包袱，**四种类型都存在这一列**（TOML 里也是 `url =`），
+    字段名 `url` 是历史包袱，**五种类型都存在这一列**（TOML 里也是 `url =`），
     免得同一件事有两个键、读的人还得判断该看哪个。`target` 是它的别名。
     """
     trigger: str
@@ -122,8 +146,8 @@ class SearchMatch:
     subtitle: str             # 如 `b keyd 配置 -> https://...`
     url: str                  # 已填好关键词的目标地址；固定链接 = 模板本身
     link: SearchLink
-    keyword: str = ""
-    kind: str = "url"         # url / app / exec / file / dir
+    keyword: str = ""         # 用户输入的原始内容；`ask` 型靠它当"要复制的问题原文"
+    kind: str = "url"         # url / app / exec / file / dir / ask
     payload: str = ""         # 真正要打开的东西；留空 = 用 url 本身
 
 
@@ -146,6 +170,13 @@ BUILTIN_LINKS = [
     # 千问/通义没能验到：chat.qwen.ai 的 HTML 只暴露埋点脚本，应用包是运行时注入的，抓不到可 grep 的静态 chunk。
     SearchLink("ds", "DeepSeek（直接问）", "https://chat.deepseek.com/?q=" + QUOTED_PLACEHOLDER + "&autosend=1"),
     SearchLink("dsp", "DeepSeek（只预填）", "https://chat.deepseek.com/?q=" + QUOTED_PLACEHOLDER),
+    # 千问走 `ask` 而不是 `search`：扒 www.qianwen.com/chat 的 @ali/qianwen-web/4.10.0 async chunk
+    # 得到三条证据（2026-10-16，全文见 docs/KNOWN-LIMITS.md）——① 业务侧只读夸克集成参数
+    # （biz_id/channel_id/file/filename/qk_biz/qk_module/qk_params）；② 唯一的 `?q=` 是拼
+    # `quark.cn/s?q=` 的站内搜索构造器，不是聊天输入框；③ 代码里明确抛
+    # "Workbench URL auto-send is not supported"。既然站方不给预填的口子，就换成
+    # 「问题进剪贴板 + 打开网页」这条不依赖站点配合的路：回车 → Ctrl+V → 回车。
+    SearchLink("qw", "千问（复制+打开）", "https://www.qianwen.com/chat", "ask"),
     SearchLink("tr", "翻译（有道）", "https://dict.youdao.com/search?q=" + QUOTED_PLACEHOLDER),
     SearchLink("ghcli", "GitHub CLI 仓库", "https://github.com/cli/" + RAW_PLACEHOLDER),
     SearchLink("ghp", "GitHub 我的仓库", "https://github.com/pulls"),
@@ -155,7 +186,7 @@ DEFAULT_TRIGGER = "b"
 
 
 # ---------------------------------------------------------------------------
-# 四种类型：怎么打开 / 怎么校验 / 怎么预览（全是纯函数，界面前端只负责摆控件）
+# 五种类型：怎么打开 / 怎么校验 / 怎么预览（全是纯函数，界面前端只负责摆控件）
 # ---------------------------------------------------------------------------
 def fill_raw(template: str, keyword: str) -> str:
     """把 {q}/{q_raw} 都按**原样**填进目标（应用命令行用，URL 编码在参数里没意义）。"""
@@ -181,6 +212,9 @@ def open_plan(link: SearchLink, keyword: str = "") -> tuple[str, str]:
       url   载荷 = 最终网址（search 已填好关键词）
       app   载荷 = .desktop 名或一条命令（上层再判断是哪一个）
       file  载荷 = 展开 `~` 后的本地路径
+      ask   载荷 = 要打开的网址（带 {q} 就填好，没有就原样）；
+                  **问题原文不在这里** —— 它是 `keyword` 本身，载荷里放 URL 编码串
+                  就等于把"复制问题"这件事悄悄变成了"复制一条网址"
 
     刻意不在这里判断"desktop 名到底存不存在"：那要扫 /usr/share/applications，
     属于上层（Qbar 已经有应用表）的事，纯函数保持可以离线跑单测。
@@ -188,6 +222,8 @@ def open_plan(link: SearchLink, keyword: str = "") -> tuple[str, str]:
     kind = link.resolved_type
     if kind in ("search", "url"):
         return ("url", link.target_url(keyword))
+    if kind == "ask":
+        return ("ask", link.target_url(keyword))
     if kind == "app":
         return ("app", fill_raw(link.url, keyword))
     return ("file", expand_path(link.url))
@@ -229,6 +265,12 @@ def link_problems(link: SearchLink, seen: tuple[str, ...] = ()) -> list[str]:
     elif raw_type == "app":
         if "\n" in target:
             out.append("应用命令不许换行")
+    elif raw_type == "ask":
+        # 只拦"根本不是网页"的目标：ask 的第二步是「打开」，写成 `~/notes` 或
+        # `firefox` 的话打开的是别的东西，用户却以为在开千问 —— 比报错更糟。
+        # `{q}` 这里**不**要求也不禁止：带就是打开填好的地址，不带就是打开原始 url。
+        if not is_http_url(target):
+            out.append("问 AI（复制+打开）的 url 必须以 http:// 或 https:// 开头（它是要打开的网页）")
     return out
 
 
@@ -250,11 +292,15 @@ def preview_pair(link: SearchLink, sample: str = "") -> tuple[str, str]:
     """界面上的实时预览：返回 `(输入什么, 得到什么)`。
 
     search 类没填示例词时用「关键词」占位，这样预览行永远读得通。
+    `ask` 类第二项是「网址 + 换行 + 两步动作」：光看一条网址，没人知道回车之后
+    剪贴板里会变成什么，所以副文案必须一起给（界面照原样画成第二行）。
     """
     _kind, payload = open_plan(link, sample)
     sample = sample.strip()
     if link.resolved_type == "search":
         return (f"{link.trigger} {sample or '关键词'}", payload)
+    if link.resolved_type == "ask":
+        return (f"{link.trigger} {sample or '问题'}", f"{payload}\n{ASK_HINT}")
     if link.resolved_type == "app" and not link.is_fixed:
         return (f"{link.trigger} {sample or '参数'}", payload)
     return (link.trigger, payload)
@@ -401,6 +447,12 @@ class QbarConfig:
             return SearchMatch(f"{link.name}搜索：{keyword}",
                                f"{link.trigger} {keyword} -> {link.target_url(keyword)}",
                                link.target_url(keyword), link, keyword, kind, payload)
+        if kind == "ask":
+            # 标题带问题原文（Qbar 的「标题」列显的就是它，用户要确认拷走的就是这一串），
+            # `url` / `payload` 都是**要打开的网址**，问题原文另有去处：`keyword` 字段。
+            title = f"{link.name}：{keyword}" if keyword else link.name
+            return SearchMatch(title, f"{ASK_HINT} → {payload}", payload, link, keyword,
+                               kind, payload)
         # 应用 / 文件：把"要执行的东西"原样当副标题显出来，用户一眼看得懂会跑什么
         label = LINK_TYPE_LABEL.get(link.resolved_type, link.resolved_type)
         return SearchMatch(f"{link.name}（{label}）", payload, payload, link, keyword, kind, payload)
@@ -444,6 +496,8 @@ HEADER = [
     "#   search 网站内搜索（目标必须有 {q}/{q_raw}）   url 固定网址（目标不许有 {q}）",
     "#   app    本地应用：.desktop 名（firefox）或一条命令，命令里 {q} 当参数（原样）",
     "#   file   文件或目录路径：~ 会展开；固定路径，不支持 {q}",
+    "#   ask    问 AI（复制+打开）：url 必须以 http(s):// 开头（{q} 可带可不带），回车把",
+    "#          **问题原文**放进剪贴板并打开那个网页，粘贴后回车 —— 站方不给 URL 预填时用这条",
     "# 提醒：设置界面会重写 [general] 与每条 [[link]]，**写在条目中间的注释会被模板注释顶掉**；",
     "#       自己的说明请写在文件开头（开头那段注释界面会原样带回去）。",
 ]

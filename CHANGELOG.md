@@ -36,6 +36,19 @@
   页面全堆进去。改为带 `Gdk.AppLaunchContext` + 事件时间戳；判据 `tests/test_launch_context.py`
   （AST 扫描，headless 也跑，改回 `None` 立刻红），详见 `docs/KNOWN-LIMITS.md`。
 - 默认引擎模板加淘宝 / 闲鱼（两个搜索端点实测 HTTP 200，中文关键词走 `{q}` URL 编码）。
+- AI 问答进默认引擎（2026-10-16）：`ds` / `dsp` 走 `search`（DeepSeek 网页端**支持** URL 预填与
+  自动发送，参数名与 `≤800 字` 那条限制是从它 `main.js` 里读出来的）；`qw`（千问）走新加的
+  第五种类型 **`ask`（复制 + 打开）** —— 扒它 `@ali/qianwen-web/4.10.0` 的 async chunk 得到三条证据
+  证明站方没给口子（只读夸克集成参数 / 唯一的 `?q=` 是夸克搜索构造器 / 明确抛
+  `"Workbench URL auto-send is not supported"`），于是改成"问题原文进剪贴板 + 打开网页"这条
+  **不依赖站点配合**的路。证据与结论见 `docs/KNOWN-LIMITS.md`。
+- `ask` 的历史建模：`Entry` 新增 `clip` 字段带问题原文，历史键的载荷用 `JSON([网址, 问题])`
+  —— **不用字符串分隔符**拼两个字段（问题里有换行 / 逗号 / `|` / 中文长句都会串位），
+  所以点历史能"重新复制同一个问题 + 重新打开"。判据 `tests/test_qbar_ask_type.py`：
+  脏输入逐字符往返、`_activate` 的 ask 支源码级体检（复制漏了 / 复制成 URL / 忘了打开 /
+  绕过 `_open_url` 四种违例都红）、以及 mock 掉 GTK 的动作层断言（不建窗口、不叫浏览器）。
+- `docs/PRIVACY.md` 补一节「剪贴板：只写、不读」：原先写在"本项目不做的事"里那句"不动剪贴板"
+  是**不准的**（算数结果、`-> date/time` 早就在写），现在把三处写入与 `ask` 落盘的副作用写清。
 
 ### 托盘（`tray/`）
 

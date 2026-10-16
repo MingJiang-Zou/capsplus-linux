@@ -21,6 +21,7 @@ import ast
 import os
 import subprocess
 import sys
+import shutil
 import tempfile
 import time
 import unittest
@@ -192,11 +193,9 @@ class TestSettingsWindow(unittest.TestCase):
                 "    setup-python/venv 的解释器看不见它）。CI 的界面 job 必须用系统 python3。")
         if not display_works():
             raise AssertionError("CAPSPLUS_GUI=1 但连不上显示服务器（没在 xvfb-run / 真桌面下跑？）")
-
-
-    @classmethod
-    def setUpClass(cls):
         cls.app_module = __import__("settings_app", globals(), locals(), ["SettingsWindow"], 0)
+        # ↑ 这里原先是**第二个同名 setUpClass**，把上面那整段判红覆盖成死代码（Python 只认最后一个定义）。
+        #   2026-10-16 合并回一处；同类事故由 tests/test_no_duplicate_defs.py 钉住。
 
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
@@ -253,7 +252,11 @@ class TestSettingsWindow(unittest.TestCase):
         # **照抄调用者的显示环境**，不替子进程发明显示器。上一版这里硬塞了
         # `WAYLAND_DISPLAY="wayland-0"`：在 xvfb 里跑时子进程反而连到真实 Wayland 桌面，
         # 于是"我明明用了 xvfb"却仍然往用户屏幕上弹窗（2026-10-16 实测踩到）。
-        env = dict(os.environ)
+        # 隔离到临时 HOME：真入口进程会写 ~/.local/state/capsplus/qbar.log 并重绑 qbar.sock，
+        # 不隔离就等于每次 GUI 验收都碰真人那一份（2026-10-16 分身实测各写 5 行、重绑两个 socket）。
+        sb = tempfile.mkdtemp(prefix="capsplus-entry-sb-")
+        self.addCleanup(shutil.rmtree, sb, True)
+        env = dict(os.environ, HOME=sb)
         env.setdefault("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}")   # 有 DISPLAY 时这个不决定后端
         for entry in ("capsplus-settings", "capsplus-qbar"):
             path = REPO / "bin" / entry
@@ -464,6 +467,35 @@ class TestSettingsWindow(unittest.TestCase):
         self.assertIn("example.com/s?x=keyd", page.preview_label.get_text())
         page.f_type.set_active(LINK_TYPES.index("url"))     # url 不许带 {q} → 预览当场说哪儿错
         self.assertIn("固定网址不许带", page.preview_label.get_text())
+
+    def test_ask_type_dropdown_validation_and_two_line_preview(self):
+        """第五种类型 `ask` 在设置界面这一路的三件事（真起窗跑 `set_markup`）：
+        ① 下拉里有它而且显中文名；② 目标不是网址 → 预览当场说人话；
+        ③ 目标写对 → 预览是**两行**（第一行网址、第二行灰字副文案）。
+        副文案那行是按 `\\n` 拆出来单独画 markup 的，拼坏了这里就炸。
+        """
+        page = self.window.links_page
+        labels = [row[0] for row in page.f_type.get_model()]
+        self.assertEqual(len(labels), len(LINK_TYPES), f"下拉项数要跟 LINK_TYPES 一致：{labels}")
+        self.assertTrue(any(s.endswith("（ask）") and "问 AI" in s for s in labels),
+                        f"下拉里没有 ask 这一类：{labels}")
+
+        page.view.get_selection().select_path(Gtk.TreePath.new_from_indices([0]))
+        page.f_trigger.set_text("qw")
+        page.f_name.set_text("千问（复制+打开）")
+        page.f_type.set_active(LINK_TYPES.index("ask"))
+        page.f_target.set_text("~/notes")
+        self.assertIn("http://", page.preview_label.get_text(),
+                      "ask 的网址写错没拦下来")
+
+        page.f_target.set_text("https://www.qianwen.com/chat")
+        preview = page.preview_label.get_text()
+        lines = preview.splitlines()
+        self.assertEqual(len(lines), 2, f"预览该是两行（网址 / 副文案）：{preview!r}")
+        self.assertIn("输入 qw", lines[0])
+        self.assertIn("https://www.qianwen.com/chat", lines[0])
+        self.assertIn("剪贴板", lines[1])
+        self.assertIn("打开", lines[1])
 
     def test_duplicate_prefix_in_form_blocks_save(self):
         """前缀和别的行撞了 → 红字拦下，**不许写盘**（文件一个字节都不该变）。"""
