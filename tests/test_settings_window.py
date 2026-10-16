@@ -40,8 +40,28 @@ except Exception as exc:                        # noqa: BLE001
 else:
     GI_ERROR = ""
 
-os.environ.setdefault("WAYLAND_DISPLAY", "wayland-0")
-os.environ.setdefault("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}")   # 别处不一定是 1000
+# 界面测试默认**不跑**。`show_all()` 会在真实桌面映射出窗口，Qbar 冷启动还会 grab_focus
+# 抢走键盘焦点 —— 明江就在这台机器上干活，2026-10-16 他明确抱怨"老把 qbar 和设置页面换出来"。
+# 要跑界面测试必须显式开关，并且要在虚拟显示下、把 WAYLAND_DISPLAY 摘掉：
+#   xvfb-run -a --server-args="-screen 0 1280x800x24" \
+#     env -u WAYLAND_DISPLAY CAPSPLUS_GUI=1 python3 -m unittest discover -s tests
+RUN_GUI = os.environ.get("CAPSPLUS_GUI") == "1"
+
+if RUN_GUI:
+    os.environ.setdefault("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}")   # 别处不一定是 1000
+    # 光 `-u WAYLAND_DISPLAY` 不够：libwayland 会退回连 `$XDG_RUNTIME_DIR/wayland-0` 套接字，
+    # 于是还是连到真实桌面（2026-10-16 实测）。调用者显式给了 DISPLAY（xvfb-run 就是这么进来的）
+    # 又没给 WAYLAND_DISPLAY，那就照他的意思锁 X11 —— 这是尊重调用者的选择，不是发明显示器。
+    if os.environ.get("DISPLAY") and not os.environ.get("WAYLAND_DISPLAY"):
+        os.environ.setdefault("GDK_BACKEND", "x11")
+    # 这里**不再**替调用者补 WAYLAND_DISPLAY。原先那行 setdefault 才是这次骚扰的根源：
+    # 即使外面用 xvfb-run 起了虚拟 X11，只要 WAYLAND_DISPLAY 被补上，GDK3 就优先走 Wayland，
+    # 窗口照样弹到明江的真实桌面上（2026-10-16 实测：我自己那两次"xvfb 验证"其实都弹了真窗）。
+    # 新规则：**测试绝不自己发明显示器** —— 给什么后端就用什么后端，什么都不给就 skip。
+    #   虚拟显示（默认用法，不打扰桌面，也是 CI 的跑法）：
+    #     xvfb-run -a env -u WAYLAND_DISPLAY CAPSPLUS_GUI=1 python3 -m unittest discover -s tests
+    #   要真 Wayland 证据（会弹窗，挑人不在用机器时跑）：
+    #     env -u DISPLAY WAYLAND_DISPLAY=wayland-0 CAPSPLUS_GUI=1 python3 -m unittest discover -s tests
 
 from capsplus import mapping_overrides as MO    # noqa: E402
 from capsplus.render import binding_rows        # noqa: E402
@@ -98,7 +118,8 @@ def display_works() -> bool:
     return bool(ok)
 
 
-@unittest.skipUnless(display_works(), f"没有可用的显示服务器（{GI_ERROR or 'Gtk.init_check 失败'}）")
+@unittest.skipUnless(display_works() and RUN_GUI,
+                     "界面测试需要显式 CAPSPLUS_GUI=1（默认跳过，避免在真实桌面弹窗抢焦点）")
 class TestSettingsWindow(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -297,11 +318,18 @@ class TestSettingsWindow(unittest.TestCase):
     def test_window_is_really_mapped(self):
         display = Gtk.Window.get_display(self.window) if hasattr(Gtk.Window, "get_display") else None
         from gi.repository import Gdk
-        name = Gdk.Display.get_default().get_name()
+        disp = None      # 下面统一取，别再单独拿一次
+        disp = Gdk.Display.get_default()
+        backend = type(disp).__name__          # WaylandDisplay / X11Display：以 GDK 实际选的后端为准
         self.assertTrue(self.window.get_realized(), "窗口没 realize = 根本没连上显示服务器")
         self.assertTrue(self.window.get_mapped(), "show_all() 之后没 mapped = 没真起窗")
         self.assertTrue(self.window.get_visible())
-        self.assertIn("wayland", name.lower())
+        # 原先这里写死 assertIn("wayland", …)：CI 在 xvfb(X11) 上跑就变成假红，
+        # 而"为了让它绿"把它整类跳过又是假绿。改成按真实后端分支断言。
+        # 类名带命名空间前缀（GdkWaylandDisplay / GdkX11Display），别按精确串比
+        self.assertTrue("Wayland" in backend or "X11" in backend, f"认不出的 GDK 后端: {backend}")
+        if "Wayland" in backend:
+            self.assertIn("wayland", disp.get_name().lower())
         self.assertTrue(display is None or True)
 
     def test_three_pages_exist_with_the_right_titles(self):
