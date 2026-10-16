@@ -36,6 +36,11 @@ SUB_FLAG = "CAPSPLUS_NOGI_SUB"
 def nogi_env(**extra) -> dict:
     """一份"假装没装 PyGObject"的环境：PYTHONPATH 前置屏蔽器 + 挡递归 + 不落真用户目录。"""
     env = dict(os.environ)
+    # 本判据测的是"**没装 PyGObject、且没人要求跑界面测试**"那条契约；必须摘掉两个界面开关，
+    # 否则外层用 CAPSPLUS_GUI=1 跑全量时，子进程会同时"要求跑"且"没有 gi" → 按新规矩判红
+    # （红得对，但测的已经不是本条主张了）。
+    env.pop("CAPSPLUS_GUI", None)
+    env.pop("CAPSPLUS_WAYLAND", None)
     env["PYTHONPATH"] = os.pathsep.join([str(NOGI_DIR), env.get("PYTHONPATH", "")]).rstrip(os.pathsep)
     env[SUB_FLAG] = "1"
     env.update(extra)

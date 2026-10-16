@@ -250,8 +250,11 @@ class TestSettingsWindow(unittest.TestCase):
         判据：能撑到超时（= 真起了窗口）或干净退出（单实例已在跑）都算过；
         stderr 里出现 Traceback 就是红。
         """
-        env = dict(os.environ, XDG_RUNTIME_DIR=f"/run/user/{os.getuid()}",
-                             WAYLAND_DISPLAY="wayland-0")
+        # **照抄调用者的显示环境**，不替子进程发明显示器。上一版这里硬塞了
+        # `WAYLAND_DISPLAY="wayland-0"`：在 xvfb 里跑时子进程反而连到真实 Wayland 桌面，
+        # 于是"我明明用了 xvfb"却仍然往用户屏幕上弹窗（2026-10-16 实测踩到）。
+        env = dict(os.environ)
+        env.setdefault("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}")   # 有 DISPLAY 时这个不决定后端
         for entry in ("capsplus-settings", "capsplus-qbar"):
             path = REPO / "bin" / entry
             self.assertTrue(path.exists(), f"入口不存在：{path}")
