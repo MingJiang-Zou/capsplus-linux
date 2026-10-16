@@ -1,4 +1,8 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-2.0-only
+# Copyright (c) 2026 capsplus-linux contributors
+# 本文件属 capsplus-linux —— CapsLock+ v3.3.0 的 Linux 移植（衍生作品）；按键映射数据译自上游：
+#   上游 https://github.com/wo52616111/capslock-plus （GPL-2.0，© wo52616111）；改动见 README「许可与上游」。
 """capsplus-settings —— Capslock+ 的设置窗口（GTK3，中文，三页）。
 
     ① 快速链接   只读表格 + 表格下方的**表单条**：增/删/上下移动 + 四种类型 + 实时预览，

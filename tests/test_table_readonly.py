@@ -1,3 +1,7 @@
+# SPDX-License-Identifier: GPL-2.0-only
+# Copyright (c) 2026 capsplus-linux contributors
+# 本文件属 capsplus-linux —— CapsLock+ v3.3.0 的 Linux 移植（衍生作品）；按键映射数据译自上游：
+#   上游 https://github.com/wo52616111/capslock-plus （GPL-2.0，© wo52616111）；改动见 README「许可与上游」。
 """源码级护栏：**两页表格必须永远只读**（2026-10-15 治本方案 A 的永久锁）。
 
 按 现象 / 原因 / 建议 写在这儿，免得下一个人再把编辑控件塞回表格：

@@ -362,6 +362,40 @@ keyd 的一条 `macro(...)` 里累计发出的按键事件**超过 15 个就不�
    （AST，出现可编辑 renderer 就红，headless 也跑）+ 行为级 `tests/test_settings_window.py`
    （`get_property("editable")` 全 False、单击第 N 行编辑条就是第 N 行、双击焦点进编辑条的输入框）。
 
+## 许可与上游
+
+**本仓库整体以 GPL-2.0-only 授权**（全文见 [`LICENSE`](LICENSE)，17984 字节，取自 Debian 的
+`/usr/share/common-licenses/GPL-2`）。之所以是 GPL-2.0 而不是随便挑一个：
+
+- 上游 **CapsLock+** —— <https://github.com/wo52616111/capslock-plus>（AutoHotkey 写的 Windows 版），
+  GitHub API 实测 `license.spdx_id = GPL-2.0`，2026-10-16 那天 1315 star。
+- 本仓的按键映射表（`capsplus/mapping_data.py`）是把上游源码
+  `lib/lib_keysSet.ahk` 里的 `keySchemeInit_capslox()`（配合 `lib/lib_keysFunction.ahk` 的动作实现）
+  **逐条翻译**成 keyd 语法的产物。翻译成另一种配置语言不改变"衍生作品"的性质 ——
+  按 GPL-2.0 第 2 条，分发衍生作品必须**同样以 GPL-2.0 提供源码**、保留上游署名、并说明改了什么。
+
+本仓相对上游做的事（就是"改动说明"那部分）：
+
+| 改动 | 说明 |
+| --- | --- |
+| 翻译按键映射表 | 上游 AHK 的 `capl` / `capl+alt` 两层键位 → `capsplus/mapping_data.py` 里的 Python 常量（单一真相源），再由 `capsplus/render.py` 渲染成 keyd 配置 |
+| 适配 keyd 的硬边界 | keyd 的 `macro(...)` 一条最多 15 个按键事件，超了**整条静默丢掉**：原版"上/下 30 行"改成 `pageup`/`pagedown`，"选中 10 行"（=20 事件）压到 7 行（=14 事件）。见「硬件与 keyd 的边界」 |
+| 渲染 / 应用 / 回滚链路 | `capsplus apply`：备份 → 装 `/etc/keyd` → reload → 抓 `ERROR:` → 出错自动回滚，`--dry-run` 只渲染自检 |
+| 用户键位覆盖层 | 上游是改源码；本仓是 `~/.config/capsplus/mappings.toml` 只存"改过的那几条"，没改的键跟着仓库走 |
+| Qbar | 上游 Qbar 是 AHK 实现的启动器；本仓用 GTK3 重写，并把搜索改成**可配置**（`qbar.toml` 四种链接类型） |
+| 托盘 | 上游没有；本仓新增（GTK3 + AyatanaAppIndicator3：启停映射 / 重载 / 唤起 Qbar / 看日志） |
+| 设置界面 | 上游没有；本仓新增 `capsplus-settings`（GTK3 三页：快速链接 / 通用 / 按键映射） |
+| 明确没做的 | 独立剪贴板 B 组、WinBind 切窗口、热字符串、F2/F3/F4/F6/F12 —— 原因是 Wayland / keyd 层面做不到，见「与原版 Capslock+ 的差异」 |
+
+上游项目与本仓**没有从属关系**（不是 fork，也没有在 Linux 上跑它的任何 `.ahk` 文件）；
+本仓只是把它的键位设计与动作语义翻译到 keyd + GTK3。上游 © `wo52616111`。
+基于本仓做闭源分支不行（GPL-2.0 不允许）；合进别的 GPL-2.0 项目可以。
+
+每个 `.py`、`bin/` 脚本与 `install.sh` 顶部都带 `SPDX-License-Identifier: GPL-2.0-only` 声明块，
+`capsplus render` 生成的 keyd 配置头注释里也带上同样的许可与上游说明 ——
+这三处由 `tests/test_license_headers.py` 锁住（漏一个就判红）。
+注：只写 `LICENSE` 一份，不另造 `COPYING`（两份真相迟早漂）。
+
 ## 开发
 
 ```bash

@@ -1,4 +1,8 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: GPL-2.0-only
+# Copyright (c) 2026 capsplus-linux contributors
+# 本文件属 capsplus-linux —— CapsLock+ v3.3.0 的 Linux 移植（衍生作品）；按键映射数据译自上游：
+#   上游 https://github.com/wo52616111/capslock-plus （GPL-2.0，© wo52616111）；改动见 README「许可与上游」。
 # capsplus-linux 安装脚本：只装用户侧（bin 软链、autostart、应用菜单入口），并检查依赖。
 # 刻意**不碰** /etc/keyd —— 那份配置由你手工跑 `capsplus apply` 并审 diff。
 set -euo pipefail
@@ -12,7 +16,8 @@ WITH_AUTOSTART=1
 for arg in "$@"; do
   case "$arg" in
     --no-autostart) WITH_AUTOSTART=0 ;;
-    -h|--help) sed -n '2,12p' "$0"; exit 0 ;;
+    # 顶部第 2..5 行是 GPL 声明块，帮助只印真正的说明（6..7 行）
+    -h|--help) sed -n '6,7p' "$0"; exit 0 ;;
     *) echo "未知参数: $arg" >&2; exit 2 ;;
   esac
 done

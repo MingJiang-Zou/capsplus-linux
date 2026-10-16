@@ -1,3 +1,7 @@
+# SPDX-License-Identifier: GPL-2.0-only
+# Copyright (c) 2026 capsplus-linux contributors
+# 本文件属 capsplus-linux —— CapsLock+ v3.3.0 的 Linux 移植（衍生作品）；按键映射数据译自上游：
+#   上游 https://github.com/wo52616111/capslock-plus （GPL-2.0，© wo52616111）；改动见 README「许可与上游」。
 """Qbar 快速链接 / 网页搜索的纯逻辑测试（标准库 unittest，无需显示服务器）。
 
 覆盖：trigger 最长前缀优先、默认引擎、URL 编码（中文/空格/&）、固定链接、坏 TOML 容错、

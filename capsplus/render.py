@@ -1,3 +1,7 @@
+# SPDX-License-Identifier: GPL-2.0-only
+# Copyright (c) 2026 capsplus-linux contributors
+# 本文件属 capsplus-linux —— CapsLock+ v3.3.0 的 Linux 移植（衍生作品）；按键映射数据译自上游：
+#   上游 https://github.com/wo52616111/capslock-plus （GPL-2.0，© wo52616111）；改动见 README「许可与上游」。
 """keyd 配置渲染器：把 mapping_data 的常量渲染成 /etc/keyd/*.conf 文本。
 
 硬规矩（踩过的坑，别删）：
@@ -9,9 +13,12 @@
 from . import mapping_data as MD
 
 HEADER = [
-    "Capslock+ v3.3.0 -> Ubuntu 26.04 / keyd.rvaiya 2.5.0",
-    "本文件由 capsplus render 生成，请勿手改（改动请改 capsplus/mapping_data.py）",
-    "依据: 官方源码 lib/lib_keysSet.ahk 的 keySchemeInit_capslox() + lib/lib_keysFunction.ahk",
+    "Capslock+ v3.3.0 -> Linux keyd（本文件由 capsplus render 生成，请勿手改）",
+    "要改键位：改 capsplus/mapping_data.py，或写用户覆盖层 ~/.config/capsplus/mappings.toml",
+    "许可: GPL-2.0-only —— 本文件是衍生作品，再分发必须同样以 GPL-2.0 提供源码",
+    "上游: CapsLock+ v3.3.0  https://github.com/wo52616111/capslock-plus （GPL-2.0, (c) wo52616111）",
+    "      按键映射译自官方源码 lib/lib_keysSet.ahk 的 keySchemeInit_capslox() + lib/lib_keysFunction.ahk",
+    "      本仓改了什么: 见 README「许可与上游」",
     "",
     "语义: 短按 Caps = 原大小写切换; 按住 Caps = [capl] 层; 再加 Alt = [capl+alt] 增强层",
     "注意: macro(...) 行尾不许写注释, 否则解析报 invalid key or action（本渲染器已保证）",

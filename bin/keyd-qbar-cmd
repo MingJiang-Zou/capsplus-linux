@@ -1,4 +1,8 @@
 #!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-only
+# Copyright (c) 2026 capsplus-linux contributors
+# 本文件属 capsplus-linux —— CapsLock+ v3.3.0 的 Linux 移植（衍生作品）；按键映射数据译自上游：
+#   上游 https://github.com/wo52616111/capslock-plus （GPL-2.0，© wo52616111）；改动见 README「许可与上游」。
 # keyd 用：keyd 的 command(...) 以 root 执行，拉 GUI 必须降权 + 带用户会话环境。
 # 用法（keyd 配置里）：command(/home/zmj/.local/bin/keyd-qbar-cmd)
 # 效果：Qbar 已开 -> 切换显示/隐藏（Qbar 自己的 socket 单实例负责）；没开 -> 起一个。
