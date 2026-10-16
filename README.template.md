@@ -1,16 +1,59 @@
-# capsplus —— Linux（Ubuntu 26.04 / GNOME Wayland）版 Capslock+
+# capsplus —— Capslock+ 的 Linux 移植（keyd + GTK3）
 
-把 Windows 上的 **Capslock+ v3.3.0** 的核心能力搬到本机：按住 CapsLock 变成一层导航/编辑键，
-外带一个托盘和一个 Qbar 启动器。键位映射的**唯一真相源**是 `capsplus/mapping_data.py`，
-keyd 配置、README 键表都由它渲染出来 —— 改映射不用改两处。
+**一句话**：把 Windows 上 **Capslock+ v3.3.0** 的核心用法搬到 Linux —— 按住 CapsLock 进一层
+导航/编辑键，外加一个托盘、一个 Qbar 启动器和一个图形设置界面。键位映射的**唯一真相源**是
+`capsplus/mapping_data.py`，keyd 配置与下面的键表都由它渲染（改映射不用改两处）。
 
-键盘层落点是 **keyd**（内核 evdev/uinput 层）。本机是纯 Wayland（GNOME 50，Xwayland 进程 0），
-xcape / xmodmap / AutoKey 那类 X11 工具全部出局，keyd 是唯一通吃的路线。
+<!-- 状态徽章：等仓库真推到 GitHub 了再放开，把 <OWNER>/<REPO> 填上。**没 CI 跑过就不许放假徽章** -->
+<!--
+[![tests](https://github.com/<OWNER>/<REPO>/actions/workflows/tests.yml/badge.svg)](https://github.com/<OWNER>/<REPO>/actions/workflows/tests.yml)
+[![license: GPL-2.0-only](https://img.shields.io/badge/license-GPL--2.0--only-blue.svg)](LICENSE)
+-->
+
+**许可**：GPL-2.0-only（本仓的按键映射表译自上游 CapsLock+，属衍生作品）——
+出处、改动清单与分发要求见下面「[许可与上游](#许可与上游)」一节，全文见 [`LICENSE`](LICENSE)。
+
+**截图**：还没有（`assets/screenshots/` 里只有一份该拍什么的清单，
+见 [`assets/screenshots/PLACEHOLDER.md`](assets/screenshots/PLACEHOLDER.md)）。
+要补的三张：① Qbar 敲 `b 关键词` 的搜索态；② 设置窗口「按键映射」页（只读表格 + 下方编辑条）；
+③ 托盘菜单。放图之前先读 [`docs/PRIVACY.md`](docs/PRIVACY.md) —— 截图里可能带着你搜过的词。
+
+## 依赖
+
+| 依赖 | 版本 / 说明 | 必需性 |
+| --- | --- | --- |
+| Linux + **keyd** | 实测 **2.5.x**。Debian/Ubuntu 的包把它装成 `keyd.rvaiya`，Arch/Fedora/openSUSE 装成 `keyd` —— 本仓两个名字都试（`capsplus/env.py`） | 必需（没它整套键位都不成立） |
+| **Python** | **≥ 3.11**（用了标准库 `tomllib`，除此之外零第三方依赖） | 必需 |
+| **GTK3 + PyGObject** | `python3-gi` `gir1.2-gtk-3.0` | 必需（Qbar / 托盘 / 设置窗口） |
+| **AyatanaAppIndicator3** | `gir1.2-ayatanaappindicator3-0.1` + GNOME 的 `ubuntu-appindicators` 扩展 | **可选** —— 没装就没托盘图标，其余功能不受影响 |
+| `fd` / `fdfind` | Debian/Ubuntu 叫 `fdfind` | 可选（只影响 Qbar 搜文件） |
+
+**实测平台**：Ubuntu 26.04.1 LTS + GNOME Shell 50.1 + 纯 Wayland（`loginctl show-session … -p Type` → `wayland`）。
+其余发行版做的是"名字与路径可移植"的功课，**还没在别的发行版上真装过一遍** ——
+硬要列支持面的话：`keyd` 支持的 Linux 都算潜在可用，桌面侧限制一律见
+[`docs/KNOWN-LIMITS.md`](docs/KNOWN-LIMITS.md)（13 条，每条带实测日期与复现方法）。
+
+## 快速上手（三条命令）
+
+```bash
+./install.sh                 # ① 装用户侧：bin 软链 + 应用菜单入口 + autostart + 依赖检查
+capsplus render | less       # ② 先看渲染出来的 keyd 配置，不动系统
+capsplus apply               # ③ 装进 /etc/keyd 并 reload（先备份，keyd 报错自动回滚）
+```
+
+`install.sh` **不碰 `/etc/keyd`**，③ 这一步是你自己按下去的。之后：
+
+```bash
+capsplus status              # keyd 服务/程序路径/当前配置摘要/与渲染是否一致
+capsplus-qbar                # Qbar（Caps+Q 由 keyd 唤起）
+capsplus-settings            # 设置窗口：快速链接 / 通用 / 按键映射
+```
 
 ## 目录
 
 ```
 capsplus/       CLI 与映射真相源（render / apply / status）
+  env.py            跨发行版落点的唯一入口（keyd 二进制名/单元名、用户 bin 目录、fd 名）
   mapping_data.py   键位数据 + 分组注释（改这里）
   render.py         渲染 keyd 配置 / 归一化校验 / 生成 README 键表 / binding_rows 给界面用
   mapping_overrides.py  用户键位覆盖层 `~/.config/capsplus/mappings.toml`（只存改过的那几条）
@@ -23,9 +66,15 @@ qbar/           GTK3 浮层启动器（capsplus-qbar）
 settings/       GTK3 设置窗口（capsplus-settings）—— **只摆控件，两页表格一律只读**；算法都在上面那两个纯层里
 bin/            capsplus / capsplus-tray / capsplus-qbar / capsplus-settings / keyd-qbar-cmd
 assets/         自画的两个托盘 SVG（启用/暂停）
-packaging/      应用菜单 .desktop（只放 Qbar 一条）、autostart .desktop、systemd --user unit
+packaging/      应用菜单 .desktop（只放 Qbar 与设置两条）、autostart .desktop、systemd --user unit
+              —— 模板里一律用 @BIN_DIR@ / @REPO_DIR@，由 install.sh 换成实际路径
+docs/           KNOWN-LIMITS.md（实测平台限制 13 条）/ PRIVACY.md（本机留什么、分享前清什么）
 tests/          标准库 unittest（无 pytest 依赖）
 tools/gen-readme.py  由模板 + 映射数据生成 README
+tools/e2e/      真机端到端验收（虚拟键盘逐条比对，要 root）
+tools/ci/nogi/  sitecustomize 屏蔽 gi，一行复现"没装 PyGObject 的 CI"
+.github/        workflows/tests.yml（ubuntu-latest × py3.11/3.12，不装 gi、不 sudo、不碰 /etc）
+CHANGELOG.md    0.1.0 段的版本叙事（**尚无任何 release tag**）
 ```
 
 ## 安装
@@ -43,7 +92,9 @@ bash install.sh --no-autostart   # 不装开机自启（应用菜单入口照装
 `fd`（Debian/Ubuntu 装出来叫 `fdfind`）、`keyd`（**Debian/Ubuntu 叫 `keyd.rvaiya`，
 Arch/Fedora/openSUSE 叫 `keyd`** —— 本仓两个名字都试，见 `capsplus/env.py`）、GNOME 扩展
 `ubuntu-appindicators@ubuntu.com`（托盘才有地方显示）。
-TOML 解析用 Python 3.11+ 自带的 `tomllib`，**不需要额外装包**。
+TOML 解析用 Python 3.11+ 自带的 `tomllib`，**除此之外零第三方依赖**。
+`install.sh` 会先卡两条：`python3 >= 3.11`（不够就给对应发行版的装法）与 keyd 在不在
+（不在就按发行版给 `apt`/`pacman`/`dnf`/`zypper` 命令，**不替你装** —— 它要动内核输入层）。
 
 `install.sh` **不会**碰 `/etc/keyd` —— 配置由你自己跑 `capsplus apply` 并审 diff。
 
@@ -371,6 +422,14 @@ keyd 的一条 `macro(...)` 里累计发出的按键事件**超过 15 个就不�
    （AST，出现可编辑 renderer 就红，headless 也跑）+ 行为级 `tests/test_settings_window.py`
    （`get_property("editable")` 全 False、单击第 N 行编辑条就是第 N 行、双击焦点进编辑条的输入框）。
 
+## 隐私：本机留了什么
+
+不联网、不上传、不埋点（全仓没有任何网络请求代码，实测 2026-10-16）。但它会在
+`~/.local/state/capsplus/` 与 `~/.config/capsplus/` 里写文件，其中两处**真的会记下你搜过什么**：
+`qbar-history.json` 的键是最终 URL（带 URL 编码的关键词），`qbar.log` 的 `activate` 行带结果标题
+（形如「必应搜索：<关键词>」）。位置、保留策略、怎么清、贴截图/日志之前该删什么，
+逐条写在 [`docs/PRIVACY.md`](docs/PRIVACY.md)。
+
 ## 许可与上游
 
 **本仓库整体以 GPL-2.0-only 授权**（全文见 [`LICENSE`](LICENSE)，17984 字节，取自 Debian 的
@@ -408,9 +467,22 @@ keyd 的一条 `macro(...)` 里累计发出的按键事件**超过 15 个就不�
 ## 开发
 
 ```bash
-python3 -m unittest discover -s tests -v     # 263 个用例，纯标准库（无 pytest）
-python3 tools/gen-readme.py                  # 重新生成 README（含键表）
+python3 -m unittest discover -s tests        # 294 个用例，纯标准库（无 pytest）；默认 0.1s 跑完
+xvfb-run -a env -u WAYLAND_DISPLAY GDK_BACKEND=x11 CAPSPLUS_GUI=1   python3 -m unittest discover -s tests      # 加跑 35 条真窗口用例（8~9s）；不加 CAPSPLUS_GUI 就 skip
+PYTHONPATH=tools/ci/nogi python3 -m unittest discover -s tests   # 复现"没装 python3-gi"的 CI
+python3 -m compileall -q .                   # CI 的另一半：全仓语法过一遍
+python3 tools/gen-readme.py                  # 改了映射/模板就重新生成 README
 ```
+
+界面测试**默认不跑**：`show_all()` 会在 GDK 当前连着的桌面上真弹窗并抢走键盘焦点，而开发机就是人
+干活的机器（2026-10-16 有实测抱怨）。要跑得同时满足两件事：`CAPSPLUS_GUI=1` + GDK 连的不是真
+Wayland 桌面（上面那条 `xvfb-run … GDK_BACKEND=x11` 就是标准姿势；进程内再设 `GDK_BACKEND` 太晚了，
+GDK 读得比 Python 早 —— 实测过）。真需要"真桌面证据"时再加 `CAPSPLUS_WAYLAND=1`，挑人不用机器的时候跑。
+
+CI（`.github/workflows/tests.yml`）跑的是 `python3 -m unittest discover -s tests` 与
+`python3 -m compileall -q .` 两步，矩阵 py3.11 / py3.12：**不装 python3-gi、不碰 `/etc`、不用 sudo**。
+"没有 gi 也必须能过收集阶段"由 `tests/test_no_gi_smoke.py` 守着（顶层裸写 `import gi` 会被它判红，
+判据自己有反例具型，不是摆设）。
 
 `tests/test_settings_window.py` 是**真起窗**的界面测试（会断言窗口真的 `mapped`、三页控件与
 表格行数、"单击第 N 行 → 编辑条显示的就是第 N 行"、双击后焦点在编辑条的输入框、
