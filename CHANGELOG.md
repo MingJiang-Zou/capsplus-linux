@@ -42,6 +42,9 @@
   与 `test_qbar_window_is_not_wider_than_the_screen`（真构造窗口断宽度，500px 虚拟屏实测 450）。
 - 改 `bin/keyd-qbar-cmd`：**只报一个显示后端**——调用者已导出就用它的；否则探 `$XDG_RUNTIME_DIR/wayland-0`
   socket 在不在（在 → Wayland），再否则才退回 `DISPLAY`。原先两个变量一起凭空注入，是浏览器另起窗口的温床。
+- **定位**「焦点不在浏览器时另起新窗口」的根因：GTK3 没有 Wayland 激活令牌通道
+  （`libgdk-3` 里 `XDG_ACTIVATION_TOKEN` 0 次），不是双报后端、也不是另起进程（主进程数实测恒为 1）。
+  三条可行修法与成本写进 `docs/KNOWN-LIMITS.md`；扩展方案需在 GNOME 上重启 shell 才能装新扩展。
   ⚠ 过程中我自己把 `bash` 数组写进了 `#!/bin/sh`（dash）脚本 → **Caps+Q 直接失灵**（keyd 不报错，只是没反应）；
   已改回 POSIX 变量，并把判据从 `bash -n` 升级为**按 shebang 选解释器**（`tests/test_portability.py`）。
 - 默认引擎模板加淘宝 / 闲鱼（两个搜索端点实测 HTTP 200，中文关键词走 `{q}` URL 编码）。

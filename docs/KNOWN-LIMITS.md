@@ -270,3 +270,32 @@ r = searchParams.get("q")?.trim() ?? e.get("prompt")
 
 **隐私副作用**：`ask` 会把问题原文写进剪贴板，并且原样（不 URL 编码）落进
 `qbar-history.json` 与 `qbar.log` —— 见 `docs/PRIVACY.md` 第一节表格与第四节。
+
+## 「焦点不在浏览器时网页另起新窗口」是 Wayland 激活令牌问题（2026-10-16 定位到根因）
+
+**现象**：Qbar 打开网址时，焦点在浏览器 → 在原窗口开标签页；焦点不在浏览器 → Edge 新画一扇窗。
+
+**已经排除的**（都实测过，别再往这些方向找）：
+- 不是"另起进程"：打开探针网址前后，`msedge` **主进程数始终是 1**（`/proc` 逐个比对，渲染进程 +若干）
+  ⇒ 单实例转发是正常的，新窗口是同一个浏览器实例画的。
+- 不是双报显示后端：`bin/keyd-qbar-cmd` 原先同时注入 `DISPLAY` 与 `WAYLAND_DISPLAY`，那确实是 bug（已修，
+  现在按 socket 探测、只报一个），但**修完现象不变** ⇒ 不是主因。
+- 不是 Edge 的偏好开关：扫它 `Default/Preferences` 里 139 个含 window/tab/startup/focus 的键，
+  只有窗口几何与 `spawn_ntp_on_last_tab` 之类，**没有"外部链接开在哪扇窗"的策略键**；`/etc/opt/edge/` 不存在。
+
+**根因**：GTK3 **没有把 Wayland 激活令牌交给被启动程序的通道** —— 实测
+`libgdk-3.so.0` / `libgtk-3.so.0` 里字符串 `XDG_ACTIVATION_TOKEN` 出现 **0 次**（GTK4 才有这套）。
+没有令牌，`mutter` 不允许 Edge 把已有窗口拉到前台；Edge 为保证用户看得见，只能新建窗口
+（新建窗口在映射时就可以是激活的，不需要令牌）。焦点已在浏览器时不需要激活 ⇒ 正常开标签页。
+
+**可行的修法（尚未实施，成本都标出来）**：
+1. **装一个 GNOME Shell 扩展替我们激活窗口**：扩展跑在 mutter 里，有特权，
+   `global.display.get_tab_list(Meta.TabList.NORMAL_ALL, null)` 找到浏览器窗口再 `activate(time)`，
+   Qbar 随后打开 URL ——此时焦点已在浏览器，走的就是"开标签页"那条路。
+   **API 可行性已在真机验证**：Ubuntu 自带且启用的 `tiling-assistant@ubuntu.com` 用的正是这两个调用
+   （GNOME Shell 50.1）。代价：**新扩展必须重启 shell 才会被发现**（实测 `gnome-extensions enable`
+   对刚放进 `~/.local/share/gnome-shell/extensions/` 的扩展报「不存在」；Wayland 不能 `Alt+F2 r`
+   热重启 ⇒ 需要一次注销重登），外加开发 ~120 行 JS + Qbar 侧 ~15 行与 GNOME 升级的维护成本。
+2. **给浏览器开远程调试口**（`--remote-debugging-port=9222` + `PUT /json/new?url=`）：能确定性地"在原窗口开标签"，
+   不需要重登；代价是 **本机任意进程都能读写你的浏览器标签**，安全上不如方案 1，不做默认。
+3. 接受现状：把这条当已知限制；反正焦点本来就在浏览器时行为是对的。
