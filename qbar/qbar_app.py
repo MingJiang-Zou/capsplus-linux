@@ -42,11 +42,12 @@ from qbar.logic import (  # noqa: E402
     entry_history_payload, history_key,
     scan_desktop_files, settings_launch_command,
     window_width,
-    raise_browser_command, RAISE_TIMEOUT_S,
+    raise_browser_signal, RAISE_SETTLE_US,
 )
 from qbar.search_config import open_command  # noqa: E402
 
 STATE_DIR = Path.home() / ".local/state/capsplus"
+_BUS_CONN = None                      # 会话总线连接，懒取一次（见 _session_bus）
 SOCK_PATH = STATE_DIR / "qbar.sock"
 LOG_PATH = STATE_DIR / "qbar.log"
 # CAPSPLUS_QBAR_DEBUG=1 时把每次按键/搜索条数也记进日志（排查"字没进去"用）
@@ -92,6 +93,14 @@ def app_dirs() -> list[Path]:
         if part.strip():
             dirs.append(Path(part.strip()) / "applications")
     return dirs
+
+
+def _session_bus():
+    """会话总线连接（懒取一次）。PyGI 没有 GJS 那个 `Gio.DBus.session` 便捷对象。"""
+    global _BUS_CONN
+    if _BUS_CONN is None:
+        _BUS_CONN = Gio.bus_get_sync(Gio.BusType.SESSION, None)
+    return _BUS_CONN
 
 
 class QbarWindow(Gtk.Window):
@@ -397,24 +406,26 @@ class QbarWindow(Gtk.Window):
         Gio.AppInfo.launch_default_for_uri(target.as_uri(), self._launch_context())
 
     def _raise_browser_window(self):
-        """先叫扩展把浏览器现有窗口激活；扩展没装/没应答就安静跳过。
+        """发一发 D-Bus 信号，请 GNOME 扩展把浏览器现有窗口激活（失败绝不拦下打开动作）。
 
         不激活的后果是用户实测到的：焦点不在浏览器时 Edge **另起一扇窗**，之后 Qbar 打开的
-        页面全堆在那扇窗里。这一步只在**当前工作区**有浏览器窗口时生效（扩展那边判的），
-        所以不会把人从别的工作区硬拽过来。超时上限 0.35s，且失败绝不拦下打开动作。
+        页面全堆在那扇窗里。扩展那边只在**当前工作区**有浏览器窗口时才动手（不硬拽工作区）。
+
+        为什么走**信号**而不是"导出对象 + 方法调用"：本机 GJS 实测
+        `export_object_path` / `return_value` 这些便捷函数已被摘除，`register_object` 只剩
+        原始 C 绑定（vtable 是 C 结构，JS 造不出来），而 `emit_signal` / `signal_subscribe`
+        可用且跨实现跑通过（Python-GI 发、GJS 收）。信号没有回复通道 ⇒ 这里不假设成功，
+        只等一帧（80ms）再打开；扩展没装时这一步没有任何副作用。
         """
         try:
-            proc = subprocess.run(raise_browser_command(), timeout=RAISE_TIMEOUT_S,
-                                  capture_output=True, text=True, check=False)
-        except Exception as exc:                      # 没 gdbus / 没扩展 / 超时都走这里
+            raise_browser_signal(_session_bus())
+        except Exception as exc:                      # 连不上会话总线这类极端情况
             log(f"raise-browser 跳过：{type(exc).__name__} {exc}")
             return
-        raised = proc.stdout.strip().startswith("(true,")
-        log(f"raise-browser → {proc.stdout.strip() or proc.stderr.strip() or '无回复'}")
-        if raised:
-            # 激活落地要一帧；不等就打开，浏览器仍会按"我没焦点"处理 ⇒ 又新画一扇窗。
-            # 这里阻塞最多 80ms，而这一步之后 Qbar 马上就隐藏，感觉不到。
-            GLib.usleep(80_000)
+        log("raise-browser 信号已发（扩展没装时这一步无副作用）")
+        # 激活落地约一帧；不等就打开，浏览器仍会按"我没焦点"处理 ⇒ 又新画一扇窗。
+        # 最多阻塞 80ms，而这一步之后 Qbar 马上隐藏，用户感觉不到。
+        GLib.usleep(RAISE_SETTLE_US)
 
     def _open_url(self, url: str):
         """开网址：配了 `general.browser` 就用那条命令，否则系统默认浏览器（xdg-open）。"""

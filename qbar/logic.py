@@ -771,22 +771,25 @@ def should_hide_on_focus_out(visible: bool, focused: bool, ms_since_show: int,
 # ---------------------------------------------------------------------------
 # 打开网址前先请 GNOME 把浏览器窗口激活（配合仓内扩展 raise-browser）
 # ---------------------------------------------------------------------------
-RAISE_BUS_NAME = "io.github.capsplus.RaiseBrowser"
+RAISE_BUS_NAME = "io.github.capsplus.RaiseBrowser"     # 扩展自己拥有的总线名（探活用得上）
 RAISE_BUS_PATH = "/io/github/capsplus/RaiseBrowser"
 RAISE_BUS_IFACE = "io.github.capsplus.RaiseBrowser"
-RAISE_TIMEOUT_S = 0.35          # 一次 D-Bus 往返的量级；超时就当扩展不在，直接开网址
+RAISE_MEMBER = "RaiseBrowser"
+RAISE_PROBE_MEMBER = "Probe"
+RAISE_SETTLE_US = 80_000        # 激活落地约一帧；等满再打开，否则浏览器仍按"我没焦点"处理
 
 
-def raise_browser_command(hint: str = "") -> list[str]:
-    """`gdbus` 调用 argv（列表传参，绝不拼 shell 字符串）。
+def raise_browser_signal(publisher, member=RAISE_MEMBER):
+    """往会话总线发一发 `RaiseBrowser` 信号，让 GNOME 扩展去激活浏览器窗口。
 
-    动机（2026-10-16 实测）：GTK3 递不出 Wayland 激活令牌（`libgdk-3` 里
-    `XDG_ACTIVATION_TOKEN` 出现 0 次），浏览器在没有令牌的焦点状态下只会**新画一扇窗**。
-    扩展跑在 mutter 里，`Meta.Window.activate()` 是它自己的特权动作，所以我们借它一步。
-    扩展没装时 `gdbus` 立刻以 "NameHasNoOwner" 失败返回 ⇒ 调用方吞掉错误，行为退回现状。
+    这台机实测过的三件事，写法照此为准（别再照网上老教程抄）：
+      * **PyGI 没有 `Gio.DBus.session`**（那是 GJS 的便捷对象）⇒ 用 `Gio.bus_get_sync()`；
+      * `emit_signal` 的实参顺序是 `(destination, object_path, interface, member, parameters)`，
+        `parameters` 传 `None` 可用；
+      * 信号没有回复通道 ⇒ 调用方**不假设成功**，最多白等一帧，正事（打开网址）照做。
+    扩展没装时 `emit_signal` 也不会报错（D-Bus 不追踪订阅者），行为就退回"另起新窗口"。
     """
-    argv = ["gdbus", "call", "--session",
-            "--dest", RAISE_BUS_NAME,
-            "--object-path", RAISE_BUS_PATH,
-            "--method", f"{RAISE_BUS_IFACE}.RaiseBrowser"]
-    return argv
+    # publisher 由调用方（qbar_app，本来就 import 了 gi）传进来：
+    # 这一层刻意不碰 gi —— `tests/test_settings_window.py::test_the_two_pure_layers_really_do_not_import_gi`
+    # 就是钉这条的，我上一版在函数里写 `from gi.repository import Gio`，被它当场判红。
+    publisher.emit_signal(None, RAISE_BUS_PATH, RAISE_BUS_IFACE, member, None)

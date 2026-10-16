@@ -296,8 +296,8 @@ r = searchParams.get("q")?.trim() ?? e.get("prompt")
    （GNOME Shell 50.1）。代价：**新扩展必须重启 shell 才会被发现**（实测 `gnome-extensions enable`
    对刚放进 `~/.local/share/gnome-shell/extensions/` 的扩展报「不存在」；Wayland 不能 `Alt+F2 r`
    热重启 ⇒ 需要一次注销重登），外加开发 ~120 行 JS + Qbar 侧 ~15 行与 GNOME 升级的维护成本。
-   **仓内实现（已写完）**：`extensions/raise-browser@capsplus.example/`（D-Bus 方法 `RaiseBrowser` 与
-   `Probe`）+ `tools/install-extension.sh`（复制进用户扩展目录并加进 `enabled-extensions`）+
+   **仓内实现（已写完）**：`extensions/raise-browser@capsplus.example/`（D-Bus **信号** `RaiseBrowser` / `Probe`；
+   这台机的 GJS 没有 `export_object_path`、`register_object` 只剩 C 绑定 ⇒ 只能走信号）+ `tools/install-extension.sh`（复制进用户扩展目录并加进 `enabled-extensions`）+
    `tools/verify-raise-browser.py`（**A/B 实测**：用 `Probe` 报的窗口数做差，+1 = 另起新窗、0 = 原窗口
    开标签页 —— 不依赖人眼，绕开"Wayland 下我拿不到窗口"这个死结）。Qbar 侧由
    `[general] raise_browser`（默认 true）控制，调用超时 0.35s、失败静默跳过（实测扩展不在时 7ms 返回）。
@@ -305,3 +305,22 @@ r = searchParams.get("q")?.trim() ?? e.get("prompt")
 2. **给浏览器开远程调试口**（`--remote-debugging-port=9222` + `PUT /json/new?url=`）：能确定性地"在原窗口开标签"，
    不需要重登；代价是 **本机任意进程都能读写你的浏览器标签**，安全上不如方案 1，不做默认。
 3. 接受现状：把这条当已知限制；反正焦点本来就在浏览器时行为是对的。
+
+### 本机 GJS 的 D-Bus 可用性（2026-10-16 逐条实测，别再照网上老写法抄）
+
+| 用法 | 本机结果 |
+| --- | --- |
+| `Gio.DBus.session.export_object_path` / `unexport_object_path` | **undefined**（GJS 便捷函数已摘除） |
+| `Gio.DBus.session.return_value` / `return_error_literal` | **undefined** |
+| `Gio.DBus.session.register_object` | 存在，但是**原始 C 绑定**：`At least 5 arguments required`，vtable 是 C 结构，JS 造不出来 ⇒ 实际不可用 |
+| `Gio.DBus.session.signal_subscribe` | 可用，**7 个实参且回调在最后一位**（`sender, interface, member, object_path, arg0, user_data, callback`） |
+| `Gio.DBus.session.emit_signal` | 可用，**5 个实参**（`destination, object_path, interface, member, parameters`），`parameters` 传 `None` 可以 |
+| `Gio.DBus.session.signal_remove` | **undefined** ⇒ `disable()` 里要按 `typeof` 兜着，不能因为它不存在就把停用流程抛断 |
+| PyGI（Python 侧）`Gio.DBus.session` | **不存在**（GJS 专属便捷对象）⇒ 用 `Gio.bus_get_sync(Gio.BusType.SESSION, None)` |
+| 跨实现通路 | Python-GI `emit_signal` → GJS `signal_subscribe` **实测收到** ✓ |
+
+扩展加载失败是**静默**的：现象与没装一样。所以两处都留了话——
+`export default class` 缺失时 shell 自己报 `TypeError: extensionModule.default is not a constructor`，
+其余失败由扩展自己的 `console.error` 写进 journal；排查一律
+`journalctl --user --since '-10 min' | grep raise-browser`。
+另外：改过扩展代码后 `disable/enable` **不会重新 import**（状态卡在 ERROR），必须重登。

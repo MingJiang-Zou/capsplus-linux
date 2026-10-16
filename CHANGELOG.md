@@ -52,6 +52,8 @@
   才生效，GNOME 只在启动时扫用户扩展目录）与 `tools/verify-raise-browser.py`（A/B 实测：用扩展 `Probe`
   的窗口数做差判定，+1 = 新窗口、0 = 原窗口开标签页）。`[general] raise_browser` 默认开，
   设置界面第②页有开关；扩展不在时 7ms 静默跳过，功能不退化。判据 `tests/test_raise_browser.py`。
+  ⚠ 实现改过两次形态，原因都写进 `docs/KNOWN-LIMITS.md`：第一版用模块级 `export function enable`（GNOME 50 要 `export default class`，报 `not a constructor` **静默不加载**）；第二版想导出 D-Bus 对象，实测本机 GJS 的 `export_object_path` 是 `undefined`、`register_object` 只剩 C 绑定 ⇒ 改走**信号**（`emit_signal` 5 参 / `signal_subscribe` 7 参且回调在最后），并把这些死路钉进判据。
+
 - 默认引擎模板加淘宝 / 闲鱼（两个搜索端点实测 HTTP 200，中文关键词走 `{q}` URL 编码）。
 - AI 问答进默认引擎（2026-10-16）：`ds` / `dsp` 走 `search`（DeepSeek 网页端**支持** URL 预填与
   自动发送，参数名与 `≤800 字` 那条限制是从它 `main.js` 里读出来的）；`qw`（千问）走新加的

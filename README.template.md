@@ -72,12 +72,25 @@ capsplus-settings            # 设置窗口：快速链接 / 通用 / 按键映�
 sh tools/install-extension.sh     # 复制到 ~/.local/share/gnome-shell/extensions 并加进启用列表
 # ⚠ 必须**注销再登录**一次：GNOME Shell 只在启动时扫描用户扩展目录，
 #    当场 `gnome-extensions enable` 会报「扩展不存在」；Wayland 也不能 Alt+F2 + r 热重启。
-gdbus call --session --dest io.github.capsplus.RaiseBrowser \
-  --object-path /io/github/capsplus/RaiseBrowser --method io.github.capsplus.RaiseBrowser.Probe
-                                  # 自检：应报出 default=…desktop windows=N on-current=M
+#    而且**改过代码也一样**：disable/enable 不会重新 import，状态会卡在 ERROR。
+
+gnome-extensions info raise-browser@capsplus.example | grep 状态
+journalctl --user --since "-10 min" | grep raise-browser
+    # 期望看到 `[raise-browser] ready default=microsoft-edge.desktop windows=N on-current=M`
+    # 加载失败会留具体原因（例如缺 export default class 时的 `not a constructor`）
+
 python3 tools/verify-raise-browser.py
-                                  # A/B 实测：A 轮不激活（预期另起新窗），B 轮先激活（预期开标签页）
+    # A/B 实测：A 轮不激活（预期 +1 扇窗），B 轮先激活（预期 0）——
+    # 窗口数由扩展报进 journal，不需要人眼数窗口
 ```
+
+**这台机（Ubuntu 26.04 / GNOME 50.1 / GJS）的实测事实，写下来免得再踩**：
+`Gio.DBus.session.export_object_path` / `return_value` 等便捷函数**已不存在**（`undefined`），
+`register_object` 只剩原始 C 绑定（vtable 是 C 结构，JS 造不出来）⇒ **扩展导出 D-Bus 对象这条路走不通**；
+可用的是 `emit_signal`（5 参：destination, path, interface, member, parameters）与
+`signal_subscribe`（7 参，**回调在最后一位**），且 `signal_remove` 也没有。
+Python 侧同理没有 `Gio.DBus.session`，要用 `Gio.bus_get_sync(Gio.BusType.SESSION, None)`。
+跨实现通路已实测：Python-GI 发 → GJS 收到 ✓
 
 不想用就把 `~/.config/capsplus/qbar.toml` 里 `raise_browser` 设为 `false`
 （设置界面第②页「通用」里也有这个开关）。更多细节与排除过程见
