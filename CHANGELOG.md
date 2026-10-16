@@ -40,8 +40,10 @@
   窗口宽度按 `logic.window_width()` 钳到**最窄那块屏**的 90%（默认 680 的上限不变）；
   判据 `tests/test_qbar_width.py`（钳位算法 + 源码级防回退 + Pango 必须 require_version）
   与 `test_qbar_window_is_not_wider_than_the_screen`（真构造窗口断宽度，500px 虚拟屏实测 450）。
-- 改 `bin/keyd-qbar-cmd`：**Wayland 优先，有 Wayland 就不再注入 `DISPLAY`**（原先两个后端一起报，
-  是浏览器另起窗口的温床；细节与未确认部分见 `docs/KNOWN-LIMITS.md`）。
+- 改 `bin/keyd-qbar-cmd`：**只报一个显示后端**——调用者已导出就用它的；否则探 `$XDG_RUNTIME_DIR/wayland-0`
+  socket 在不在（在 → Wayland），再否则才退回 `DISPLAY`。原先两个变量一起凭空注入，是浏览器另起窗口的温床。
+  ⚠ 过程中我自己把 `bash` 数组写进了 `#!/bin/sh`（dash）脚本 → **Caps+Q 直接失灵**（keyd 不报错，只是没反应）；
+  已改回 POSIX 变量，并把判据从 `bash -n` 升级为**按 shebang 选解释器**（`tests/test_portability.py`）。
 - 默认引擎模板加淘宝 / 闲鱼（两个搜索端点实测 HTTP 200，中文关键词走 `{q}` URL 编码）。
 - AI 问答进默认引擎（2026-10-16）：`ds` / `dsp` 走 `search`（DeepSeek 网页端**支持** URL 预填与
   自动发送，参数名与 `≤800 字` 那条限制是从它 `main.js` 里读出来的）；`qw`（千问）走新加的

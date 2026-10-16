@@ -290,9 +290,21 @@ class TestQbarLauncherReportsOneDisplayBackend(unittest.TestCase):
         text = self.SCRIPT.read_text(encoding="utf-8")
         for bad in ('DISPLAY="${DISPLAY:-:0}"', 'WAYLAND_DISPLAY="${WAYLAND_DISPLAY:-wayland-0}"'):
             self.assertNotIn(bad, text, f"包装脚本又回到无条件注入两个后端了：{bad}")
-        self.assertIn('DISPLAY_ARGS', text, "显示后端应该由那段探测逻辑算进 DISPLAY_ARGS 数组")
+        self.assertIn("DISPLAY_ENV", text, "显示后端应由探测段算进 DISPLAY_ENV（POSIX 变量，不许用 bash 数组）")
         self.assertIn('-S "$RUN_DIR/wayland-0"', text, "得真的去探 Wayland socket，否则判断没有依据")
 
-    def test_script_stays_bash_parseable(self):
-        proc = subprocess.run(["bash", "-n", str(self.SCRIPT)], capture_output=True, text=True)
-        self.assertEqual(proc.returncode, 0, f"bash -n 失败：{proc.stderr}")
+    def test_script_parses_with_its_own_shebang_interpreter(self):
+        """语法检查必须用**脚本自己声明的解释器**。
+
+        2026-10-16 实测教训：脚本 shebang 是 `#!/bin/sh`（本机 dash），我加了一行 bash 数组
+        `DISPLAY_ARGS=(…)` → dash 下 `Syntax error: "(" unexpected`，keyd 那边不报错、
+        只是 Caps+Q 没反应；而我当时跑的是 `bash -n`，正好把它遮住了。
+        """
+        shebang = self.SCRIPT.read_text(encoding="utf-8").splitlines()[0]
+        interp = shebang.lstrip("#!").strip() or "/bin/sh"
+        proc = subprocess.run([interp, "-n", str(self.SCRIPT)], capture_output=True, text=True)
+        self.assertEqual(proc.returncode, 0, f"{interp} -n 失败：{proc.stderr}")
+        if "/bin/sh" in interp or interp.endswith("dash"):
+            for bad in ("DISPLAY_ARGS=(", "shopt", "[[ ", "(( ", "${A[@]}"):
+                self.assertNotIn(bad, self.SCRIPT.read_text(encoding="utf-8"),
+                                 f"POSIX sh 脚本里出现了 bash 专用写法：{bad}")

@@ -52,19 +52,23 @@ fi
 # 后果是两个后端一起报给子进程，Chromium 系（本机 Edge，原生 Wayland 实例）容易另起窗口
 # 而不是在原窗口开标签页（2026-10-16 用户实测）。现在按"合成器 socket 在不在"决定，
 # 只传一个；Xorg 会话也不再被塞一个不存在的 wayland-0。
+# ⚠ 本脚本 shebang 是 `#!/bin/sh`（本机是 dash）：**不许用 bash 数组**（`A=(…)` 会
+#   直接 syntax error，而 keyd 那边不报错、只是 Caps+Q 没反应）。
+#   2026-10-16 就栽过一次：判据只跑了 `bash -n` 没跑 `sh -n`，把语法错遮住了。
+#   校验请用 `tests/test_portability.py`（会按 shebang 选解释器）。
 if [ -n "${WAYLAND_DISPLAY:-}" ]; then
-  DISPLAY_ARGS=(WAYLAND_DISPLAY="$WAYLAND_DISPLAY")
+  DISPLAY_ENV="WAYLAND_DISPLAY=$WAYLAND_DISPLAY"
 elif [ -S "$RUN_DIR/wayland-0" ]; then
-  DISPLAY_ARGS=(WAYLAND_DISPLAY=wayland-0)
+  DISPLAY_ENV="WAYLAND_DISPLAY=wayland-0"
 elif [ -n "${DISPLAY:-}" ]; then
-  DISPLAY_ARGS=(DISPLAY="$DISPLAY")
+  DISPLAY_ENV="DISPLAY=$DISPLAY"
 else
-  DISPLAY_ARGS=(DISPLAY=:0)
+  DISPLAY_ENV="DISPLAY=:0"
 fi
 
 exec "$RUNUSER" -u "$USER_NAME" -- env \
   HOME="$USER_HOME" \
   XDG_RUNTIME_DIR="$RUN_DIR" \
-  "${DISPLAY_ARGS[@]}" \
+  $DISPLAY_ENV \
   DBUS_SESSION_BUS_ADDRESS="unix:path=$RUN_DIR/bus" \
   "$QBAR" "$@"
