@@ -4,13 +4,10 @@
 导航/编辑键，外加一个托盘、一个 Qbar 启动器和一个图形设置界面。键位映射的**唯一真相源**是
 `capsplus/mapping_data.py`，keyd 配置与下面的键表都由它渲染（改映射不用改两处）。
 
-<!-- 状态徽章：等仓库真推到 GitHub 了再放开，把 <OWNER>/<REPO> 填上。**没 CI 跑过就不许放假徽章** -->
-<!--
-[![tests](https://github.com/<OWNER>/<REPO>/actions/workflows/tests.yml/badge.svg)](https://github.com/<OWNER>/<REPO>/actions/workflows/tests.yml)
+<!-- 徽章纪律：没有真跑过的 CI 就不许放假徽章（这条注释留着提醒后来人） -->
+[![tests](https://github.com/517477981/capsplus-linux/actions/workflows/tests.yml/badge.svg)](https://github.com/517477981/capsplus-linux/actions/workflows/tests.yml)
 [![license: GPL-2.0-only](https://img.shields.io/badge/license-GPL--2.0--only-blue.svg)](LICENSE)
--->
-
-**许可**：GPL-2.0-only（本仓的按键映射表译自上游 CapsLock+，属衍生作品）——
+[![Python](https://img.shields.io/badge/python-3.11%20%7C%203.12-green.svg)](#依赖)*许可**：GPL-2.0-only（本仓的按键映射表译自上游 CapsLock+，属衍生作品）——
 出处、改动清单与分发要求见下面「[许可与上游](#许可与上游)」一节，全文见 [`LICENSE`](LICENSE)。
 
 **截图**（都是 `xvfb-run` 在虚拟显示里拍的，`python3 tools/make-screenshots.py` 可重拍）：
