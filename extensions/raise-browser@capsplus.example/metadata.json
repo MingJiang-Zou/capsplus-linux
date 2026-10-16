@@ -1,0 +1,7 @@
+{
+  "uuid": "raise-browser@capsplus.example",
+  "name": "capsplus Raise Browser",
+  "description": "给 Qbar 一个 D-Bus 入口，把默认浏览器的现有窗口先激活（Wayland 下浏览器拿不到激活令牌时只会新建窗口，而扩展跑在 mutter 里有这个特权）",
+  "shell-version": ["45", "46", "47", "48", "49", "50", "50.1"],
+  "url": "https://github.com/517477981/capsplus-linux"
+}

@@ -42,6 +42,7 @@ from qbar.logic import (  # noqa: E402
     entry_history_payload, history_key,
     scan_desktop_files, settings_launch_command,
     window_width,
+    raise_browser_command, RAISE_TIMEOUT_S,
 )
 from qbar.search_config import open_command  # noqa: E402
 
@@ -395,10 +396,32 @@ class QbarWindow(Gtk.Window):
             return
         Gio.AppInfo.launch_default_for_uri(target.as_uri(), self._launch_context())
 
+    def _raise_browser_window(self):
+        """先叫扩展把浏览器现有窗口激活；扩展没装/没应答就安静跳过。
+
+        不激活的后果是用户实测到的：焦点不在浏览器时 Edge **另起一扇窗**，之后 Qbar 打开的
+        页面全堆在那扇窗里。这一步只在**当前工作区**有浏览器窗口时生效（扩展那边判的），
+        所以不会把人从别的工作区硬拽过来。超时上限 0.35s，且失败绝不拦下打开动作。
+        """
+        try:
+            proc = subprocess.run(raise_browser_command(), timeout=RAISE_TIMEOUT_S,
+                                  capture_output=True, text=True, check=False)
+        except Exception as exc:                      # 没 gdbus / 没扩展 / 超时都走这里
+            log(f"raise-browser 跳过：{type(exc).__name__} {exc}")
+            return
+        raised = proc.stdout.strip().startswith("(true,")
+        log(f"raise-browser → {proc.stdout.strip() or proc.stderr.strip() or '无回复'}")
+        if raised:
+            # 激活落地要一帧；不等就打开，浏览器仍会按"我没焦点"处理 ⇒ 又新画一扇窗。
+            # 这里阻塞最多 80ms，而这一步之后 Qbar 马上就隐藏，感觉不到。
+            GLib.usleep(80_000)
+
     def _open_url(self, url: str):
         """开网址：配了 `general.browser` 就用那条命令，否则系统默认浏览器（xdg-open）。"""
         if not url:
             return
+        if getattr(self.engine.config, "raise_browser", True):
+            self._raise_browser_window()
         cmd = open_command(self.engine.config.browser, url)
         if cmd.startswith("xdg-open "):
             Gio.AppInfo.launch_default_for_uri(url, self._launch_context())

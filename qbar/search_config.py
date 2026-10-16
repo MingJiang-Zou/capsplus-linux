@@ -13,6 +13,7 @@ Python 3.11+ 自带），所以在没有显示服务器的环境里也能直接�
     default_search = "b"     # 不带前缀的输入用哪个（填某个 link 的 trigger）
     browser = ""             # 留空 = 系统默认浏览器（xdg-open）
     hide_on_focus_out = true # 点别处就收起来（等价于再按一次 Caps+Q）
+    raise_browser = true     # 打开网址前先叫扩展把浏览器窗口激活（raise-browser 扩展；没装就安静跳过）
 
     [[link]]
     trigger = "b"
@@ -366,6 +367,11 @@ class QbarConfig:
     # 失焦即隐藏（默认开）：点别处 = 等价于再按一次 Caps+Q，
     # 这样下次 Caps+Q 一定是"从隐藏到显示"，一次就能唤起。
     hide_on_focus_out: bool = True
+    # 打开网址前先试一次 D-Bus，让 GNOME 扩展把浏览器现有窗口激活。
+    # 为什么要有这一步：GTK3 递不出 Wayland 激活令牌（libgdk-3 里 XDG_ACTIVATION_TOKEN 出现 0 次），
+    # 没有令牌时 mutter 不让浏览器把已有窗口拉到前台，它就只能新画一扇窗（2026-10-16 实测）。
+    # 扩展没装 / 没应答都会安静跳过，不影响打开，所以默认开是安全的。
+    raise_browser: bool = True
     path: Path = CONFIG_PATH
     error: str = ""
 
@@ -517,6 +523,7 @@ def render_default_toml() -> str:
 
 def render_config_toml(links: list[SearchLink], default_search: str = DEFAULT_TRIGGER,
                        browser: str = "", hide_on_focus_out: bool = True,
+                       raise_browser: bool = True,
                        header: str | None = None) -> str:
     """把配置渲染成 TOML 文本：**顺序就是传进来的顺序**，注释来自模板（tomllib 只读）。
 
@@ -530,6 +537,7 @@ def render_config_toml(links: list[SearchLink], default_search: str = DEFAULT_TR
         f'browser = {toml_str(browser)}             # 留空 = 系统默认浏览器（xdg-open）；填了 = 用命令模板',
         '                         # 模板里 {url} 会被替换成真实地址，如 "firefox --new-tab {url}"',
         f'hide_on_focus_out = {"true" if hide_on_focus_out else "false"} # 点别处就收起来（等价于再按一次 Caps+Q，下次按一下就能唤起）',
+        f'raise_browser = {"true" if raise_browser else "false"}         # 打开网址前先激活浏览器现有窗口（没装 raise-browser 扩展则无副作用）',
         "",
     ]
     for link in links:
@@ -559,7 +567,8 @@ def leading_comments(text: str) -> str:
 
 
 def save_config(links: list[SearchLink], default_search: str, browser: str,
-                hide_on_focus_out: bool, path: Path | None = None) -> Path:
+                hide_on_focus_out: bool, path: Path | None = None,
+                raise_browser: bool = True) -> Path:
     """原子写回 qbar.toml：先写 .tmp 再 replace；开头注释从原文件带回来。"""
     target = Path(path) if path else CONFIG_PATH
     header = ""
@@ -568,7 +577,10 @@ def save_config(links: list[SearchLink], default_search: str, browser: str,
     except (OSError, UnicodeDecodeError):
         header = ""
     target.parent.mkdir(parents=True, exist_ok=True)
-    text = render_config_toml(links, default_search, browser, hide_on_focus_out, header or None)
+    # header / raise_browser 一律走关键字：位置参数错位一次就是一次静默写坏配置
+    # （render_config_toml 的形参顺序是 …, hide_on_focus_out, raise_browser, header）。
+    text = render_config_toml(links, default_search, browser, hide_on_focus_out,
+                              raise_browser=raise_browser, header=header or None)
     tmp = target.with_name(target.name + ".tmp")
     tmp.write_text(text, encoding="utf-8")
     tmp.replace(target)
@@ -641,6 +653,11 @@ def load_config(path: Path | None = None, create: bool = True) -> QbarConfig:
         errors.append("hide_on_focus_out 必须是 true / false")
         hide_on_focus_out = True
 
+    raise_browser = general.get("raise_browser", True)
+    if not isinstance(raise_browser, bool):
+        errors.append("raise_browser 必须是 true / false")
+        raise_browser = True
+
     raw_links = raw.get("link", [])
     if raw_links is None:
         raw_links = []
@@ -688,6 +705,7 @@ def load_config(path: Path | None = None, create: bool = True) -> QbarConfig:
 
     return QbarConfig(links=links, default_search=default_search, browser=browser,
                       hide_on_focus_out=hide_on_focus_out,
+                      raise_browser=raise_browser,
                       path=target, error="；".join(errors))
 
 

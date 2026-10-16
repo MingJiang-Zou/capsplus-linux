@@ -766,3 +766,27 @@ def should_hide_on_focus_out(visible: bool, focused: bool, ms_since_show: int,
     if not flag or not visible or focused:
         return False
     return ms_since_show >= FOCUS_OUT_GRACE_MS
+
+
+# ---------------------------------------------------------------------------
+# 打开网址前先请 GNOME 把浏览器窗口激活（配合仓内扩展 raise-browser）
+# ---------------------------------------------------------------------------
+RAISE_BUS_NAME = "io.github.capsplus.RaiseBrowser"
+RAISE_BUS_PATH = "/io/github/capsplus/RaiseBrowser"
+RAISE_BUS_IFACE = "io.github.capsplus.RaiseBrowser"
+RAISE_TIMEOUT_S = 0.35          # 一次 D-Bus 往返的量级；超时就当扩展不在，直接开网址
+
+
+def raise_browser_command(hint: str = "") -> list[str]:
+    """`gdbus` 调用 argv（列表传参，绝不拼 shell 字符串）。
+
+    动机（2026-10-16 实测）：GTK3 递不出 Wayland 激活令牌（`libgdk-3` 里
+    `XDG_ACTIVATION_TOKEN` 出现 0 次），浏览器在没有令牌的焦点状态下只会**新画一扇窗**。
+    扩展跑在 mutter 里，`Meta.Window.activate()` 是它自己的特权动作，所以我们借它一步。
+    扩展没装时 `gdbus` 立刻以 "NameHasNoOwner" 失败返回 ⇒ 调用方吞掉错误，行为退回现状。
+    """
+    argv = ["gdbus", "call", "--session",
+            "--dest", RAISE_BUS_NAME,
+            "--object-path", RAISE_BUS_PATH,
+            "--method", f"{RAISE_BUS_IFACE}.RaiseBrowser"]
+    return argv

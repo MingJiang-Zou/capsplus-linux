@@ -72,6 +72,8 @@ GENERAL_HELP = {
     "default_search": "不带前缀直接输入时，用哪个引擎搜（下拉只列 search 类型的链接）",
     "browser": "留空 = 系统默认浏览器（xdg-open）；填命令模板，{url} 会被换成真实地址",
     "hide_on_focus_out": "点别处就收起 Qbar（等价于再按一次 Caps+Q，下次按一下就能唤起）",
+    "raise_browser": "打开网址前先把浏览器现有窗口激活（需要装仓内 GNOME 扩展 raise-browser；"
+                     "没装就自动跳过，不影响打开）。不激活时浏览器会另起一扇新窗口。",
 }
 
 VERB = {"search": "浏览器搜", "url": "浏览器开", "app": "启动", "file": "打开",
@@ -196,16 +198,19 @@ class SettingsWindow(Gtk.Window):
             self.status("没有写盘：一条链接都没有。全删了 Qbar 会退回内置引擎，"
                         "但界面至少该留一条。", RED)
             return False
-        default_search, browser, hide_on_focus_out = self.general_page.memory_values()
+        default_search, browser, hide_on_focus_out, raise_browser = \
+            self.general_page.memory_values()
         try:
             saved = SL.snapshot_config(self.qbar_path, self.backup_dir)
-            SC.save_config(links, default_search, browser, hide_on_focus_out, self.qbar_path)
+            SC.save_config(links, default_search, browser, hide_on_focus_out, self.qbar_path,
+                           raise_browser=raise_browser)
         except OSError as exc:
             self.status(f"写不了 {self.qbar_path}：{exc}", RED)
             return False
         self.cfg.links = links
         self.cfg.default_search, self.cfg.browser = default_search, browser
         self.cfg.hide_on_focus_out = hide_on_focus_out
+        self.cfg.raise_browser = raise_browser
         hint = f"（原件存到 {saved.parent}）" if saved else ""
         self.status(f"已写入 {self.qbar_path}{hint}；Qbar 下次打开自动重读，不用重启进程。"
                     "注意：条目中间的注释会被模板注释顶掉，自己的说明请写在文件开头。", BLUE)
@@ -569,11 +574,14 @@ class GeneralPage(Gtk.Box):
         self.browser_entry.connect("changed", lambda *_a: self._mark_dirty())
         self.focus_switch = Gtk.Switch()
         self.focus_switch.set_halign(Gtk.Align.START)
+        self.raise_switch = Gtk.Switch()
+        self.raise_switch.set_halign(Gtk.Align.START)
 
         for row, (label, widget, key) in enumerate((
                 ("默认搜索引擎", self.default_combo, "default_search"),
                 ("浏览器命令", self.browser_entry, "browser"),
-                ("失焦即隐藏", self.focus_switch, "hide_on_focus_out"))):
+                ("失焦即隐藏", self.focus_switch, "hide_on_focus_out"),
+                ("先激活浏览器", self.raise_switch, "raise_browser"))):
             grid.attach(Gtk.Label(label=label, xalign=0), 0, row, 1, 1)
             grid.attach(widget, 1, row, 1, 1)
             help_label = Gtk.Label(xalign=0)
@@ -613,10 +621,11 @@ class GeneralPage(Gtk.Box):
             self.default_combo.set_active(active)
         self.browser_entry.set_text(cfg.browser)
         self.focus_switch.set_active(bool(cfg.hide_on_focus_out))
+        self.raise_switch.set_active(bool(getattr(cfg, "raise_browser", True)))
         self._loading = False
 
-    def memory_values(self) -> tuple[str, str, bool]:
-        """(default_search, browser, hide_on_focus_out) —— 界面值收成可写盘的三元组。"""
+    def memory_values(self) -> tuple[str, str, bool, bool]:
+        """(default_search, browser, hide_on_focus_out, raise_browser) —— 界面值收成可写盘的四元组。"""
         index = self.default_combo.get_active()
         if 0 <= index < len(self._search_triggers):
             default_search = self._search_triggers[index]
@@ -624,13 +633,14 @@ class GeneralPage(Gtk.Box):
             # 链接表里一条 search 都没有：别把不存在的 trigger 写进配置
             default_search = self.app.cfg.default_search
         return (default_search, self.browser_entry.get_text().strip(),
-                self.focus_switch.get_active())
+                self.focus_switch.get_active(), self.raise_switch.get_active())
 
     def _mark_dirty(self) -> None:
         if getattr(self, "_loading", False):
             return                        # 程序自己在回填，不是用户改的
         if self.memory_values() != (self.app.cfg.default_search, self.app.cfg.browser,
-                                    self.app.cfg.hide_on_focus_out):
+                                    self.app.cfg.hide_on_focus_out,
+                                    bool(getattr(self.app.cfg, "raise_browser", True))):
             self.app.status("通用设置改了但还没写盘 —— 点「保存通用设置」。", AMBER)
 
 

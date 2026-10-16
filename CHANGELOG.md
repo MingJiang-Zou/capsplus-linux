@@ -47,6 +47,11 @@
   三条可行修法与成本写进 `docs/KNOWN-LIMITS.md`；扩展方案需在 GNOME 上重启 shell 才能装新扩展。
   ⚠ 过程中我自己把 `bash` 数组写进了 `#!/bin/sh`（dash）脚本 → **Caps+Q 直接失灵**（keyd 不报错，只是没反应）；
   已改回 POSIX 变量，并把判据从 `bash -n` 升级为**按 shebang 选解释器**（`tests/test_portability.py`）。
+- **新增 GNOME 扩展 `raise-browser`（可选）**：Qbar 打开网址前先用 D-Bus 请扩展把浏览器现有窗口激活，
+  再打开 —— 针对「焦点不在浏览器时另起一扇窗」。配套 `tools/install-extension.sh`（装；需**注销重登一次**
+  才生效，GNOME 只在启动时扫用户扩展目录）与 `tools/verify-raise-browser.py`（A/B 实测：用扩展 `Probe`
+  的窗口数做差判定，+1 = 新窗口、0 = 原窗口开标签页）。`[general] raise_browser` 默认开，
+  设置界面第②页有开关；扩展不在时 7ms 静默跳过，功能不退化。判据 `tests/test_raise_browser.py`。
 - 默认引擎模板加淘宝 / 闲鱼（两个搜索端点实测 HTTP 200，中文关键词走 `{q}` URL 编码）。
 - AI 问答进默认引擎（2026-10-16）：`ds` / `dsp` 走 `search`（DeepSeek 网页端**支持** URL 预填与
   自动发送，参数名与 `≤800 字` 那条限制是从它 `main.js` 里读出来的）；`qw`（千问）走新加的

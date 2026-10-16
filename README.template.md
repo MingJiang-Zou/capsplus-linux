@@ -53,6 +53,36 @@ capsplus-qbar                # Qbar（Caps+Q 由 keyd 唤起）
 capsplus-settings            # 设置窗口：快速链接 / 通用 / 按键映射
 ```
 
+## 让浏览器在**原窗口开标签页**（可选，需要装一个 GNOME 扩展）
+
+不装也能用，只是会有这个现象（2026-10-16 实测）：**焦点不在浏览器时，Qbar 打开网址会另起一扇浏览器窗口**，
+之后 Qbar 打开的页面全堆在那扇窗里；焦点本来就在浏览器上时才会正常开标签页。
+
+根因不在我们这边：`GTK3 递不出 Wayland 激活令牌`（实测 `libgdk-3` 里字符串
+`XDG_ACTIVATION_TOKEN` 出现 0 次）。没有令牌，`mutter` 不允许浏览器把已有窗口拉到前台，
+浏览器为了让你看得见就只能新画一扇窗。
+
+所以仓里带了一个 **~120 行的 GNOME Shell 扩展**：它跑在 mutter 进程内，
+`Meta.Window.activate()` 是它自己的特权动作，不需要令牌。Qbar 打开网址前先经 D-Bus 请它把
+浏览器的窗口激活，再打开 —— 此时焦点在浏览器上，走的就是"开标签页"那条路。
+**扩展没装 / 没应答时 Qbar 照原样打开网址**（实测 `gdbus` 7 毫秒返回错误，不卡界面），
+所以这是一个纯增益、可静默失效的开关。
+
+```sh
+sh tools/install-extension.sh     # 复制到 ~/.local/share/gnome-shell/extensions 并加进启用列表
+# ⚠ 必须**注销再登录**一次：GNOME Shell 只在启动时扫描用户扩展目录，
+#    当场 `gnome-extensions enable` 会报「扩展不存在」；Wayland 也不能 Alt+F2 + r 热重启。
+gdbus call --session --dest io.github.capsplus.RaiseBrowser \
+  --object-path /io/github/capsplus/RaiseBrowser --method io.github.capsplus.RaiseBrowser.Probe
+                                  # 自检：应报出 default=…desktop windows=N on-current=M
+python3 tools/verify-raise-browser.py
+                                  # A/B 实测：A 轮不激活（预期另起新窗），B 轮先激活（预期开标签页）
+```
+
+不想用就把 `~/.config/capsplus/qbar.toml` 里 `raise_browser` 设为 `false`
+（设置界面第②页「通用」里也有这个开关）。更多细节与排除过程见
+[`docs/KNOWN-LIMITS.md`](docs/KNOWN-LIMITS.md)。
+
 ## 目录
 
 ```
@@ -77,6 +107,9 @@ tests/          标准库 unittest（无 pytest 依赖）
 tools/gen-readme.py  由模板 + 映射数据生成 README
 tools/e2e/      真机端到端验收（虚拟键盘逐条比对，要 root）
 tools/ci/nogi/  sitecustomize 屏蔽 gi，一行复现"没装 PyGObject 的 CI"
+tools/install-extension.sh    装 GNOME 扩展 raise-browser（激活浏览器窗口用）
+tools/verify-raise-browser.py A/B 实测"在原窗口开标签页"有没有生效（不靠人眼数窗口）
+extensions/raise-browser@capsplus.example/  GNOME Shell 扩展本体（D-Bus: RaiseBrowser / Probe）
 .github/        workflows/tests.yml（ubuntu-latest × py3.11/3.12，不装 gi、不 sudo、不碰 /etc）
 CHANGELOG.md    0.1.0 段的版本叙事（**尚无任何 release tag**）
 ```

@@ -296,6 +296,12 @@ r = searchParams.get("q")?.trim() ?? e.get("prompt")
    （GNOME Shell 50.1）。代价：**新扩展必须重启 shell 才会被发现**（实测 `gnome-extensions enable`
    对刚放进 `~/.local/share/gnome-shell/extensions/` 的扩展报「不存在」；Wayland 不能 `Alt+F2 r`
    热重启 ⇒ 需要一次注销重登），外加开发 ~120 行 JS + Qbar 侧 ~15 行与 GNOME 升级的维护成本。
+   **仓内实现（已写完）**：`extensions/raise-browser@capsplus.example/`（D-Bus 方法 `RaiseBrowser` 与
+   `Probe`）+ `tools/install-extension.sh`（复制进用户扩展目录并加进 `enabled-extensions`）+
+   `tools/verify-raise-browser.py`（**A/B 实测**：用 `Probe` 报的窗口数做差，+1 = 另起新窗、0 = 原窗口
+   开标签页 —— 不依赖人眼，绕开"Wayland 下我拿不到窗口"这个死结）。Qbar 侧由
+   `[general] raise_browser`（默认 true）控制，调用超时 0.35s、失败静默跳过（实测扩展不在时 7ms 返回）。
+   判据：`tests/test_raise_browser.py`。
 2. **给浏览器开远程调试口**（`--remote-debugging-port=9222` + `PUT /json/new?url=`）：能确定性地"在原窗口开标签"，
    不需要重登；代价是 **本机任意进程都能读写你的浏览器标签**，安全上不如方案 1，不做默认。
 3. 接受现状：把这条当已知限制；反正焦点本来就在浏览器时行为是对的。
