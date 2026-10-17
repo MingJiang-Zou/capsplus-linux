@@ -26,9 +26,12 @@
     注入子进程也在后台线程 —— 完成后一律 `GLib.idle_add`（这里的出口：`Server.post`）
     回主线程；
   * **review 弹窗在主线程建窗 + 回调驱动**：后台识别完 `post(_open_review)` 回主线程建窗，
-    commit/cancel 由 `voice_osd.VoiceUi.on_finish` 回调推进状态机；注入一定发生在
-    窗口**销毁之后** ≥ `FOCUS_RETURN_MS`（`GLib.timeout_add` 等待，不是主线程 sleep）——
-    否则 Ctrl+V 会贴进我们自己的窗口；
+    commit/cancel 由 `voice_osd.VoiceUi.on_finish` 回调推进状态机；注入的条件是**事实**而不是
+    计时 —— 必须等到窗口 `unmap` 或收到 `focus_out`（`voice_osd.RELEASE_KINDS`），
+    `INJECT_FLOOR_MS` 只是**下限**、`INJECT_WAIT_CAP_MS` 只是**上限兜底**；等满上限还拿不到
+    任何这类信号，就带着诊断注入并把这一次标成**未确认**（Wayland 不保证给我们这种通知），
+    绝不写成"上屏结束"。等待全程由主循环计时（`GLib.timeout_add`），不是主线程 sleep ——
+    否则 Ctrl+V 会贴进我们自己的窗口，而"贴进去又随窗口消失"就是明江看到的"闪一下"；
   * **剪贴板的还原同一条时序模型**（2026-10-17 补）：上屏前在后台线程读一份内存快照，
     粘贴之后由主循环 `after_ms(CLIPBOARD_SETTLE_MS, …)` 计时，到点再起一个后台线程跑
     `voice_inject.perform_restore`。快照**只在内存**，永不落盘（判据
@@ -109,9 +112,170 @@ def should_abandon(session, now: float | None = None, limit: float = MAX_SESSION
     return (now if now is not None else time.monotonic()) - session.started_at > limit
 
 
-# 上屏注入之前给 WM 一点时间把焦点还给原文档（窗口销毁 → 焦点回退是异步的）。
-# 单位是毫秒：主线程用 `GLib.timeout_add(FOCUS_RETURN_MS, ...)` 等它，**不睡觉**。
-FOCUS_RETURN_MS = 120
+# ── 注入的触发条件（2026-10-17 改口径：从"拍脑袋计时"改成"确认自己已经不在焦点链上"）──
+#
+# 旧写法只有一个 `FOCUS_RETURN_MS = 120` 的定时器：窗口销毁之后固定等 120ms 就发 Ctrl+V。
+# 真机现象（明江 17:19：文字像贴上去了又被删掉，"闪烁了一下"）说明**这段时间既不充分也不是
+# 证据** —— 它只是"过了 120 毫秒"，不说明焦点交给了谁。现在三段分开，判据各自钉在段上：
+#
+#   必要条件  时间线里出现 `unmap` 或 `focus_out`（`voice_osd.RELEASE_KINDS`）：
+#             我们**确实已经把窗口撤了、也已经不在焦点链上**，事实到了才动手；
+#   下限      `INJECT_FLOOR_MS`：事实到得再早也不许比这更快动手。X11/GTK3 实测（Xvfb +
+#             `CAPSPLUS_GUI=1`，2026-10-17 晚）：`destroy()` 里 **unmap 与销毁是同步的**，
+#             Enter 之后 0.03ms 就到；`focus_out` 在没有窗口管理器的环境里**根本没来**。
+#             所以"只等事件"在那个平台上等于不等。下限取 120ms = 明江一直活着、本轮真机
+#             也确实在跑的那个值 —— 这次改动**不许把注入提得比现状更早**。
+#   上限兜底  `INJECT_WAIT_CAP_MS`：等满了仍然一个"焦点交出"的信号都没拿到（Wayland 不保证
+#             把这种通知交给客户端），**带着诊断**注入，并把这一次标成**未确认**而不是
+#             "上屏结束"。取 400ms 的理由：它比已知不够用的 120ms 大一档；最坏路径
+#             400 + 300（剪贴板还原）= 0.7s，用户感觉不到"卡"，离 90s 看门狗差两个数量级。
+#
+# 单位都是毫秒；等待一律由主循环计时（`Server.after_ms`），**主线程不许睡觉**。
+INJECT_FLOOR_MS = 120
+INJECT_WAIT_CAP_MS = 400
+# 诊断行里 `gate=` 的取值 = "是谁让的这一步"：
+#   event  焦点交出的事实晚于下限，是**事件**让的步（最理想：既快又有证据）
+#   floor  事实早就到了，是**下限**到点让的步（等价于旧行为，但这一次有证据）
+#   cap    到上限仍没观察到任何焦点交出的信号 ⇒ **未确认**
+#   nowin  本次压根没有弹窗（降级直投），没有"贴进自己"这回事
+INJECT_GATES = ("event", "floor", "cap", "nowin")
+
+
+def _tri(value) -> str:
+    """三态布尔 → `1 / 0 / na`：诊断行里"没观察到"与"观察到是假"必须是两个不同的字。"""
+    if value is None:
+        return "na"
+    return "1" if value else "0"
+
+
+def _num(value, missing: int = -1) -> str:
+    try:
+        return str(int(round(float(value))))
+    except (TypeError, ValueError):
+        return str(missing)
+
+
+def timeline_token(timeline) -> str:
+    """把时间线压成一个 token：`map@-8,focus_in@-7,finish@0,unmap@250,destroy@250`（**毫秒**，相对 Enter）。
+
+    只有 `kind` 与时刻，别的什么都没有 —— 明江真机日志里最想要的就这一串：
+    单位与 `enter_ms`/`release_ms` 一致（微秒读起来没人能对得上现象），Enter 之前的事件是负数
+    （`map@-8` = 开窗后 8 毫秒才进焦点链），之后的是正数。
+    """
+    marks = [e for e in (timeline or []) if isinstance(e, dict) and e.get("kind") == "finish"]
+    base = int(marks[-1].get("us", 0)) if marks else 0
+    out = []
+    for entry in (timeline or []):
+        if not isinstance(entry, dict):
+            continue
+        us = int(entry.get("us", 0) or 0)
+        out.append(f"{entry.get('kind', '?')}@{round((us - base) / 1000.0)}")
+    return ",".join(out) if out else "empty"
+
+
+def inject_diag_line(diag: dict) -> str:
+    """`inject_diag key=value …`：**固定前缀 + key=value**，给明江拿去和真机现象对齐。
+
+    里面只有状态量：弹窗可见性/实化/mapped、Enter→注入与 Enter→焦点交出的毫秒数、
+    让这一步的是哪个 gate、时间线 token。**识别文本、剪贴板内容一个字符都不许进这一行**
+    （隐私判据：`tests/test_voice_focus_gate.py::TestDiagnosticsCarryNoText`）。
+    """
+    parts = (f"gate={diag.get('gate') or 'none'}",
+             f"unconfirmed={1 if diag.get('unconfirmed') else 0}",
+             f"enter_ms={_num(diag.get('enter_ms'))}",
+             f"release_ms={_num(diag.get('release_ms'))}",
+             f"visible={_tri(diag.get('visible'))}",
+             f"realized={_tri(diag.get('realized'))}",
+             f"mapped={_tri(diag.get('mapped'))}",
+             f"unmap={_tri(diag.get('unmap_seen'))}",
+             f"focus_out={_tri(diag.get('focus_out_seen'))}",
+             f"destroy={_tri(diag.get('destroy_seen'))}",
+             f"entries={_num(diag.get('entries'), 0)}",
+             f"tl={timeline_token(diag.get('timeline'))}")
+    return "inject_diag " + " ".join(parts)
+
+
+def inject_done_line(diag: dict) -> str:
+    """注入**回来之后**的那一行：后端、成不成、代码、步数。同样只有状态量。"""
+    parts = (f"backend={diag.get('backend') or 'none'}",
+             f"ok={1 if diag.get('ok') else 0}",
+             f"code={diag.get('code') or '-'}",
+             f"steps={_num(diag.get('steps'), 0)}",
+             f"gate={diag.get('gate') or 'none'}",
+             f"unconfirmed={1 if diag.get('unconfirmed') else 0}")
+    return "inject_done " + " ".join(parts)
+
+
+def restore_diag_line(branch: str, still_ours=None, delay_ms=None) -> str:
+    """剪贴板还原的作业最终落进哪个分支：`armed → restored/not_ours/verify_mismatch/…`，
+    没作业就是 `skip`。`still_ours` 就是"注入后回读剪贴板是否仍等于我们写的那段"。"""
+    parts = [f"branch={branch or 'none'}", f"still_ours={_tri(still_ours)}"]
+    if delay_ms is not None:
+        parts.append(f"delay_ms={_num(delay_ms, 0)}")
+    return "restore_diag " + " ".join(parts)
+
+
+def build_diag(ui, gate: str, inject_us: int, finish_us: int) -> dict:
+    """把"注入那一刻"的状态量攒成一个**纯数据** dict（诊断行与 status 那行都从它出）。
+
+    `ui` 为 None = 这次根本没有弹窗（降级直投），状态量全 `na`，只有 gate 与间隔。
+    """
+    diag: dict = {"gate": gate, "unconfirmed": gate == "cap"}
+    probe = ui.probe() if ui is not None else {}
+    probe = probe or {}
+    diag.update(probe)
+    base = int(finish_us or probe.get("finish_us") or inject_us)
+    diag["finish_us"] = base
+    diag["inject_us"] = int(inject_us)
+    diag["enter_ms"] = round((int(inject_us) - base) / 1000.0, 1)
+    released = bool(probe.get("released"))
+    diag["released"] = released
+    diag["release_ms"] = (round((int(probe.get("at_us", 0)) - base) / 1000.0, 1)
+                          if released else None)
+    diag.setdefault("entries", 0)
+    diag.setdefault("timeline", [])
+    for key in ("visible", "realized", "mapped", "unmap_seen", "focus_out_seen",
+                "destroy_seen"):
+        diag.setdefault(key, None)
+    return diag
+
+
+def idle_note(diag: dict) -> str:
+    """回 idle 的那句话：**没证实的事不许写成成功**。"""
+    if diag and diag.get("gate") == "cap":
+        return "上屏未确认：未观察到焦点交出，注入可能落进自己"
+    return "上屏结束"
+
+
+def verdict_line(diag: dict, clip_diag: dict | None = None) -> str:
+    """`status` 里"上次上屏：结论 + 依据"那**一行**（明江只要贴这一行给我，不必贴整页）。
+
+    结论放在最前面，第二个词就是依据；后面跟"凭什么"的状态量。控制在一行内 ——
+    这行是他复制粘贴的唯一入口，长了就等于没有。
+    """
+    if not diag:
+        return ""
+    gate = diag.get("gate") or "none"
+    head = {
+        "cap": "结论=未确认 依据=未观察到焦点交出，注入可能落进自己",
+        "nowin": "结论=已上屏 依据=本次没有弹窗（降级直投）",
+    }.get(gate, f"结论=已上屏 依据=已确认窗口撤走")
+    window = (f"vis={_tri(diag.get('visible'))}/real={_tri(diag.get('realized'))}"
+              f"/map={_tri(diag.get('mapped'))}")
+    clip = clip_diag or {}
+    still = clip.get("still_ours")
+    readback = "回读=还是我们写的" if still is True else (
+        "回读=已被别人改" if still is False else "回读=没读到")
+    parts = [head, f"gate={gate}",
+             f"Enter→注入={_num(diag.get('enter_ms'))}ms",
+             f"Enter→焦点交出={_num(diag.get('release_ms'))}ms",
+             f"窗口={window}",
+             f"后端={diag.get('backend') or 'none'}",
+             f"ok={_tri(diag.get('ok'))}",
+             f"code={diag.get('code') or '-'}",
+             f"还原={clip.get('branch') or '还没到点'}",
+             readback]
+    return " ".join(parts)
 
 
 class Session:
@@ -124,6 +288,7 @@ class Session:
         self.vad_summary = ""
         self.asr_summary = ""
         self.inject_summary = ""
+        self.inject_diag: dict = {}       # 注入那一刻的状态量（纯数据，无文本）
         self.text = ""
         self._ui = None
         self._lock = threading.Lock()
@@ -280,39 +445,107 @@ class Session:
         self._review_failed(outcome.action)
 
     def _review_failed(self, why: str) -> None:
-        self._schedule_inject(self.text, f"弹窗没走成（{why}），已直接上屏")
+        self._arm_inject(self.text, f"弹窗没走成（{why}），已直接上屏", None)
 
     def _on_review_outcome(self, outcome) -> None:
-        """弹窗结局（主线程；`voice_osd` 保证回调发生在**窗口销毁之后**）。"""
-        self._ui = None
+        """弹窗结局（主线程；`voice_osd` 保证回调发生在**窗口销毁之后**）。
+
+        `ui` 交回给注入那条路：诊断要问的"窗口此刻还可见吗/还 mapped 吗"只有它答得了，
+        而 `probe()` 里读 widget ⇒ **只能在主线程做**，所以这里把对象传下去、不传结论。
+        """
+        ui, self._ui = self._ui, None
         action = outcome.action
         if action == "commit":
-            self._schedule_inject(outcome.text, "", delay_ms=FOCUS_RETURN_MS)
+            self._arm_inject(outcome.text, "", ui)
             return
         if action in ("failed", "unavailable"):
             # 弹窗这条路走不通 ≠ 用户没说完：退回直接上屏，别把文本静默丢掉
-            self._schedule_inject(self.text, f"弹窗没走成（{action}），已直接上屏")
+            self._arm_inject(self.text, f"弹窗没走成（{action}），已直接上屏", None)
             return
+        if ui is not None:
+            ui.forget()
         self._set_state("idle", note=f"弹窗 {action}，已丢弃")
 
-    def _schedule_inject(self, text: str, note: str, delay_ms: int = 0) -> None:
-        """注入永远**不在主线程跑**：先让主循环等 `delay_ms`（窗口销毁→焦点回退是异步的），
-        再交给后台线程去起子进程。旧写法在这里 `time.sleep(delay_s)`，主线程一睡
-        mutter 的 ping 就没人应答 —— 真机弹窗事故的半个病根。"""
-        def fire() -> None:
-            threading.Thread(target=self._inject_directly, args=(text, note),
-                             daemon=True).start()
-        self.server.after_ms(delay_ms, fire)
+    def _arm_inject(self, text: str, note: str, ui) -> None:
+        """**注入的触发条件**：等到"窗口已 unmap 或已收到 focus-out"这个**事实**才动手。
 
-    def _inject_directly(self, text: str, note: str) -> None:
-        """把文本交给上屏后端。**只在后台线程调用**：主线程路径一律经 `_schedule_inject`。
-        弹窗场景下必然发生在窗口销毁之后（见模块 docstring 的时序）。"""
+        三段（必要条件 / 下限 / 上限兜底）写在文件头的常量上。形状是"一次武装、三个问讯"：
+        下限定时器、上限定时器、焦点交出回调 —— 谁先到都只干同一件事，问一次
+        `try_fire()`；一次性闸门保证**只注入一次**。等待全部由主循环计时，
+        本函数与它挂上的每个回调都只搬数据 + 起后台线程，不睡、不 join、不 `wait()`
+        （`BLOCK-ON-MAIN-PATH` 把这几个函数名钉在主线程名册里）。
+        """
+        from capsplus import voice_osd as OSD
+
+        armed_us = OSD.now_us()
+        # 起点是"用户按下 Enter"那一刻（`_finish` 打的点）。取不到就退化成"此刻"：
+        # 绝不能拿 0 当起点 —— 那会让 `span` 变成一个巨大的数，兜底与下限当场全部误判成立。
+        mark = int(ui.release_fact()["finish_us"]) if ui is not None else 0
+        finish_us = mark or armed_us
+        once = threading.Lock()
+        state = {"fired": False}
+
+        def fire(gate: str) -> None:
+            with once:
+                if state["fired"]:
+                    return
+                state["fired"] = True
+            self._inject_with_diagnosis(text, note, ui, gate, OSD.now_us(), finish_us)
+
+        def try_fire() -> None:
+            """每次有人问（事件到 / 下限到 / 上限到）都问同一句：**条件齐了吗**。
+
+            只在 `ui` 存在时会被叫到 —— 没有弹窗那条路在上面已经 `fire("nowin")` 走掉了。
+            """
+            fact = ui.release_fact()
+            span = OSD.now_us() - finish_us
+            if fact["released"]:
+                if span < INJECT_FLOOR_MS * 1000:
+                    return                       # 下限还没到：等下限定时器再问一次
+                fire("event" if int(fact["at_us"]) - finish_us >= INJECT_FLOOR_MS * 1000
+                     else "floor")
+                return
+            if span >= INJECT_WAIT_CAP_MS * 1000:
+                fire("cap")                      # 到上限仍没有任何焦点交出的信号
+
+        if ui is None:
+            fire("nowin")
+            return
+        ui.on_release(lambda _fact: try_fire())
+        self.server.after_ms(INJECT_FLOOR_MS, try_fire)
+        self.server.after_ms(INJECT_WAIT_CAP_MS, try_fire)
+
+    def _inject_with_diagnosis(self, text: str, note: str, ui, gate: str,
+                               inject_us: int, finish_us: int) -> None:
+        """在**主线程**把状态量取齐（读 widget 只能在这儿），再把注入交给后台线程。
+
+        交出去的是 `diag` 那份纯数据 —— `_inject_directly` 里再碰一次 GTK 就是
+        `UI-IN-THREAD` 那个 AST 门要红的地方。
+        """
+        diag = build_diag(ui, gate, inject_us, finish_us)
+        P.log_line(inject_diag_line(diag))
+        self.server.last_inject_diag = diag
+        self.inject_diag = diag
+        if ui is not None:
+            ui.forget()
+        threading.Thread(target=self._inject_directly, args=(text, note, diag),
+                         daemon=True).start()
+
+    def _inject_directly(self, text: str, note: str, diag: dict | None = None) -> None:
+        """把文本交给上屏后端。**只在后台线程调用**：主线程路径一律经 `_arm_inject`。
+        弹窗场景下必然发生在窗口销毁**并且焦点交出的事实被观察到**之后（见文件头三段）。"""
         if not self._alive():
             return
         probe = self.server.probe()
         result = INJ.inject(text, backend=self.server.backend, probe=probe,
                             runner=self.server.run_command)
         self.inject_summary = result.describe()
+        done = dict(diag or {})
+        done.update(backend=result.backend or "", ok=bool(result.ok),
+                    code=result.code or "", steps=int(result.steps or 0))
+        P.log_line(inject_done_line(done))
+        self.server.last_inject_diag = done
+        self.inject_diag = done
         # 快照已经在 `inject` 里读进内存了：这里只负责把"过一会儿条件还原"的等待挂到主循环。
         # 顺序是判据：snapshot（在 inject 内，先于 wl-copy）→ 写 → 粘贴 → 还原（在这里挂出去）。
         self.server.arm_clipboard_restore(result.restore_job, result.clipboard_note)
@@ -321,7 +554,7 @@ class Session:
                                            code=result.code, note=note))
         if not result.ok and result.code != "manual":
             self.server.broadcast(P.error_event(result.code, result.message, result.hint))
-        self._set_state("idle", note="上屏结束")
+        self._set_state("idle", note=idle_note(done))
 
 
 class Server:
@@ -348,6 +581,8 @@ class Server:
         self._clip_job: INJ.RestoreJob | None = None   # 待还原的剪贴板快照（**只在内存**）
         self._clip_lock = threading.Lock()
         self.clipboard_summary = ""              # 进 status 的那句话：只有动作 + 类型/字节数
+        self.clipboard_diag: dict = {}           # 还原作业最终落进哪个分支（结构化，可解析）
+        self.last_inject_diag: dict = {}         # 上一次注入的状态量（进 status 的 verdict）
         self._quit = threading.Event()
         self._idle_evt = threading.Event()
         self._idle_evt.set()                 # 没有会话 = 就是 idle
@@ -453,7 +688,14 @@ class Server:
         if note:
             self._set_clipboard_summary(note)
         if job is None:
+            # 没有作业 = 这次**不会**有任何东西回来（开关关着 / 备份没成 / 降级 / manual）。
+            # 这条分支必须落进日志：明江看到的"闪一下"如果正是 300ms 后的还原，这里会是 armed。
+            self.clipboard_diag = {"branch": "skip", "still_ours": None}
+            P.log_line(restore_diag_line("skip"))
             return
+        self.clipboard_diag = {"branch": "armed", "still_ours": None,
+                               "delay_ms": int(job.delay_ms)}
+        P.log_line(restore_diag_line("armed", None, job.delay_ms))
         with self._clip_lock:
             pending = self._clip_job
             if pending is None:
@@ -461,10 +703,13 @@ class Server:
             else:
                 pending.ours.extend(job.ours)
                 job.snapshot.data = None          # 丢弃中间态，顺手把这份字节从内存里放掉
+                self.clipboard_diag = {"branch": "merged", "still_ours": None,
+                                       "delay_ms": int(pending.delay_ms)}
+                P.log_line(restore_diag_line("merged", None, pending.delay_ms))
         self.after_ms(job.delay_ms, self._fire_clipboard_restore)
 
     def _fire_clipboard_restore(self) -> None:
-        """主循环到点后的动作：**只把活交给后台线程**，自己不碰子进程（形状同 `_schedule_inject`）。"""
+        """主循环到点后的动作：**只把活交给后台线程**，自己不碰子进程（形状同 `_arm_inject`）。"""
         threading.Thread(target=self.run_clipboard_restore, daemon=True).start()
 
     def run_clipboard_restore(self) -> None:
@@ -479,7 +724,8 @@ class Server:
             return
         result = INJ.perform_restore(job, self.run_command)
         self._set_clipboard_summary(result.describe())
-        P.log_line(f"剪贴板还原 {result.code}")        # 只有代码；内容不进日志
+        self.clipboard_diag = {"branch": result.code, "still_ours": result.still_ours}
+        P.log_line(restore_diag_line(result.code, result.still_ours))   # 只有代码与三态布尔
 
     def _set_clipboard_summary(self, text: str) -> None:
         with self._clip_lock:
@@ -552,6 +798,8 @@ class Server:
                              vad=session.vad_summary if session else "",
                              asr=session.asr_summary if session else "",
                              inject=session.inject_summary if session else "",
+                             diag=dict(self.last_inject_diag),
+                             verdict=verdict_line(self.last_inject_diag, self.clipboard_diag),
                              clipboard=self.clipboard_summary,
                              backend=self.backend,
                              history=list(self.history[-6:]), **extra)
@@ -763,6 +1011,9 @@ def cmd_status() -> int:
             print(f"  上次识别 : {frame['asr']}")
         if frame.get("inject"):
             print(f"  上次上屏 : {frame['inject']}")
+        if frame.get("verdict"):
+            # 一行看全"结论 + 依据"：出问题只要把这一行贴过来就够定位，不必贴整页 status。
+            print(f"  上屏结论 : {frame['verdict']}")
         if frame.get("clipboard"):
             # 只报动作 + 类型 + 字节数；剪贴板里的内容一个字都不到这里（隐私判据钉这行）
             print(f"  剪贴板   : {frame['clipboard']}")

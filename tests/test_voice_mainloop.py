@@ -22,7 +22,9 @@ mutter 对客户端的 ping 落在进程主线程 —— 主线程在睡觉，�
     反例具型 = **修前的错误代码原样内联**（`BROKEN_SNIPPET`），喂同一个检查器必须变红。
   * **实质判据 A（行为级，本文件 `TestReviewRunsOnMainThread`，CAPSPLUS_GUI=1 + Xvfb 才跑，
     无显示显式 skip）**：review 建窗点断言 `threading.current_thread() is threading.main_thread()`
-    为真；且注入发生在窗口销毁之后 ≥ FOCUS_RETURN_MS、Esc 路径不注入。
+    为真；且**注入前时间线里已经有 unmap/focus_out**（`voice_osd.RELEASE_KINDS`，2026-10-17
+    改口径：触发条件是"焦点交出的事实"，`INJECT_FLOOR_MS` 只是下限、`INJECT_WAIT_CAP_MS`
+    只是上限兜底）、`Esc` 路径不注入。
   * **进程级（脚本，交付回报里贴修前/修后对比）**：`sh tools/verify-voice-mainloop.sh` ——
     headless 起 `serve`，断言主线程 wchan 不是 `hrtimer_nanosleep`。修前它必须能复现红。
 
@@ -52,7 +54,7 @@ WORKER_PATH = REPO / "capsplus" / "voice_worker.py"
 # ── 判据 B：静态 AST 检查器（对字符串源码工作，反例才能内联进来）────────────────
 MAIN_PATH_FUNCS = frozenset({
     "serve_forever", "_watchdog_tick", "_run_fallback_loop", "_open_review",
-    "_on_review_outcome", "_review_failed", "_schedule_inject",
+    "_on_review_outcome", "_review_failed", "_arm_inject", "_inject_with_diagnosis",
     "_fire_clipboard_restore",
     "post", "after_ms", "request_quit", "main",
 })
@@ -273,6 +275,42 @@ class Server:
 '''
         self.assertEqual(static_violations(src), [])
 
+    def test_the_injection_gate_callbacks_must_not_block(self):
+        """反例具型（2026-10-17 焦点门这一轮加）：**等事件**这件事只许由主循环做。
+
+        把注入改成"在到点回调里 `wait()` 直到窗口交出焦点"，功能上像是更严，实际是拿
+        主线程去赌合成器理不理你 —— 就是那个「voice_worker.py 无响应」弹窗的形状，
+        `BLOCK-ON-MAIN-PATH` 必须红。下限/上限定时器与 `_inject_with_diagnosis` 同理。
+        """
+        src = '''
+class Session:
+    def _arm_inject(self, text, note, ui):
+        def try_fire():
+            ui.released.wait(1.0)          # 等"焦点交出"等到主循环不转（错误写法）
+            self._inject_with_diagnosis(text, note, ui)
+
+    def _inject_with_diagnosis(self, text, note, ui, gate):
+        self.server.done.wait(0.5)         # 等子进程注入完（同样堵死主线程）
+        threading.Thread(target=self._inject_directly, args=(text, note), daemon=True).start()
+'''
+        hits = static_violations(src)
+        joined = "\n".join(hits)
+        self.assertTrue(any(v.startswith("BLOCK-ON-MAIN-PATH") for v in hits), hits)
+        self.assertIn("_arm_inject", joined)
+        self.assertIn("_inject_with_diagnosis", joined)
+
+    def test_the_named_main_path_functions_actually_exist(self):
+        """名册不许变成死名：`MAIN_PATH_FUNCS` 里每一个名字都必须在交付的 worker 里真存在。
+
+        为什么单独钉一条：门 #3 是 `funcs.get(fname)` 取不到就 `continue` —— 一旦有人把
+        `_schedule_inject` 改名而忘了同步这里，检查器会**悄无声息地**不再管那条路径
+        （本仓 2026-10-17 已经为"没人跑过的分支把判据照成假绿"栽过一次）。
+        """
+        tree = ast.parse(WORKER_PATH.read_text(encoding="utf-8"))
+        have = {node.name for node in ast.walk(tree) if isinstance(node, ast.FunctionDef)}
+        missing = sorted(MAIN_PATH_FUNCS - have)
+        self.assertEqual(missing, [], f"名册里有名字在 worker 里已经不存在：{missing}")
+
 
 # ── 无头行为：主线程门岗与三条降级（所有机器都跑，不开窗）───────────────────────
 class TestReviewDegradation(unittest.TestCase):
@@ -380,8 +418,9 @@ class TestReviewDegradation(unittest.TestCase):
 @unittest.skipUnless(TP.RUN_GUI and not TP.real_desktop_risk(),
                      "界面判据只在 CAPSPLUS_GUI=1 + 虚拟显示下跑；口径照 TestOsdRealWindow")
 class TestReviewRunsOnMainThread(unittest.TestCase):
-    """实质判据 A：整条「识别完 → 回主线程建窗 → Enter → 销毁 → 延迟 → 注入」链上，
-    建窗必须发生在**进程主线程**；注入发生在窗口销毁之后 ≥ FOCUS_RETURN_MS。"""
+    """实质判据 A：整条「识别完 → 回主线程建窗 → Enter → 销毁 → **等到焦点交出的事实** → 注入」
+    链上，建窗必须发生在**进程主线程**；注入必须发生在窗口 `unmap`/`focus_out` **之后**，
+    且不早于下限、不晚于上限兜底。"""
 
     @classmethod
     def setUpClass(cls):
@@ -413,7 +452,8 @@ class TestReviewRunsOnMainThread(unittest.TestCase):
 
         def fake_run(argv, **kw):
             calls.append({"argv": list(argv), "t": time.monotonic(),
-                          "ui": session._ui if session else None})
+                          "ui": session._ui if session else None,
+                          "diag": dict(session.inject_diag)})
             return type("R", (), {"returncode": 0, "stderr": b""})()
 
         probe = INJ.Probe(wl_copy="/bin/true", wl_copy_primary=True, ydotool="/bin/true",
@@ -480,7 +520,14 @@ class TestReviewRunsOnMainThread(unittest.TestCase):
         return session, calls, events, build_threads, key_times
 
     def test_commit_path_builds_on_main_thread_and_injects_after_destroy(self):
-        """判据 A 本体：Enter → commit → 窗口已销毁 → ≥120ms 后注入；建窗点在主线程。"""
+        """判据 A 本体：Enter → commit → 窗口销毁**并且时间线里出现焦点交出的事实** → 注入。
+
+        2026-10-17 改口径：原来这条只断言"隔了 ≥100ms"，那只是"过了那么久"，不说明焦点
+        给了谁 —— 明江真机看到的"贴上又被删"就是从这种假绿里漏过去的。现在断言的是**顺序**：
+        时间线里 `unmap`/`focus_out` 至少一条，且它发生在注入之前。
+        """
+        from capsplus import voice_worker as W
+
         session, calls, events, build_threads, key_times = self._round(TP.Gdk.KEY_Return)
         self.assertEqual(build_threads, [True],
                          f"建窗点不在进程主线程（{build_threads}）—— 真机「无响应」弹窗的形状")
@@ -493,12 +540,30 @@ class TestReviewRunsOnMainThread(unittest.TestCase):
                               "注入时 _ui 还在 = 窗口没销毁就动手，Ctrl+V 会贴进自家弹窗")
         self.assertTrue(key_times)
         gap = calls[0]["t"] - key_times[0]
-        self.assertGreaterEqual(gap, 0.10,
-                                f"焦点归还等待被跳过/缩短：{gap:.3f}s < FOCUS_RETURN_MS")
+        self.assertGreaterEqual(gap, W.INJECT_FLOOR_MS / 1000.0 - 0.02,
+                                f"注入的下限被跳过：{gap:.3f}s < INJECT_FLOOR_MS")
+        self.assertLess(gap, (W.INJECT_WAIT_CAP_MS + 400) / 1000.0,
+                        f"注入拖到上限之外去了：{gap:.3f}s")
+        diag = calls[0]["diag"]
+        self.assertIn(diag.get("gate"), ("event", "floor"),
+                      f"真窗口下本该由焦点交出的事实放行，结果 gate={diag.get('gate')}")
+        self.assertTrue(diag.get("released"), "注入前没观察到任何 unmap/focus_out")
+        self.assertTrue(diag.get("unmap_seen") or diag.get("focus_out_seen"),
+                        f"时间线里没有焦点交出的条目：{diag.get('timeline')}")
+        self.assertFalse(diag.get("unconfirmed"), "真窗口路径不该被判成未确认")
+        self.assertGreaterEqual(diag.get("release_ms", -1), 0,
+                                "焦点交出的时刻早于 Enter？时间线的口径坏了")
+        self.assertLessEqual(diag.get("release_ms", 1e9), diag.get("enter_ms", -1),
+                             "注入排在焦点交出之前 = 本轮改动要防的那件事")
+        kinds = [e.get("kind") for e in diag.get("timeline") or []]
+        self.assertIn("map", kinds, "时间线里连 map 都没有 = 生命周期信号根本没接上")
+        self.assertIn("destroy", kinds, "时间线里没有 destroy：销毁这件事没被记下来")
+        self.assertIn("finish", kinds, "Enter 的打点没记 = enter_ms 是编出来的")
         self.assertEqual(session.state, "idle")
         from capsplus import voice_proto as P
-        self.assertNotIn("九点开会", P.log_path().read_text(encoding="utf-8"),
-                         "隐私语义不许回退：识别文本不进日志")
+        log = P.log_path().read_text(encoding="utf-8")
+        self.assertIn("inject_diag ", log, "注入那一刻的状态量必须落进日志")
+        self.assertNotIn("九点开会", log, "隐私语义不许回退：识别文本不进日志")
 
     def test_cancel_path_never_injects_and_still_builds_on_main_thread(self):
         """Esc：同样是主线程建窗，但一个字都不注入。"""

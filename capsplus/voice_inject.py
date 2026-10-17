@@ -590,6 +590,10 @@ class RestoreResult:
     message: str = ""
     commands: list[str] = field(default_factory=list)
     stage: str = STAGE_RESTORE
+    # "注入之后回读剪贴板，里面还是不是我们写的那段"：True / False / None（读不到）。
+    # 诊断行 `restore_diag … still_ours=…` 要的就是这个三态，别拿 `did` 代替 ——
+    # `no_backup` 那条压根没查过，`did=False` 与"查过但不是我们的"是两件事。
+    still_ours: bool | None = None
 
     def describe(self) -> str:
         """一行摘要，进 `capsplus-voice status`：**只有动作与类型/字节数**。"""
@@ -607,9 +611,10 @@ def perform_restore(job: RestoreJob, run, verify: bool = True) -> RestoreResult:
     still = check_still_ours(job, run)
     if still is not True:
         if still is False:
-            return RestoreResult(code="not_ours", message="剪贴板已被别处更新，未还原")
+            return RestoreResult(code="not_ours", message="剪贴板已被别处更新，未还原",
+                                 still_ours=False)
         return RestoreResult(code="check_failed",
-                             message="读不回剪贴板现值，保守起见未还原")
+                             message="读不回剪贴板现值，保守起见未还原", still_ours=None)
     ran: list[str] = []
     for step in restore_steps(job):
         ran.append(" ".join(step.argv))
@@ -618,14 +623,17 @@ def perform_restore(job: RestoreJob, run, verify: bool = True) -> RestoreResult:
                        timeout=STEP_TIMEOUT_S)
         except (OSError, subprocess.TimeoutExpired, ValueError) as exc:
             return RestoreResult(code="step_failed",
-                                 message=f"还原那步没跑起来 {type(exc).__name__}", commands=ran)
+                                 message=f"还原那步没跑起来 {type(exc).__name__}", commands=ran,
+                                 still_ours=True)
         rc = getattr(proc, "returncode", 0)
         if rc != 0:
             # 同 snapshot_clipboard：不拼 stderr，摘要里绝可能出现用户内容片段。
-            return RestoreResult(code="step_failed", message=f"还原命令退出码 {rc}", commands=ran)
+            return RestoreResult(code="step_failed", message=f"还原命令退出码 {rc}", commands=ran,
+                                 still_ours=True)
     if snap.empty:
         return RestoreResult(did=True, code="cleared",
-                             message="原剪贴板为空 ⇒ 已按 --clear 清空", commands=ran)
+                             message="原剪贴板为空 ⇒ 已按 --clear 清空", commands=ran,
+                             still_ours=True)
     if verify and len(snap.data or b"") <= VERIFY_MAX_BYTES:
         back = None
         for mime in dict.fromkeys([snap.mime] + list(TEXT_MIME_CANDIDATES)):
@@ -643,11 +651,13 @@ def perform_restore(job: RestoreJob, run, verify: bool = True) -> RestoreResult:
             return RestoreResult(
                 code="verify_mismatch", commands=ran,
                 message="还原命令发了但回读不一致（Wayland 要求发数据源的客户端有键盘焦点，"
-                        "多半是 worker 没拿到）")
+                        "多半是 worker 没拿到）", still_ours=True)
         return RestoreResult(did=True, code="restored", commands=ran,
-                             message=f"{snap.mime} {len(snap.data or b'')} 字节（已回读核对）")
+                             message=f"{snap.mime} {len(snap.data or b'')} 字节（已回读核对）",
+                             still_ours=True)
     return RestoreResult(did=True, code="restored_unverified", commands=ran,
-                         message=f"{snap.mime} {len(snap.data or b'')} 字节（太大，未回读核对）")
+                         message=f"{snap.mime} {len(snap.data or b'')} 字节（太大，未回读核对）",
+                         still_ours=True)
 
 
 def unverified_reason(probe: Probe) -> str:

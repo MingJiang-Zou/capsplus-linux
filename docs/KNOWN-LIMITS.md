@@ -419,7 +419,34 @@ r = searchParams.get("q")?.trim() ?? e.get("prompt")
 
 ### 9. 未实测（本节撑不起来的部分，别顺着往下信）
 
-① 弹窗销毁后焦点是否真还给原文档；② `Ctrl+V` 在 Edge / Chrome / GNOME 终端 / LibreOffice / VS Code
+① 弹窗销毁后焦点是否真还给原文档（**已部分实测，见下面第 10 条**：X11 侧量到了信号到达的时刻，
+但"焦点给了谁"这条客户端问不到）；② `Ctrl+V` 在 Edge / Chrome / GNOME 终端 / LibreOffice / VS Code
 里的实际落点与适用面；③ **ibus / libpinyin 在场时 Enter 会不会被输入法吃掉**（头号风险，
 `voice_osd.key_action` 已备但没在真输入法下跑过）；④ 打字中途按 `Caps+M`，键声会不会被能量门误判成
 语音；⑤ 跨线程碰 GTK 会**段错误 rc=139**（试过并在代码里禁止，真 Wayland 下的长期稳定性未测）。
+
+### 10. "焦点交给了谁"客户端问不到 —— 所以上屏的触发条件只能是"事实 + 上下限"（2026-10-17 实测）
+
+- **怎么验的**：Xvfb + `GDK_BACKEND=x11` + `CAPSPLUS_GUI=1` 下把 `voice_osd` 记的生命周期时间线打出来
+  （毫秒、相对 Enter）：`map@-5, focus_in@-2.5, focus_out@-2.2, focus_in@-2.1, finish@0, unmap@0.03,
+  destroy@0.06`；同一份窗口销毁后 `get_visible()` / `get_realized()` / `get_mapped()` 全是 False。
+- **三条结论**：
+  1. **X11 下 `unmap` 与 `destroy` 同步**（Enter 之后 0.03ms 就到）⇒ "等到 unmap 事件"在这个平台上
+     **等于没等**。所以注入另外要有**下限**（`voice_worker.INJECT_FLOOR_MS = 120`）：改成"只等事件"
+     反而会把上屏提得比现状更早、更危险。
+  2. **`focus_out` 不一定来**：Xvfb 没有窗口管理器，这一轮就没收到（只有 unmap）。mutter 下收不收得到
+     尚未在真桌面取证 —— 这正是 `gate=cap` 那条分支存在的理由。
+  3. **客户端拿不到"焦点给了谁"**：xdg-shell 没这个查询，GTK3 也没有；`set_accept_focus(False)` 只是
+     X11 hint 的等价物。于是"焦点已回到原文档"**不可能被证实、只可能被证伪**（我们还 mapped /
+     还可见 ⇒ 一定没交出去）。
+- **因此定成**：注入的必要条件是时间线里出现 `unmap` 或 `focus_out`（`voice_osd.RELEASE_KINDS`），
+  下限 120ms，**上限兜底 400ms**（`INJECT_WAIT_CAP_MS`）；等满还拿不到任何信号就带着诊断注入，
+  并把这一次写成**未确认** —— 状态行、`voice.log` 的 `inject_diag gate=cap unconfirmed=1`、
+  `capsplus-voice status` 的「上屏结论」三处同步，**不许写成"上屏结束"**。判据：
+  `tests/test_voice_focus_gate.py`（四条，各带能红的反例具型）+
+  `tests/test_voice_mainloop.py::TestReviewRunsOnMainThread`（真窗口那条钉的是**顺序**而不是时长）。
+- **真桌面上还没定的那一件事**：按 Enter 后"贴上又删"到底是 ①贴进了我们自己正在消失的窗口、
+  ②目标应用自己的行为、还是 ③`wl-copy` 没拿到选区所有权、粘出来的是旧内容。三条的**区分量**都在
+  `inject_diag` / `restore_diag` 这两行里（`visible`/`mapped` 是不是还 1、`gate` 是哪个、
+  `still_ours` 是什么、`Enter→注入` 与 `Enter→焦点交出` 各多少毫秒）—— 要在真机再测一次并把那两行
+  贴回来才能定。

@@ -38,7 +38,7 @@
 | `mappings.toml`（`~/.config/capsplus/`） | 设置界面「按键映射」 | 你改过的键位覆盖（只存改动那几条） | 不含文字，但含键位习惯 | 无自动清理 |
 | `qbar.sock` / `settings.sock` / `tray.lock` | 单实例与 flock | Unix socket / 锁文件，**不存内容** | 不含 | 进程退出即失效（socket 会被清） |
 | `voice.sock` | 语音常驻 worker（`capsplus/voice_worker.py`） | 单实例与命令通道（换行分隔 JSON）。**权限 0600** —— 与 Qbar 那个只收一字节的 socket 不同，这条线上跑的是**你说的话**，同机别人不能连（`voice_proto.SOCK_MODE`，判据在 `tests/test_voice_proto.py`） | 传输瞬间含，**落盘不含**（socket 本身不存东西） | 进程退出即失效 |
-| `voice.log` | 语音 worker（`voice_proto.log_line`） | **只记状态与数量**，形如 `recording 开始采集` / `decoding 送识别 96000 字节` / `review 待确认 12 字` / `idle 识别失败 <code>`。**不记录识别出的文本、不记录音频**（写日志的调用点只传 `state`+`note`，`note` 里最多是字节数/字数） | 不含文字内容 | 只留**最后 200 行**，每次写整体重写 |
+| `voice.log` | 语音 worker（`voice_proto.log_line`） | **只记状态与数量**，形如 `recording 开始采集` / `decoding 送识别 96000 字节` / `review 待确认 12 字` / `idle 识别失败 <code>`，以及 2026-10-17 晚加的可解析三行 `inject_diag gate=… enter_ms=… visible=… mapped=… tl=finish@0,unmap@250` / `inject_done backend=… ok=… code=… steps=…` / `restore_diag branch=… still_ours=…`（**全是状态量与毫秒数**：窗口可见性、焦点交出发生在第几毫秒、剪贴板"还是不是我们写的那段"——没有内容本身）。**不记录识别出的文本、不记录音频、不记录剪贴板字节**（判据：`tests/test_voice_focus_gate.py::TestDiagnosticsCarryNoText` 拿"念一句银行卡号"与剪贴板里的卡号各做一次全文扫描） | 不含文字内容 | 只留**最后 200 行**，每次写整体重写 |
 | `/etc/keyd/capslock-plus.conf` | `capsplus apply`（sudo） | 渲染出的键位配置（含你机器上的 bin 目录绝对路径） | 含**你的家目录路径**（`command(<你的 ~/.local/bin>/keyd-qbar-cmd)`，语音输入还会多一条同形状的 `capsplus-voice` 行） | 由你管 |
 
 另外几个"环境变量决定行为"的点：
@@ -82,8 +82,10 @@
    - 只想不留常驻：`capsplus-voice stop` 收掉 worker（下次按键会自己再起来），
      `systemctl --user disable --now voice-svc` 收掉识别服务。
    - 整个不要这颗键：删掉 `mappings.toml` 里那两行再 `capsplus apply`（仓内键位本来就没有 `m`）。
-   `voice.log` 本来就**只记状态不记文本**（剪贴板那一步只记 `剪贴板还原 <code>` 一个代码，
-   比如 `restored` / `not_ours`，**不含任何内容**），一般不必清；要清跟 `qbar.log` 一起 `mv` 走即可。
+   `voice.log` 本来就**只记状态不记文本**（剪贴板那一步只记一行 `restore_diag branch=<code>
+   still_ours=1/0/na` —— `branch` 是 `restored` / `not_ours` / `verify_mismatch` / `skip` 这类代码，
+   `still_ours` 是"回读出来还是不是我们写的那段"这个三态布尔，**都不含内容**），一般不必清；
+   要清跟 `qbar.log` 一起 `mv` 走即可。
 
 ## 三、要把截图 / 配置 / 日志贴到网上之前
 

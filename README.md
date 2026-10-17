@@ -303,7 +303,8 @@ m = "command(<你的 ~/.local/bin>/capsplus-voice toggle)"
 keyd `command()`（**以 root 执行**）→ `bin/capsplus-voice` 降权（runuser + 只报一个显示后端、另一个用
 `env -u` 摘掉）→ `capsplus/voice_worker.py`（Qbar 式 socket 单实例，`~/.local/state/capsplus/voice.sock`，
 **0600**）→ `arecord -f S16_LE -r 16000 -c 1` → 能量门 VAD → `POST http://127.0.0.1:18090/asr-upload?lang=zh`
-→ **确认弹窗**（Enter 上屏 / Shift+Enter 换行 / Esc 丢弃）→ **窗口销毁之后**才发注入
+→ **确认弹窗**（Enter 上屏 / Shift+Enter 换行 / Esc 丢弃）→ **等到"窗口已 unmap 或收到 focus-out"
+这个事实**才发注入（下限 120ms；等满 400ms 仍一个信号都没收到也注入，但那次写成**未确认**）
 （**先备份剪贴板** `wl-paste` → `wl-copy` → `ydotool key 29:1 47:1 47:0 29:0`，键码从内核头文件现读，
 不写死数字 → 过 `CLIPBOARD_SETTLE_MS`（300ms）**条件还原**原剪贴板，详见下面「这颗键对剪贴板做什么」）。
 
@@ -365,7 +366,9 @@ voice-svc-user.service`，模型在 `~/.cache/sherpa-onnx/sherpa-onnx-sense-voic
 可覆盖：`CAPSPLUS_VOICE_BACKEND=clipboard|primary|manual`、`CAPSPLUS_VOICE_RESTORE_CLIPBOARD=0`
 （关掉还原，回到"覆盖且不还原"的老行为；默认开）、`CAPSPLUS_ASR_HOST/PORT/LANG`。
 
-**未实测清单（别当已验证，这几条只有真桌面 + 真人能清）**：① 弹窗销毁后焦点是否真还给原文档；
+**未实测清单（别当已验证，这几条只有真桌面 + 真人能清）**：① 弹窗销毁后焦点是否真还给原文档 ——
+客户端**问不到**（X11 实测：`unmap` 与 `destroy` 同步、Enter 后 0.03ms 就到，`focus_out` 在没有窗口
+管理器时压根不来；mutter 下收不收得到还没取证），所以现在只能靠真机那一行 `inject_diag` 来定；
 ② `Ctrl+V` 在 Edge / Chrome / GNOME 终端 / LibreOffice / VS Code 里的实际落点与适用面；
 ②b **剪贴板还原的真机时序**：300ms 够不够（目标应用异步取数据要多久）、worker 无键盘焦点时
 `wl-copy` 能不能真把选区所有权接回去（判据只能验到"回读一致才算已还原"，真机成不成还没测）；

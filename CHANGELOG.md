@@ -17,7 +17,8 @@ GitHub 仓库的 Releases 页。版本号唯一落点是 `capsplus/__init__.py` 
 `Caps+M` → keyd `command()`（root）→ `bin/capsplus-voice` 降权（runuser + 只报一个显示后端）
 → `voice_worker.py`（Qbar 式 socket 单实例，`~/.local/state/capsplus/voice.sock`，0600）
 → `arecord -f S16_LE -r 16000 -c 1` → 能量门 VAD → `POST http://127.0.0.1:18090/asr-upload?lang=zh`
-→ **可编辑确认弹窗**（Enter 上屏 / Shift+Enter 换行 / Esc 丢弃）→ **窗口销毁之后**才注入
+→ **可编辑确认弹窗**（Enter 上屏 / Shift+Enter 换行 / Esc 丢弃）→ **等到"窗口已 unmap 或收到
+focus-out"这个事实**才注入（下限 120ms、上限兜底 400ms，见下文"上屏的触发条件"）
 （**备份剪贴板** `wl-paste` → `wl-copy` → `ydotool key 29:1 47:1 47:0 29:0` → 300ms 后**条件还原**）。
 
 ### 实测数字（2026-10-17，本机，不是估算）
@@ -58,7 +59,36 @@ GitHub 仓库的 Releases 页。版本号唯一落点是 `capsplus/__init__.py` 
   降级（`needs_manual_paste`）与粘贴失败两种情况**故意不还原**（那时文本还要留给用户自己粘）。
   开关 `CAPSPLUS_VOICE_RESTORE_CLIPBOARD=0` 关掉还原（回到老行为，且连备份读都不做）。
   `capsplus-voice status` 新增一行「剪贴板」，能看出上次是否真还原了。
-- **未实测清单**（只有真桌面 + 真人能清）：① 弹窗销毁后焦点是否真还给原文档；② `Ctrl+V` 在
+- **上屏的触发条件（2026-10-17 晚，真机现象"贴上又闪掉"之后改的）**：过去只有一个定时器 ——
+  窗口销毁后固定等 `FOCUS_RETURN_MS = 120ms` 就发 Ctrl+V。**"过了 120 毫秒"不等于"焦点回到了
+  原文档"**，而 Ctrl+V 落进我们那个正在消失的弹窗，用户看到的就正是"字进去了、又随窗口没了"。
+  现在改成三段，且**事实与时长分开**（`capsplus/voice_worker.py` 文件头逐段写了理由）：
+  必要条件 = `voice_osd` 记下的生命周期时间线里出现 `unmap` 或 `focus_out`（纯数据，条目只有
+  `{kind, us}`）；下限 `INJECT_FLOOR_MS=120`（X11 实测 `unmap` 与 `destroy` **同步**、Enter 后 0.03ms
+  就到，"只等事件"在那边等于不等，不许把注入提得比现状更早）；上限兜底 `INJECT_WAIT_CAP_MS=400`
+  （Wayland 可能一个这类通知都不给客户端 ⇒ 等满也注入，但这一次**写成"未确认"**，
+  状态行 / `voice.log` / `status` 三处同步，不写成"上屏结束"）。等待全程由主循环计时，
+  主线程一处 `sleep` 都没有（AST 名册新增这两个函数，且加了"名册里的名字必须在 worker 里
+  真存在"那条门）。
+  **诊断能自证**（这是本轮主要交付物）：`voice.log` 里每次上屏多三行固定前缀 + key=value 的
+  可解析行 —— `inject_diag gate=… enter_ms=… release_ms=… visible=… realized=… mapped=…
+  unmap=… focus_out=… destroy=… entries=… tl=map@-8,finish@0,unmap@250`、
+  `inject_done backend=… ok=… code=… steps=… gate=…`、
+  `restore_diag branch=armed/skip/merged/restored/not_ours/verify_mismatch/… still_ours=1/0/na`；
+  `capsplus-voice status` 多一行「上屏结论」= 结论 + 依据 + 那几个状态量（一行，可直接贴）。
+  全部**只有状态量**：识别文本与剪贴板内容一个字符都不进（隐私判据按"念一句银行卡号"那条扩到
+  新字段）。判据：新增 `tests/test_voice_focus_gate.py`（时间线纯数据 / 事件路径 / 兜底未确认 /
+  隐私四条 + 假件与真窗口不许漂，四条反例具型在本轮逐条真红过：把触发条件改回"固定 120ms 立即发"、
+  删掉上限兜底、兜底那次也报"上屏结束"、在到点回调里 `wait()`）；`test_voice_mainloop.py` 的真窗口
+  那条从"隔了 ≥100ms"改成钉**顺序**（焦点交出的事实必须早于注入）。2026-10-17 晚实跑
+  `python3 -m unittest discover -s tests` → **682 条 OK（skipped=48）**；Xvfb + `CAPSPLUS_GUI=1`
+  全量 → **682 条 OK（skipped=1）**。真机那三种可能（贴进自己 / 目标应用自己清掉 / `wl-copy`
+  没拿到选区所有权粘出旧内容）**还没定**，区分量都在这三行里，需要再测一次把行贴回来。
+  详见 `docs/KNOWN-LIMITS.md`「语音输入的上屏」第 10 条。
+- **未实测清单**（只有真桌面 + 真人能清）：① 弹窗销毁后焦点是否真还给原文档（**本轮已经把"能不能
+  观察到"变成了数据**：X11/Xvfb 实测 `unmap` 与 `destroy` 同步、`focus_out` 在没有窗口管理器时压根
+  不来；mutter 下收不收得到、以及"收到之后焦点到底给了谁"仍未取证 —— 那要靠真机那一行
+  `inject_diag` 才能定）；② `Ctrl+V` 在
   Edge / Chrome / GNOME 终端 / LibreOffice / VS Code 的实际落点与适用面；②b **剪贴板还原的真机
   时序** —— 300ms 够不够、常驻 worker 没有键盘焦点时 `wl-copy` 能不能真把选区所有权接回去
   （实现只做"回读不一致就报 `verify_mismatch`"，不谎报已还原；真机成不成未测）；②c **中途改

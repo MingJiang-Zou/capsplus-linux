@@ -24,15 +24,33 @@
      非阻塞入口，主线程建窗、**窗口销毁之后**才 `on_finish`）与 `show()`（阻塞式，返回时
      窗口已销毁；只留给手动跑和单测，worker 不用它 —— "每句话起一个线程跑一个
      MainLoop"正是 2026-10-17「无响应」弹窗的病根，见 `voice_worker` 模块 docstring）。
+  4. **"先关窗"过去只是一句承诺，现在是一份数据**（2026-10-17 补）：本文件把窗口的真实
+     生命周期 `map` / `unmap` / `focus-in` / `focus-out` / `destroy` 记成**纯数据时间线**
+     （`VoiceUi.timeline`，条目只有 `{kind, us}`），注入方读它来决定"我确不在焦点链上了吗"，
+     诊断也把它原样写进日志。**不许只把这件事写在日志散文里** —— 散文没法断言，也没法反例。
+     注意"拿到 unmap/focus-out"是**我们这一侧**的事实：Wayland 不保证合成器会把它交给谁，
+     所以时间线只能证实"我们撤了"，证不了"焦点回到了原文档"；证不了的那部分由
+     `voice_worker` 标成**未确认**，不许写成成功。
 """
 
 from __future__ import annotations
 
 import os
 import threading
+import time
 from dataclasses import dataclass
+from functools import partial
 
 MODES = ("recording", "review", "notice")
+# 窗口生命周期里我们要记下来的五种信号（`focus_in`/`focus_out` 连的是 GTK 的
+# `focus-in-event`/`focus-out-event`，见 `LIFECYCLE_SIGNALS`）。
+LIFECYCLE_KINDS = ("map", "unmap", "focus_in", "focus_out", "destroy")
+# 其中能算"**我已经不在焦点链上**"的事实 —— 注入必须等到其中之一，等不到就标未确认。
+RELEASE_KINDS = ("unmap", "focus_out")
+# 我们自己打的点（不是信号）：`finish` = 用户按下 Enter/Esc 的那一刻，诊断算间隔用它。
+MARKER_KINDS = ("finish",)
+LIFECYCLE_SIGNALS = {"map": "map", "unmap": "unmap", "focus_in": "focus-in-event",
+                     "focus_out": "focus-out-event", "destroy": "destroy"}
 BADGE_ENV = "CAPSPLUS_VOICE_BADGE"
 DEFAULT_TITLE = "语音输入（Caps+M）"
 REVIEW_WIDTH = 620
@@ -101,6 +119,78 @@ def text_for_display(text: str, limit: int = TEXT_LIMIT) -> str:
     return clean[:limit]
 
 
+# ── 时间线：时基与读取（纯数据，没有 gi 也能跑）────────────────────────────────
+_CLOCK = None
+
+
+def _glib_clock_us() -> int:
+    from gi.repository import GLib
+    return int(GLib.get_monotonic_time())
+
+
+def _system_clock_us() -> int:
+    return int(time.monotonic() * 1_000_000)
+
+
+def now_us() -> int:
+    """单调微秒时基。首选 `GLib.get_monotonic_time()`，这台机没 PyGObject 才退 `time.monotonic`。
+
+    **进程内只选一次**并记住：两个时钟的纪元不同，混着用算出来的间隔是垃圾（比没诊断更糟）。
+    """
+    global _CLOCK
+    if _CLOCK is None:
+        try:
+            _glib_clock_us()
+            _CLOCK = _glib_clock_us
+        except Exception:                                # noqa: BLE001 ImportError / 坏 typelib
+            _CLOCK = _system_clock_us
+    return _CLOCK()
+
+
+def focus_released(timeline, after_us=None) -> dict:
+    """从**纯时间线**回答"焦点交出了没有" —— 不碰 GTK，单测直接喂一个 list 就能断言。
+
+    返回的 `release_kind` 是**哪一种信号**算的（`unmap`/`focus_out`），`at_us` 是它的时刻；
+    worker 诊断里那个 `gate=` 说的是"谁让的这一步"（event/floor/cap），两件事别混。
+
+    `after_us=None` 时取时间线里 `finish`（用户按下 Enter）那个打点的时刻：在那之前来过的
+    `focus_out`（用户自己点了一下别处）不能算"我们把窗口撤了"。
+    只统计 **finish 之后**的条目，返回的 `unmap_seen` / `focus_out_seen` 也是这个口径 ——
+    诊断行要回答的是"自 Enter 以来"，不是"这辈子"。
+    """
+    entries = [e for e in (timeline or []) if isinstance(e, dict)]
+    marks = [e for e in entries if e.get("kind") == "finish"]
+    if after_us is None:
+        after_us = int(marks[-1].get("us", 0)) if marks else 0
+    after_us = int(after_us)
+    out = {"released": False, "release_kind": "", "at_us": 0, "enter_ms": None,
+           "finish_us": int(marks[-1].get("us", 0)) if marks else 0,
+           "unmap_seen": False, "focus_out_seen": False, "destroy_seen": False,
+           "mapped_by_timeline": None, "entries": len(entries)}
+    for entry in entries:
+        kind = entry.get("kind")
+        us = int(entry.get("us", 0) or 0)
+        if kind == "map":
+            out["mapped_by_timeline"] = True
+        elif kind == "unmap":
+            out["mapped_by_timeline"] = False
+        elif kind == "destroy":
+            out["mapped_by_timeline"] = False
+        if us < after_us:
+            continue
+        if kind == "unmap":
+            out["unmap_seen"] = True
+        elif kind == "focus_out":
+            out["focus_out_seen"] = True
+        elif kind == "destroy":
+            out["destroy_seen"] = True
+        if kind in RELEASE_KINDS and not out["released"]:
+            out.update(released=True, release_kind=kind, at_us=us)
+    if out["released"] and out["finish_us"]:
+        out["enter_ms"] = round((out["at_us"] - out["finish_us"]) / 1000.0, 1)
+    return out
+
+
 def ui_available() -> bool:
     """现在能不能弹窗。只**读**环境变量，绝不设置（判据：`tests/test_display_env_hygiene.py`）。"""
     if os.environ.get("CAPSPLUS_VOICE_UI") == "0":
@@ -151,14 +241,19 @@ class VoiceUi:
     `post_*` 是线程安全的（走 GLib.idle_add），没建窗之前调用会先攒着，建窗时补上。
     """
 
-    def __init__(self, title: str = DEFAULT_TITLE, on_finish=None):
+    def __init__(self, title: str = DEFAULT_TITLE, on_finish=None, clock=None):
         self.on_finish = on_finish        # callable(UiOutcome)，只会被叫一次
         self.title = title
         self.mode = "recording"
         self.note = LABELS["recording"]
         self.text = ""
+        # 窗口真实生命周期：**纯数据**时间线（条目只有 {kind, us}），注入方与诊断都读它。
+        self.timeline: list[dict] = []
+        self._clock = clock or now_us
+        self._release_waiters: list = []
         self._pending: list[tuple] = []
         self._window = None
+        self._probe_widget = None          # 销毁后**只留着读状态量**的那份窗口引用
         self._view = None
         self._label = None
         self._loop = None
@@ -193,6 +288,76 @@ class VoiceUi:
             GLib.idle_add(self._apply, event)
         except Exception:                                # noqa: BLE001
             self._apply(event)
+
+    # -- 生命周期时间线 ---------------------------------------------------------
+    def _record(self, kind: str, *ignored) -> None:
+        """生命周期**唯一的写入点**：一条 `{kind, us}` 进时间线；焦点交出的事实顺本通知等待者。
+
+        它是 GTK 信号处理器（`partial` 把 `kind` 放在最前，widget/事件都落到 `ignored`），
+        所以返回值必须是 None —— 返回 True 会把 `focus-out-event` 之类吃掉，默认处理就断了。
+        等待者的回调异常**只记不下**：这里抛出去会把信号发射链打断（`_guarded` 那套教训）。
+        """
+        self.timeline.append({"kind": kind, "us": int(self._clock())})
+        if kind not in RELEASE_KINDS:
+            return
+        waiters, self._release_waiters = self._release_waiters, []
+        for callback in waiters:
+            try:
+                callback(self.release_fact())
+            except Exception:                            # noqa: BLE001 诊断不许掀翻主循环
+                pass
+
+    def release_fact(self) -> dict:
+        """`focus_released(self.timeline)` 的实例口径：Enter 之后焦点交出了没有。"""
+        return focus_released(self.timeline)
+
+    def on_release(self, callback) -> bool:
+        """焦点一交出就在**主线程**（信号上下文里）叫一次 `callback(fact)`。
+
+        已经交过了就当场叫，返回 True（调用方据此**不必**再挂兜底定时器）。
+        只通知一次：`_record` 拿走列表就地清空，第二次 unmap/focus_out 不会再叫。
+        """
+        fact = self.release_fact()
+        if fact["released"]:
+            callback(fact)
+            return True
+        self._release_waiters.append(callback)
+        return False
+
+    def probe(self) -> dict:
+        """注入那一刻的**窗口状态量**（可见 / 已实化 / 还 mapped + 焦点事实）。不含任何文本。
+
+        三个布尔分开读：一个读不到不牵连另外两个（本轮实测：`is_realized()` 这名字在
+        GTK3 里**不存在**，是 `get_realized()`；写错时被 except 一口吞掉，三个状态量一起变
+        `na`，诊断就白装了 —— 所以现在每个各包一次，并且判据逐字钉住它们）。
+        `mapped` 直接问 GTK3 的 `get_mapped()`，同时给一份从时间线推出来的
+        `mapped_by_timeline` 对照 —— 两个不一致本身就是诊断信息。
+        销毁后的窗口对象只用来读这三个布尔，别的动作一个都不做（Xvfb 实测：destroy 之后
+        三个 getter 都还能读，返回 False）。
+        """
+        fact = self.release_fact()
+        fact["visible"] = None
+        fact["realized"] = None
+        fact["mapped"] = None
+        # 时间线原样带出去（只有 kind 与 us）：诊断行要打印它，判据要断言它的顺序。
+        # 反例具型：这行漏掉时界面判据看到的 `timeline` 是空的，与假件不一致 ——
+        # 那种"假件绿、真窗口空"的漂移由 `TestFakeUiMatchesTheRealOne` 钉住。
+        fact["timeline"] = [dict(entry) for entry in self.timeline]
+        widget = self._window if self._window is not None else self._probe_widget
+        if widget is None:
+            return fact
+        for key, getter in (("visible", "get_visible"), ("realized", "get_realized"),
+                            ("mapped", "get_mapped")):
+            try:
+                fact[key] = bool(getattr(widget, getter)())
+            except Exception:                                    # noqa: BLE001 对象已被收走
+                fact[key] = None
+        return fact
+
+    def forget(self) -> None:
+        """丢掉"只为诊断留着"的窗口引用（注入决策做完调用，别让一个 widget 常驻）。"""
+        self._probe_widget = None
+        self._release_waiters = []
 
     def _apply(self, event: tuple) -> bool:
         """主线程里真正改窗口（`GLib.idle_add` 的回调，返回 False 表示只跑一次）。"""
@@ -230,11 +395,14 @@ class VoiceUi:
             return
         Gtk, _Gdk, _Pango = _gtk()
         self._window = Gtk.Window(type=Gtk.WindowType.TOPLEVEL)
+        self._probe_widget = self._window
         self._window.set_title(self.title)
         self._window.set_default_size(REVIEW_WIDTH, REVIEW_HEIGHT)
         self._window.set_position(Gtk.WindowPosition.CENTER)
         self._window.connect("delete-event", lambda *_a: (self._finish("closed"), True)[1])
         self._window.connect("key-press-event", self._on_key)
+        for kind, signal in LIFECYCLE_SIGNALS.items():
+            self._window.connect(signal, partial(self._record, kind))
 
         box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
         box.set_border_width(10)
@@ -377,6 +545,9 @@ class VoiceUi:
             return
         self._done = True
         self._action = action
+        # 先打点再销毁：`enter_ms` 要量的是"用户按下 Enter → 注入"这一整段，
+        # 从销毁之后才开始算会把最可疑的那几十毫秒洗掉。
+        self.timeline.append({"kind": "finish", "us": int(self._clock()), "action": action})
         if self._window is not None:
             try:
                 self._window.destroy()                     # 销毁 = 焦点自然归还，不做任何手动抢回

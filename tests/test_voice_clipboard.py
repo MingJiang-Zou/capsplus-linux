@@ -1014,7 +1014,10 @@ class TestSandboxGuard(unittest.TestCase):
             log = P.log_path()
             self.assertTrue(str(log).startswith(str(SANDBOX)), log)
             self.assertTrue(log.exists(), "沙箱里没有日志 = 这条链没真跑过，上面两条都是空的")
-            self.assertIn("剪贴板还原", log.read_text(encoding="utf-8", errors="replace"))
+            # 2026-10-17 起这行是**可解析**的 `restore_diag branch=… still_ours=…`（散文行
+            # 「剪贴板还原 …」已经废掉）：断言它落在 `restored` 分支，比原来只认"有这么一行"更硬。
+            self.assertIn("restore_diag branch=restored",
+                          log.read_text(encoding="utf-8", errors="replace"))
 
 
 if __name__ == "__main__":
