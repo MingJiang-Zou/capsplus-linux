@@ -132,12 +132,19 @@ capsplus/       CLI 与映射真相源（render / apply / status）
   mapping_overrides.py  用户键位覆盖层 `~/.config/capsplus/mappings.toml`（只存改过的那几条）
   apply.py          备份 -> 安装 -> reload -> 查错 -> 必要时回滚
   settings_logic.py 设置窗口的纯逻辑层（校验 / 覆盖层增删 / 宏事件计数 / 编辑条"第 N 行是谁" / apply 文案），不 import gi
+  voice_proto.py    语音输入线格式的唯一口径（socket 路径 / 帧 / 超时 / 0600 / voice.log），不 import gi
+  voice_vad.py      能量门与端点判定（纯函数；夹具是真采的 16k 单声道 PCM），不 import gi
+  voice_asr.py      识别客户端：PCM 拼 WAV 头 → POST 本机 voice-svc；服务不在也给"下一步敲什么"，不 import gi
+  voice_inject.py   上屏后端的**运行时探测** + 命令序列（键码现读内核头文件，不许写死数字），不 import gi
+  voice_recorder.py arecord 采集 → 边采边喂 VAD → 回调交出（on_state/on_result/on_error），不 import gi
+  voice_worker.py   常驻服务端（Qbar 式 socket 单实例），把上面四层串成一条 utterance 链路
+  voice_osd.py      确认弹窗（GTK3；**只有 review 页可聚焦可编辑**，按键语义下沉成纯函数 key_action）
 tray/           GTK3 + AyatanaAppIndicator3 托盘（capsplus-tray）
 qbar/           GTK3 浮层启动器（capsplus-qbar）
   logic.py          不依赖 gi 的纯逻辑层（fuzzy / 算术 / 历史 / 搜索编排）
   search_config.py  快速链接的 TOML 配置层：五种类型、校验、预览、表单条取值、写回（同样不 import gi）
 settings/       GTK3 设置窗口（capsplus-settings）—— **只摆控件，两页表格一律只读**；算法都在上面那两个纯层里
-bin/            capsplus / capsplus-tray / capsplus-qbar / capsplus-settings / keyd-qbar-cmd
+bin/            capsplus / capsplus-tray / capsplus-qbar / capsplus-settings / keyd-qbar-cmd / capsplus-voice
 assets/         自画的两个托盘 SVG（启用/暂停）
 packaging/      应用菜单 .desktop（只放 Qbar 与设置两条）、autostart .desktop、systemd --user unit
               —— 模板里一律用 @BIN_DIR@ / @REPO_DIR@，由 install.sh 换成实际路径
@@ -279,6 +286,64 @@ command(<你的 bin 目录>/keyd-qbar-cmd)     # 渲染时按 Path.home()/.local
 ```
 
 这文件归你自己按下去（它属于"动 sudo 面"），我不替你装。
+
+## 语音输入（Caps+M）
+
+**一句话**：按 `Caps+M` 说话 → 本机 SenseVoice 识别 → 弹一个**可编辑**的确认框 → 回车，文本落进光标。
+全程不出本机（唯一的网络动作是打一个 loopback 的识别口，见 [`docs/PRIVACY.md`](docs/PRIVACY.md)）。
+
+键位是**用户覆盖层**加的一条 —— 没有动仓内 `mapping_data.py`（`m` 在上游表里本来就空着）：
+
+```toml
+[capl]
+m = "command(<你的 ~/.local/bin>/capsplus-voice toggle)"
+```
+
+写完跑 `capsplus apply` 生效，回滚就是把这两行删掉再 apply。链路（每段都在本机）：
+keyd `command()`（**以 root 执行**）→ `bin/capsplus-voice` 降权（runuser + 只报一个显示后端、另一个用
+`env -u` 摘掉）→ `capsplus/voice_worker.py`（Qbar 式 socket 单实例，`~/.local/state/capsplus/voice.sock`，
+**0600**）→ `arecord -f S16_LE -r 16000 -c 1` → 能量门 VAD → `POST http://127.0.0.1:18090/asr-upload?lang=zh`
+→ **确认弹窗**（Enter 上屏 / Shift+Enter 换行 / Esc 丢弃）→ **窗口销毁之后**才发注入
+（`wl-copy` → `ydotool key 29:1 47:1 47:0 29:0`，键码从内核头文件现读，不写死数字）。
+
+实测数字（2026-10-17，本机，不是估算）：
+
+| 项 | 数 | 怎么测出来的 |
+| --- | --- | --- |
+| 出字延迟 | 5.59 秒真人中文语音 → **273ms**（含 HTTP 往返） | POST `test_wavs/zh.wav` 给真服务 |
+| 识别服务常驻 | **RSS 408MB**、**不占 GPU** | 本机 `ps`；4070S 的 12G 已被别的常驻服务吃到 11.5G，ASR 也不去抢 |
+| 底噪 / 语音 | 房间底噪 **RMS≈19、峰值 108**；语音 **RMS≈4330、峰值 27611**（差约 200 倍） | 真采 3 秒；`voice_vad.py` 的夹具就是这段 |
+
+**能量门是主闸，不是保险**：把 3 秒**纯底噪**喂给真服务，实测返回 `{"ok":true,"text":"我"}`
+（早先另一段返回「嗯」）—— 没有 VAD，环境音就会自己往你光标里塞字。门限
+`max(150, min(1000, 4×前300ms底噪RMS))` 两头各挡一件事：
+
+- **下限 150** 挡"底噪太轻、门形同虚设"（底噪 19 时 `4×19=76` 连门槛都摸不到）；
+- **上限 1000** 挡**另一头**的失真，这条是被真实故障逼出来的：按键后**立刻**张口，校准窗里装的全是
+  人声 ⇒ 门被抬到语音自己的 4 倍 ⇒ 整句截成 270ms 碎片。单测版钉的同一形状（`voice_vad.py`）：
+  一段平稳 4200 RMS 的音频被抬高的门在 960ms 处判成"说完"。
+- 没人说话时整链安全收尾，实测 `voice.log` 序列
+  `recording 开始采集 → 采集结束（endpoint） → idle 没检测到说话`（约 3 秒，没弹窗、没注入）。
+
+**为什么录音期一个窗口都不建**：xdg-shell 里没有"别给我焦点"这种请求，`set_accept_focus(False)`
+只是 X11 hint 的等价物，**拦不住合成器** ⇒ "绝不抢焦点"唯一可靠的实现就是那时候根本没有窗口。
+要现场指示：`CAPSPLUS_VOICE_BADGE=1`（自担风险），或事后看 `capsplus-voice status`。
+
+**为什么上屏走"剪贴板 + Ctrl+V"**：Wayland 下逐字打中文的路本机实测**全断**（三条协议/工具的逐条
+证据与复现方法在 [`docs/KNOWN-LIMITS.md`](docs/KNOWN-LIMITS.md)）。副作用必须说明白：**这一步会覆盖
+你剪贴板里原有的内容，当前没有"粘完再恢复"的实现**。探测没过（比如 `ydotoold` 不在跑）时自动降级成
+"只写进剪贴板、提示你自己按 Ctrl+V"，此时结果 `ok=False` —— **不算上屏成功，不许当成功报**。
+
+依赖与开关：`ydotool` / `wl-clipboard` / `arecord`（PipeWire 的 ALSA 兼容层）/ GTK3（`python3-gi`），
+外加识别服务 `voice-svc`（`systemctl --user enable --now voice-svc`；unit 模板在 `~/voice-svc/
+voice-svc-user.service`，模型在 `~/.cache/sherpa-onnx/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-int8-2025-09-09/`）。
+可覆盖：`CAPSPLUS_VOICE_BACKEND=clipboard|primary|manual`、`CAPSPLUS_ASR_HOST/PORT/LANG`。
+
+**未实测清单（别当已验证，这几条只有真桌面 + 真人能清）**：① 弹窗销毁后焦点是否真还给原文档；
+② `Ctrl+V` 在 Edge / Chrome / GNOME 终端 / LibreOffice / VS Code 里的实际落点与适用面；
+③ **ibus / libpinyin 在场时 Enter 会不会被输入法吃掉** —— 头号风险，代码里已有 `key_action`
+但没在真输入法下跑过；④ 打字中途按 `Caps+M`，键声会不会被误判成语音（完全未测）；
+⑤ 跨线程碰 GTK 会**段错误 rc=139**（试过，已在代码里禁止，但真 Wayland 下的长期稳定性未测）。
 
 ## 键位表（由 `capsplus/mapping_data.py` 生成，`tools/gen-readme.py` 重新生成）
 
@@ -522,10 +587,15 @@ keyd 的一条 `macro(...)` 里累计发出的按键事件**超过 15 个就不�
 
 ## 隐私：本机留了什么
 
-不联网、不上传、不埋点（全仓没有任何网络请求代码，实测 2026-10-16）。但它会在
-`~/.local/state/capsplus/` 与 `~/.config/capsplus/` 里写文件，其中两处**真的会记下你搜过什么**：
+没有任何数据离开本机：不上传、不埋点、不自更新。全仓**唯一的网络动作**是语音输入向
+`127.0.0.1:18090` 发的一次识别请求（`capsplus/voice_asr.py` 用 `urllib.request`，只打 loopback；
+自证：`ss -ltnp | grep 18090` 的持有者是 `~/voice-svc`，跑的是本机 SenseVoice 模型，2026-10-17 实测
+5.59 秒语音 273ms 回文本）—— 口径修正说明：本句原写"全仓没有任何网络请求代码（实测 2026-10-16）"，
+那是加了语音输入**之前**的结论，现已不成立，别再照它行事。
+但它会在 `~/.local/state/capsplus/` 与 `~/.config/capsplus/` 里写文件，其中两处**真的会记下你搜过什么**：
 `qbar-history.json` 的键是最终 URL（带 URL 编码的关键词），`qbar.log` 的 `activate` 行带结果标题
-（形如「必应搜索：<关键词>」）。位置、保留策略、怎么清、贴截图/日志之前该删什么，
+（形如「必应搜索：<关键词>」）；另外 `voice.log` **只记状态与字节数、不记你说过的话**，
+而上屏那一步**会覆盖系统剪贴板且当前不恢复**。位置、保留策略、怎么清、贴截图/日志之前该删什么，
 逐条写在 [`docs/PRIVACY.md`](docs/PRIVACY.md)。
 
 ## 许可与上游

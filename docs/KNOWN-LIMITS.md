@@ -348,3 +348,78 @@ r = searchParams.get("q")?.trim() ?? e.get("prompt")
 结论：**别把"活没活"的通道设计成扩展回包**，一律读 journal
 （`[raise-browser] probe default=… windows=N on-current=M`），Qbar 的判活就是这么做的
 （后台线程：发 Probe → 跑主循环 400ms → `journalctl --user --since …`）。
+
+---
+
+## 语音输入的上屏：Wayland 下"打中文"三路全断（2026-10-17 本机逐条实测）
+
+本节解释的是 `capsplus/voice_inject.py` 为什么长成那样（只有一个默认后端 `clipboard`，
+且它**先探测再动手**）。本机环境：Ubuntu 26.04.1 / GNOME Shell 50.1 / 会话 `Type=wayland`。
+
+### 1. mutter 没实现 `zwp_virtual_keyboard` 与 `zwp_input_method` ⇒ `wtype` 在 GNOME 必死
+
+- **实测日期**：2026-10-17。
+- **怎么验的**：对 `libmutter-18.so.0` 数协议名字串 —— `zwp_virtual_keyboard=0`、`zwp_input_method=0`，
+  只有 `zwp_text_input_manager_v3=1`（那是给输入法客户端用的，不是注入通道）。
+- **后果**：`wtype` 依赖前两个协议，装上也用不了；别拿它当退路。
+
+### 2. `libei`（本机 `libeis1` 1.5.0-3）导出符号里 **keysym 数 = 0**
+
+- **怎么验的**：`nm -D` 只读段数符号 —— keysym 类 0 条，只有 evdev 键码那条路。
+- **后果**：想靠 libei/portal"输入 Unicode 字符"在本机不成立（打不出汉字）。
+
+### 3. uinput 只有键码 ⇒ `ydotool type` / `dotool type` **打不出中文**
+
+- 逐字符映射到键盘布局，汉字没有键位；上游也认：`ydotool` issue **#249 / #22 至今 open**。
+- **所以**：注入只能发**键鼠事件**（Ctrl+V / 中键），文本本身走 `wl-copy`。
+  本仓**不许**再实现"逐字打字"的任何变体。
+
+### 4. 本机这版 ydotool 吃的确实是 evdev 键码（不是键名）
+
+- **怎么验的**：发键码 `37`，`keyd monitor` 报回来的键名是 `k`（`KEY_K=37`）⇒ 映射对得上。
+- 于是 `29`=左 Ctrl、`47`=`V`，注入序列就是 `ydotool key 29:1 47:1 47:0 29:0`。
+- **但数字不许写死**：键码一律从 `/usr/include/linux/input-event-codes.h` 现读
+  （`voice_inject.read_keycodes()`），头文件里查不到的键直接判"未验证"，**不许猜**。
+
+### 5. 客户端只认 `YDOTOOL_SOCKET`；`YDOTOOL_SOCKET_PATH` 被**静默忽略**
+
+- **症状**（踩过，浪费过一小时）：设了 `YDOTOOL_SOCKET_PATH=/run/ydotool.sock` 仍报
+  `failed to connect socket '/run/user/<uid>/.ydotool_socket'` —— 环境变量根本没进它眼里。
+- **怎么验的**：`ydotool` 不带参数的用法文本最后一行写着真名（`YDOTOOL_SOCKET`）。
+- **口径**：要改 socket 位置就设 `YDOTOOL_SOCKET`；本仓不依赖它（守护就把 socket 建在
+  `$XDG_RUNTIME_DIR` 下的默认名，客户端只要带着 `XDG_RUNTIME_DIR` 就能找到）。
+
+### 6. `ydotool key --help` **不能**用来探测语法
+
+- **实测**：把 `YDOTOOL_SOCKET` 指到一个不存在的 socket 后，`key abc` / `key ctrl+a` /
+  `key 30:1 30:0` 全都报**同一句** socket 错（rc=2）—— 它**先连 daemon 再解析参数**，
+  参数根本没被读过。
+- **于是探测换成两条能落地的**（见 `voice_inject.py`）：① 读**已安装那个二进制自己**的只读段
+  里的用法文本（`Syntax: <keycode>:<pressed>` / `0x40 - Mouse down`）来判断它认键码还是键名；
+  ② daemon 活着与否用**空参数** `ydotool key` 判 —— 0 个键码 = 0 个事件，不会往用户屏幕上打东西。
+
+### 7. 「主选区 + 中键粘贴」被**否决**（代码里留着，但别当默认用）
+
+- 中键是按**指针位置**粘贴，不是按光标位置：指针停在哪儿就贴到哪儿，在浏览器还会**开新标签页**。
+- 语音输入的语义是"贴到我刚才打字的地方"，指针位置与它无关 ⇒ **默认后端只能是 `clipboard`**。
+  `primary` 只在"光标本来就在指针底下"这种人手里有意义。
+
+### 8. 注入守护的形状：为什么是 **system 级 root 单元**，不能用包默认的 user 单元
+
+- 现状（本机运维事实，2026-10-17）：单元 `/etc/systemd/system/ydotoold.service`（root），
+  socket 建在 `$XDG_RUNTIME_DIR` 下的 `.ydotool_socket`，属 **`root:input 0660`**；
+  `/dev/uinput` 是 `root:input 660`（Debian `80-uinput.rules` 生效）；本用户已加入 `input` 组。
+- **关键一条**：**组变更对已经在跑的会话无效** —— 走包默认的 user 单元就得等注销重登，
+  而"不许打断用户干活"是本仓红线（KNOWN-LIMITS 上面几条就是为此立的）。
+  root 级守护不需要重登；而 **`runuser` / `sudo -u` 会重读组** ⇒ 实际按键路径当场可用。
+- **实测**：`voice_inject.run_probe()` 经 runuser 跑 → `verified=True`；从**改动前的旧会话进程**里跑
+  → 报"未验证"。**别拿后者下结论**（这就是 `Probe.ydotool_daemon is None/False` 要如实报出来的原因）。
+- 包自带的 user 单元 `ydotool.service` 已 `disable`：两个守护会同 socket 撞车，报
+  `Another ydotoold is running with the same socket`。
+
+### 9. 未实测（本节撑不起来的部分，别顺着往下信）
+
+① 弹窗销毁后焦点是否真还给原文档；② `Ctrl+V` 在 Edge / Chrome / GNOME 终端 / LibreOffice / VS Code
+里的实际落点与适用面；③ **ibus / libpinyin 在场时 Enter 会不会被输入法吃掉**（头号风险，
+`voice_osd.key_action` 已备但没在真输入法下跑过）；④ 打字中途按 `Caps+M`，键声会不会被能量门误判成
+语音；⑤ 跨线程碰 GTK 会**段错误 rc=139**（试过并在代码里禁止，真 Wayland 下的长期稳定性未测）。

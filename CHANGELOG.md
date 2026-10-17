@@ -7,6 +7,63 @@ GitHub 仓库的 Releases 页。版本号唯一落点是 `capsplus/__init__.py` 
 
 ---
 
+## 未发布 —— 语音输入（Caps+M）
+
+主题：**在本机全离线地把"说话"变成"光标处的文字"**。键位走用户覆盖层（`m` 在上游表里本来就空着），
+**没有动仓内 `mapping_data.py`**；识别是 loopback 上的本机 SenseVoice，一个字节都不出本机。
+
+### 链路
+
+`Caps+M` → keyd `command()`（root）→ `bin/capsplus-voice` 降权（runuser + 只报一个显示后端）
+→ `voice_worker.py`（Qbar 式 socket 单实例，`~/.local/state/capsplus/voice.sock`，0600）
+→ `arecord -f S16_LE -r 16000 -c 1` → 能量门 VAD → `POST http://127.0.0.1:18090/asr-upload?lang=zh`
+→ **可编辑确认弹窗**（Enter 上屏 / Shift+Enter 换行 / Esc 丢弃）→ **窗口销毁之后**才注入
+（`wl-copy` → `ydotool key 29:1 47:1 47:0 29:0`）。
+
+### 实测数字（2026-10-17，本机，不是估算）
+
+| 项 | 数 |
+| --- | --- |
+| 出字延迟 | 5.59 秒真人中文语音 → **273ms**（含 HTTP 往返） |
+| 识别服务常驻 | **RSS 408MB**、**不占 GPU**（本机 4070S 的 12G 已被别的常驻服务吃到 11.5G） |
+| 底噪 / 语音能量 | 房间底噪 **RMS≈19、峰值 108**；语音 **RMS≈4330、峰值 27611**（差约 200 倍） |
+
+### 三条护栏（这次真正的工程量在这儿）
+
+- **能量门是主闸，不是保险**：3 秒**纯底噪**喂给真服务实测返回 `{"ok":true,"text":"我"}`
+  （早先另一段返回「嗯」）⇒ 没有 VAD 就会让环境音往用户光标里塞字。门限
+  `max(150, min(1000, 4×前300ms底噪RMS))`：下限 150 挡"底噪太轻门形同虚设"，**上限 1000 是被真实
+  失真逼出来的** —— 按键后立刻张口时校准窗装的全是人声，门被抬到语音自己的 4 倍，把整句截成
+  270ms 碎片（单测钉的同一形状：4200 RMS 平稳音频在 960ms 处被自己判成"说完"）。
+  夹具是真采的 PCM（`tests/test_voice_vad.py`），不是合成的理想波形。
+- **录音期一个窗口都不建**：xdg-shell 没有"别给我焦点"的请求，`set_accept_focus(False)` 拦不住
+  合成器 ⇒ "绝不抢焦点"的唯一可靠实现就是那时候根本没窗口。要指示用 `CAPSPLUS_VOICE_BADGE=1`（自担风险）。
+- **注入先探测再动手**：键码从内核头文件现读（不写死数字），探测没过就**拒绝注入**并如实报
+  "未验证"；此时降级成"只写剪贴板 + 提示你自己 Ctrl+V"，且结果 `ok=False` —— **不许当成功报**。
+  为什么只能这么绕：Wayland 下逐字打中文的路本机实测全断，逐条证据与复现方法写进
+  `docs/KNOWN-LIMITS.md`「语音输入的上屏」一节。
+
+### 现状与未做（写清楚，别让下一个人以为已完成）
+
+- **剪贴板会被覆盖且不恢复**：`voice_inject.py` 里没有 `wl-paste` 备份、没有延时回写（grep 得空）。
+  计划形态是"临时写入 → 粘贴 → 约 800ms 后恢复原内容"，**这轮没实现**。详见 `docs/PRIVACY.md` 第四节。
+- **未实测清单**（只有真桌面 + 真人能清）：① 弹窗销毁后焦点是否真还给原文档；② `Ctrl+V` 在
+  Edge / Chrome / GNOME 终端 / LibreOffice / VS Code 的实际落点与适用面；③ **ibus / libpinyin 在场时
+  Enter 会不会被输入法吃掉**（头号风险，`voice_osd.key_action` 已备但没在真输入法下跑过）；
+  ④ 打字中途按 `Caps+M`，键声会不会被误判成语音；⑤ 跨线程碰 GTK 会**段错误 rc=139**
+  （试过、已在代码里禁止，但真 Wayland 下长期稳定性未测）。
+- 判据：新增 `tests/test_voice_{proto,vad,asr,inject,portability}.py` 五个模块（含"假探针不许碰真系统"、
+  "底噪必须判无语音"、"探测没过绝不发命令"这类反例具型）。2026-10-17 实跑
+  `python3 -m unittest discover -s tests` → **579 条 OK（skipped=44）**。
+- 运维副作用（都不在本仓安装范围内，属本机配置）：新增依赖 `ydotool` / `wl-clipboard` / `arecord` /
+  GTK3；注入守护走 **system 级 root 单元** `ydotoold.service`（原因：组变更对已跑会话无效，
+  不能等用户注销重登），本用户加入 `input` 组，包自带的同名 user 单元已 `disable` 防撞车；
+  识别服务 `voice-svc` 需 `systemctl --user enable --now voice-svc`（unit 模板与模型都在仓外）。
+- 回滚：删 `mappings.toml` 里那两行再 `capsplus apply`（本次 apply 的备份在
+  `~/.local/state/capsplus/keyd-conf-backup/capslock-plus.conf.20261017-150609-494922`）；
+  `capsplus-voice stop` 收 worker；`systemctl --user disable --now voice-svc` 收服务。
+- **`capsplus/__init__.py` 的 `__version__` 这次不动**（本仓规矩：打 tag 时与 CHANGELOG 一起同步）。
+
 ---
 
 ## 0.2.0 —— 2026-10-16

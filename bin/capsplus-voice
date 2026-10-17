@@ -1,0 +1,107 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-only
+# Copyright (c) 2026 capsplus-linux contributors
+# 本文件属 capsplus-linux —— CapsLock+ v3.3.0 的 Linux 移植（衍生作品）；按键映射数据译自上游：
+#   上游 https://github.com/wo52616111/capslock-plus （GPL-2.0，© wo52616111）；改动见 README「许可与上游」。
+# keyd 用：`command(...)` 以 **root** 执行，拉用户态进程必须降权 + 带上会话环境。
+#   整段降权思路照抄 `bin/keyd-qbar-cmd`（那个文件是这套写法的标准模板）。
+#
+# 用法：
+#     capsplus-voice toggle     # 按键绑这个：空闲→开录；录音中→送识别；弹窗开着→丢弃
+#     capsplus-voice start      # 只开录（worker 不在就自己把它拉起来）
+#     capsplus-voice stop       # 收尾/取消；worker 本来就空闲时 = 关掉常驻进程
+#     capsplus-voice status     # 一页看全：worker / 识别服务 / 上屏探测 / 弹窗（排查就从这里）
+#
+# 三条不许改的口径（都在 docs/KNOWN-LIMITS.md 与 tests/ 的判据里）：
+#   ① shebang 是 `#!/bin/sh`（本机是 dash）—— **不许用 bash 数组**，`A=(…)` 会当场
+#      syntax error，而 keyd 那边不报错、只是按键没反应（2026-10-16 栽过一次）。
+#      校验走 `tests/test_voice_portability.py`：按脚本**自己的 shebang** 选解释器跑 `-n`。
+#   ② 用户名 / uid / 家目录**一律不写死**：目标用户 = `CAPSPLUS_USER`，否则取本文件（软链解析后）
+#      的属主 —— install.sh 把入口软链进用户自己的 ~/.local/bin，属主就是装它的那个人。
+#   ③ 显示后端**只报一个**：有 Wayland 就不报 DISPLAY（同时报两个会让 Chromium 系另起窗口）。
+set -eu
+
+SELF="$(readlink -f "$0" 2>/dev/null || echo "$0")"
+REPO_DIR="$(dirname "$(dirname "$SELF")")"
+
+USER_NAME="${CAPSPLUS_USER:-$(stat -Lc '%U' "$SELF" 2>/dev/null || id -un)}"
+USER_UID="$(id -u "$USER_NAME" 2>/dev/null || id -u)"
+USER_HOME="$(getent passwd "$USER_NAME" | cut -d: -f6)"
+# CAPSPLUS_RUN_DIR：运行目录覆盖口。两个用处 —— ① 非标准的 seat 布局；
+# ② 判据（tests/test_voice_portability.py）能在**没有 root、没有真 Wayland socket** 的机器上
+#    把"后端只报一个"的四种场景真跑一遍（照 keyd-qbar-cmd 只 grep 源码是测不出分支走错的）。
+RUN_DIR="${CAPSPLUS_RUN_DIR:-/run/user/$USER_UID}"
+
+# 不带参数默认 **toggle**（不是 status）：keyd 的 `command()` 能不能把参数传给脚本，本仓既有用法
+# （`command(.../keyd-qbar-cmd)`）全是无参数的，**没实测过带参**。万一 keyd 只 exec 第一个 token，
+# 这颗 Caps+M 就退化成"查个状态"的哑键 —— 宁可默认去做该做的事。带参数时照旧走参数。
+CMD="${1:-toggle}"
+case "$CMD" in
+  toggle|start|stop|status) ;;
+  *) echo "用法: capsplus-voice toggle|start|stop|status" >&2; exit 2 ;;
+esac
+if [ "$#" -eq 0 ]; then set -- toggle; fi
+
+# ── 解释器与入口 ─────────────────────────────────────────────────────────────
+# CAPSPLUS_REPO 可指到别处的仓（打包/测试用）；否则就用软链解析出来的仓库目录。
+REPO_DIR="${CAPSPLUS_REPO:-$REPO_DIR}"
+WORKER="$REPO_DIR/capsplus/voice_worker.py"
+if [ ! -f "$WORKER" ]; then
+    echo "capsplus-voice: 找不到 $WORKER（CAPSPLUS_REPO 指对了吗？先跑一次 ./install.sh）" >&2
+    exit 1
+fi
+PYTHON="${CAPSPLUS_PYTHON:-}"
+if [ -z "$PYTHON" ]; then
+    for c in "$(command -v python3 2>/dev/null || true)" /usr/bin/python3; do
+        if [ -n "$c" ] && [ -x "$c" ]; then PYTHON="$c"; break; fi
+    done
+fi
+if [ -z "$PYTHON" ]; then
+    echo "capsplus-voice: 找不到 python3（本仓只用标准库，装 python3 就行）" >&2
+    exit 1
+fi
+
+# ── 显示后端：只报一个，且不凭空造（同 keyd-qbar-cmd）─────────────────────────
+# 比模板再硬一点：选定一个之后**把另一个从环境里摘掉**（`env -u`）。
+# 原因（README「网页端…/2026-10-16 追加」那节）：调用方（keyd 的 root 环境、或某个终端会话）
+# 可能本来就带着 DISPLAY=:0，那时只"报一个"仍会留下**继承来的第二个**——
+# Chromium 系（本机 Edge）拿到两个后端就容易另起窗口而不是在原窗口开标签页。
+# `$SET_U` 不做引号包裹是有意的：它只会展开成 `-u NAME` 两个固定词，不含任何用户数据。
+SET_U=""
+if [ -n "${WAYLAND_DISPLAY:-}" ]; then
+  DISPLAY_ENV="WAYLAND_DISPLAY=$WAYLAND_DISPLAY"
+  SET_U="-u DISPLAY"
+elif [ -S "$RUN_DIR/wayland-0" ]; then
+  DISPLAY_ENV="WAYLAND_DISPLAY=wayland-0"
+  SET_U="-u DISPLAY"
+elif [ -n "${DISPLAY:-}" ]; then
+  DISPLAY_ENV="DISPLAY=$DISPLAY"
+  SET_U="-u WAYLAND_DISPLAY"
+else
+  DISPLAY_ENV="DISPLAY=:0"
+  SET_U="-u WAYLAND_DISPLAY"
+fi
+
+# 会话环境：四个变量一份，两条 exec 路径共用（引号包着，家目录带空格也不会被拆开）
+ENV_HOME="HOME=$USER_HOME"
+ENV_RUNTIME="XDG_RUNTIME_DIR=$RUN_DIR"
+ENV_DBUS="DBUS_SESSION_BUS_ADDRESS=unix:path=$RUN_DIR/bus"
+
+# root（keyd 的 command()）才需要降权；用户自己在终端敲就别绕 runuser 那一道了。
+if [ "$(id -u)" -eq 0 ]; then
+    # runuser 在 /usr/sbin，root 的 PATH 里也不一定带 —— 三个位置挨个试
+    RUNUSER=""
+    for c in "$(command -v runuser 2>/dev/null || true)" /usr/sbin/runuser /sbin/runuser; do
+        if [ -n "$c" ] && [ -x "$c" ]; then RUNUSER="$c"; break; fi
+    done
+    if [ -z "$RUNUSER" ]; then
+        echo "capsplus-voice: 找不到 runuser（属于 util-linux）" >&2
+        exit 1
+    fi
+    exec "$RUNUSER" -u "$USER_NAME" -- env $SET_U \
+        "$ENV_HOME" "$ENV_RUNTIME" "$DISPLAY_ENV" "$ENV_DBUS" \
+        "$PYTHON" "$WORKER" "$@"
+fi
+
+exec env $SET_U "$ENV_HOME" "$ENV_RUNTIME" "$DISPLAY_ENV" "$ENV_DBUS" \
+    "$PYTHON" "$WORKER" "$@"

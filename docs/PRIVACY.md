@@ -5,12 +5,21 @@
 
 # 隐私：本项目在你机器上留下什么
 
-先给结论：**本项目不联网、不上传任何东西**（2026-10-16 实测：全仓没有 `urllib.request` /
-`http.client` / `socket.AF_INET` / `requests` 之类调用；唯一的"网络动作"是把拼好的搜索 URL
-交给浏览器打开，那之后就是浏览器的事了）。
+先给结论：**没有任何数据离开本机**（2026-10-17 修正口径）。
 
-但它会在你家目录里**写文件**，其中有两处真的会记下你搜过什么。下面逐条列出位置、内容、
-保留策略与清理办法。
+> 原话是"全仓没有 `urllib.request` / `http.client` / `socket.AF_INET` / `requests` 之类调用
+> （2026-10-16 实测）"—— **那句已经不成立了**，别照它行事：加了语音输入之后，
+> `capsplus/voice_asr.py` 确实 `import urllib.request`。
+
+现在的事实是：全仓**唯一的网络动作**是语音输入向 `127.0.0.1:18090` 发一次识别请求
+（`POST /asr-upload?lang=zh`，只打 loopback，超时/寻址都在 `voice_asr.py` 里， host 默认 `127.0.0.1`）。
+自证两条：`ss -ltnp | grep 18090` 看监听者 —— 是本机的 `voice-svc`（SenseVoice 本地模型，
+`~/voice-svc/daemon.py`，不联网、模型常驻本机），**没有任何远端**。
+除此之外唯一的"网络"仍是把拼好的搜索 URL 交给浏览器打开，那之后就是浏览器的事了。
+不上传、不埋点、不自更新。
+
+但它会在你家目录里**写文件**，其中两处真的会记下你搜过什么；语音输入另加一处**剪贴板副作用**
+（见第四节）。下面逐条列出位置、内容、保留策略与清理办法。
 
 ## 一、写在哪、写什么
 
@@ -27,13 +36,23 @@
 | `qbar.toml`（`~/.config/capsplus/`） | 你 / 首次打开 Qbar 自动生成 / 设置界面 | 快速链接与搜索引擎、默认引擎、`browser`、`hide_on_focus_out` | **含**：你的个人网址、`app` 类型的命令行、`file` 类型的本地路径 | 无自动清理（是你的配置，删了就没） |
 | `mappings.toml`（`~/.config/capsplus/`） | 设置界面「按键映射」 | 你改过的键位覆盖（只存改动那几条） | 不含文字，但含键位习惯 | 无自动清理 |
 | `qbar.sock` / `settings.sock` / `tray.lock` | 单实例与 flock | Unix socket / 锁文件，**不存内容** | 不含 | 进程退出即失效（socket 会被清） |
-| `/etc/keyd/capslock-plus.conf` | `capsplus apply`（sudo） | 渲染出的键位配置（含你机器上的 bin 目录绝对路径） | 含**你的家目录路径**（`command(<你的 ~/.local/bin>/keyd-qbar-cmd)`） | 由你管 |
+| `voice.sock` | 语音常驻 worker（`capsplus/voice_worker.py`） | 单实例与命令通道（换行分隔 JSON）。**权限 0600** —— 与 Qbar 那个只收一字节的 socket 不同，这条线上跑的是**你说的话**，同机别人不能连（`voice_proto.SOCK_MODE`，判据在 `tests/test_voice_proto.py`） | 传输瞬间含，**落盘不含**（socket 本身不存东西） | 进程退出即失效 |
+| `voice.log` | 语音 worker（`voice_proto.log_line`） | **只记状态与数量**，形如 `recording 开始采集` / `decoding 送识别 96000 字节` / `review 待确认 12 字` / `idle 识别失败 <code>`。**不记录识别出的文本、不记录音频**（写日志的调用点只传 `state`+`note`，`note` 里最多是字节数/字数） | 不含文字内容 | 只留**最后 200 行**，每次写整体重写 |
+| `/etc/keyd/capslock-plus.conf` | `capsplus apply`（sudo） | 渲染出的键位配置（含你机器上的 bin 目录绝对路径） | 含**你的家目录路径**（`command(<你的 ~/.local/bin>/keyd-qbar-cmd)`，语音输入还会多一条同形状的 `capsplus-voice` 行） | 由你管 |
 
-另外两个"环境变量决定行为"的点：
+另外几个"环境变量决定行为"的点：
 
 - `CAPSPLUS_QBAR_DEBUG=1` 起 Qbar → 日志里**多记一行行按键**（`key <键名> widget=…`）。
   默认关闭；开着的时候那份日志就别外传了。
 - `CAPSPLUS_BINDIR` / `CAPSPLUS_KEYD_BIN` / `CAPSPLUS_USER` 只影响路径与降权目标，不落盘。
+- **`CAPSPLUS_VOICE_BACKEND=manual`** —— 语音输入唯一"不碰剪贴板"的开关：只把识别出的文本留在
+  弹窗里由你自己复制，注入那一步整个不发（`voice_inject.BACKENDS`，默认是 `clipboard`）。
+  要隐私就设它，代价是多按一次 Ctrl+V。
+- `CAPSPLUS_VOICE_BADGE=1` 会在**录音期**也建一个窗口（可能抢焦点，默认关；纯显示，不落盘）。
+- `CAPSPLUS_ASR_HOST` / `CAPSPLUS_ASR_PORT` / `CAPSPLUS_ASR_LANG` 改识别服务的寻址。
+  ⚠ **别把它指向远端主机** —— 一旦指出去，你说过的话就出本机了（默认 `127.0.0.1`，
+  单测靠它指到本机 stub，不需要真服务）。
+- `CAPSPLUS_STATE_DIR` 只改 `voice.sock` / `voice.log` 的落点（测试注入点，不写别处）。
 
 ## 二、怎么"关"
 
@@ -51,6 +70,12 @@
    —— 历史排序就靠这个键。
 3. **想要真开关**：得在 `qbar.toml` 的 `[general]` 加两项（比如 `log` / `history`），
    写回模板与设置界面也要跟着加。**这轮没做**，列在未解决里。
+4. **语音输入这一路**（2026-10-17 新加，三条按代价从小到大）：
+   - 只想不碰剪贴板：`CAPSPLUS_VOICE_BACKEND=manual`（文本留在弹窗里，你自己复制粘贴）。
+   - 只想不留常驻：`capsplus-voice stop` 收掉 worker（下次按键会自己再起来），
+     `systemctl --user disable --now voice-svc` 收掉识别服务。
+   - 整个不要这颗键：删掉 `mappings.toml` 里那两行再 `capsplus apply`（仓内键位本来就没有 `m`）。
+   `voice.log` 本来就**只记状态不记文本**，一般不必清；要清跟 `qbar.log` 一起 `mv` 走即可。
 
 ## 三、要把截图 / 配置 / 日志贴到网上之前
 
@@ -59,6 +84,8 @@
 ```bash
 # 1) 诊断日志与搜索历史（含关键词）
 mv ~/.local/state/capsplus/qbar.log ~/.local/state/capsplus/qbar-history.json /tmp/attic-$(date +%Y%m%d)/
+# 1b) 语音的日志（只记状态与字节数，不含你说过的话；要贴 status 截图时顺手一起清）
+mv ~/.local/state/capsplus/voice.log /tmp/attic-$(date +%Y%m%d)/
 # 2) 配置原件快照（里面是你历次的个人网址）
 mv ~/.local/state/capsplus/config-backup /tmp/attic-$(date +%Y%m%d)/
 # 3) 键位备份（含你的家目录路径）
@@ -76,17 +103,31 @@ grep -c . ~/.config/capsplus/mappings.toml 2>/dev/null
   那几行删掉（或者只贴焦点相关那几行：`map` / `focus-in` / `focus-out` / `hide` / `show`）。
 - **剪贴板本身**：最后一次 `qw 你的问题` 回车之后，问题原文就留在系统剪贴板里（截图、
   共享屏幕、以及任何"粘贴一下看看"都会把它带出去）。要清就随便拷点无关文本盖掉。
+  语音输入同理且更要注意：上屏写进剪贴板的是**你说的话**，而且**不会自动恢复**（第四节）。
 
-## 四、剪贴板：只写、不读（2026-10-16 说清楚）
+## 四、剪贴板：只写、不读（2026-10-16 说清楚，2026-10-17 补第四处）
 
 Qbar 会**往系统剪贴板里放东西**（原先这句写在"本项目不做的事"里，那是不准的 —— 早就有三处在写），
-但**从不读**剪贴板内容，也不保存历史剪贴板。写入的三处：
+但**从不读**剪贴板内容，也不保存历史剪贴板。写入的四处：
 
 | 触发 | 写进剪贴板的内容 | 代码位置 |
 | --- | --- | --- |
 | `=1+2*3` 回车 | 算出来的结果（`4`） | `qbar/qbar_app.py::_activate` 的 `calc` 支 |
 | `-> date` / `-> time` | 日期 / 时间字符串 | `qbar/qbar_app.py::_run_builtin` |
 | **`qw 我的问题` 回车**（`ask` 类型） | **你输入的问题原文**，一字不改（不是 URL、不是 URL 编码串） | `qbar/qbar_app.py::_activate` 的 `ask` 支 |
+| **语音输入上屏**（`Caps+M` → 弹窗回车，默认 `clipboard` 后端） | **识别出来的那段文本**，一字不改（就是你要打进光标的内容） | `capsplus/voice_inject.py::plan` 的第一步（`wl-copy`），随后 `ydotool` 发 Ctrl+V |
+
+**语音这一处的副作用要说透（2026-10-17 现状，别按"会恢复"来用）**：
+
+- 上屏那一步会**覆盖你剪贴板里原有的内容，而且当前没有恢复的实现** —— 全仓 `voice_*.py` 里
+  没有 `wl-paste` 备份、没有延时回写（grep 得空）。所以：**拷了密码/长文再按 `Caps+M`，
+  那块内容就没了**，直到你自己再拷一次。
+- 计划中的形态是"临时写入 → 粘贴 → 约 800ms 后恢复原内容"，**这段还没落地**，
+  列在 `CHANGELOG.md` 的未发布段里；在它实现之前，上面的现状就是准的。
+- 想现在就完全不碰剪贴板：`CAPSPLUS_VOICE_BACKEND=manual`（文本只留在弹窗里，你自己复制）。
+- 探测没过（`ydotoold` 不在跑等）时会**降级**成"只写剪贴板、提示你自己按 Ctrl+V"
+  （`voice_inject.degraded_clipboard_write`，结果 `ok=False`）—— 这种情况**同样覆盖了剪贴板**，
+  而且更不会恢复，因为程序本来就当这次没成功。
 
 `ask` 这一条是本次新增，副作用要说透：
 
@@ -102,10 +143,14 @@ Qbar 会**往系统剪贴板里放东西**（原先这句写在"本项目不做�
 
 ## 五、本项目**不**做的事
 
-- 不联网、不上报、不埋点、不自更新；没有任何远端请求。
+- 不上传、不上报、不埋点、不自更新；**没有任何远端请求**（唯一的网络动作是本机 loopback 上那一次
+  识别调用，见开头那条修正口径；要指向远端只能自己改 `CAPSPLUS_ASR_HOST`，改了这条就不成立了）。
   （`ask` 只把网址交给**你自己的默认浏览器**，本仓代码自己不发一个字节到任何站点；
   问题原文是你在网页输入框里 `Ctrl+V` 之后由你按回车发出去的，发不发、发给谁都在你手里。）
 - 不记录按键流（除显式 `CAPSPLUS_QBAR_DEBUG=1`）。
-- **不读剪贴板内容**、不维护剪贴板历史（写的那三处见第五节）。
+- **不读剪贴板内容**、不维护剪贴板历史（写入的**四处**见第四节 —— 也正因为不读，
+  语音上屏覆盖掉的那块内容**取不回来**，这是现状不是设计）。
+- **音频不落盘**：语音输入采集到的 PCM 只在内存里过（喂 VAD → 拼 WAV → POST → 丢引用），
+  `voice.log` 里最多是「送识别 N 字节」这种数量（2026-10-17 读代码核对）。
 - 不动 `~/.bash_history`、其他应用的数据。
 - 不改系统配置：`/etc/keyd/` 只在你自己跑 `capsplus apply` 时写，且写之前一定先备份。
