@@ -92,8 +92,10 @@ class TestProbeLogic(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             header = fake_header(Path(tmp))
             p = I.run_probe(which=lambda name: {"wl-copy": "/usr/bin/wl-copy",
+                                                "wl-paste": "/usr/bin/wl-paste",
                                                 "ydotool": "/usr/bin/ydotool"}[name],
-                             help_runner=lambda argv: (0, "--primary\nAvailable commands:\n"
+                             help_runner=lambda argv: (0, "--primary\n--clear\n"
+                                                        "Available commands:\n"
                                                         "  key\n  click\n  type\n"),
                              binary_reader=lambda path: fake_blob(),
                              daemon_probe=lambda: (True, "可达"),

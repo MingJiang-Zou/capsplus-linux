@@ -28,7 +28,11 @@
   * **review 弹窗在主线程建窗 + 回调驱动**：后台识别完 `post(_open_review)` 回主线程建窗，
     commit/cancel 由 `voice_osd.VoiceUi.on_finish` 回调推进状态机；注入一定发生在
     窗口**销毁之后** ≥ `FOCUS_RETURN_MS`（`GLib.timeout_add` 等待，不是主线程 sleep）——
-    否则 Ctrl+V 会贴进我们自己的窗口。
+    否则 Ctrl+V 会贴进我们自己的窗口；
+  * **剪贴板的还原同一条时序模型**（2026-10-17 补）：上屏前在后台线程读一份内存快照，
+    粘贴之后由主循环 `after_ms(CLIPBOARD_SETTLE_MS, …)` 计时，到点再起一个后台线程跑
+    `voice_inject.perform_restore`。快照**只在内存**，永不落盘（判据
+    `tests/test_voice_clipboard.py::TestSnapshotNeverHitsDisk`）。
 
 为什么定成这个样子（真机事故，2026-10-17）：旧写法每个 utterance 新开一个 GTK 线程 +
 `GLib.MainLoop`，主线程 `join()` + `time.sleep` 轮询；mutter 对客户端的 ping 落在主线程
@@ -309,6 +313,9 @@ class Session:
         result = INJ.inject(text, backend=self.server.backend, probe=probe,
                             runner=self.server.run_command)
         self.inject_summary = result.describe()
+        # 快照已经在 `inject` 里读进内存了：这里只负责把"过一会儿条件还原"的等待挂到主循环。
+        # 顺序是判据：snapshot（在 inject 内，先于 wl-copy）→ 写 → 粘贴 → 还原（在这里挂出去）。
+        self.server.arm_clipboard_restore(result.restore_job, result.clipboard_note)
         self.server.broadcast(P.make_event("text", text_len=len(text),
                                            backend=result.backend, ok=result.ok,
                                            code=result.code, note=note))
@@ -338,6 +345,9 @@ class Server:
         self._session_lock = threading.Lock()
         self._probe: INJ.Probe | None = None
         self._probe_lock = threading.Lock()
+        self._clip_job: INJ.RestoreJob | None = None   # 待还原的剪贴板快照（**只在内存**）
+        self._clip_lock = threading.Lock()
+        self.clipboard_summary = ""              # 进 status 的那句话：只有动作 + 类型/字节数
         self._quit = threading.Event()
         self._idle_evt = threading.Event()
         self._idle_evt.set()                 # 没有会话 = 就是 idle
@@ -425,6 +435,56 @@ class Server:
                 self._probe = INJ.run_probe()
             return self._probe
 
+    # -- 剪贴板快照的还原（等待走主循环，读写走后台线程）------------------------
+    def arm_clipboard_restore(self, job, note: str = "") -> None:
+        """收下这次上屏的快照，把"过一会儿再还原"的**等待**挂到主循环上。
+
+        三件事都在这一个方法里定死，顺序不许调：
+          1. **为什么要等**：`wl-copy` 退出码 0 只代表选区所有权挂上了，目标应用收到 Ctrl+V
+             之后还要异步来取数据；这之前就回写等于把刚递出去的东西抽走
+             （`INJ.CLIPBOARD_SETTLE_MS` 的注释）。
+          2. **为什么用 `after_ms` 而不是 sleep**：本进程的主线程一睡，mutter 的 ping 就没人应答
+             —— 真机「无响应」弹窗的病根，判据三层见模块 docstring。`after_ms` 到点只做一件事：
+             起后台线程，主循环继续转。
+          3. **单槽**：同时只留**最早**那份快照，那才是用户原来的东西。第二次上屏赶上第一次还没
+             到点，就只把自己的文本追加进 `ours`（"还是不是我们写的"要认这两段），新快照丢弃 ——
+             拿上一次的中间态当原物还原是错的。
+        """
+        if note:
+            self._set_clipboard_summary(note)
+        if job is None:
+            return
+        with self._clip_lock:
+            pending = self._clip_job
+            if pending is None:
+                self._clip_job = job
+            else:
+                pending.ours.extend(job.ours)
+                job.snapshot.data = None          # 丢弃中间态，顺手把这份字节从内存里放掉
+        self.after_ms(job.delay_ms, self._fire_clipboard_restore)
+
+    def _fire_clipboard_restore(self) -> None:
+        """主循环到点后的动作：**只把活交给后台线程**，自己不碰子进程（形状同 `_schedule_inject`）。"""
+        threading.Thread(target=self.run_clipboard_restore, daemon=True).start()
+
+    def run_clipboard_restore(self) -> None:
+        """**后台线程**：查"还是不是我们写的那段"→ 条件还原 → 结论写进摘要。
+
+        取不到作业就是已经被前一次到点做掉了（幂等，绝不重复盖写用户的剪贴板）。
+        摘要与日志里只许出现**动作、类型、字节数**，一个内容字符都不许。
+        """
+        with self._clip_lock:
+            job, self._clip_job = self._clip_job, None
+        if job is None:
+            return
+        result = INJ.perform_restore(job, self.run_command)
+        self._set_clipboard_summary(result.describe())
+        P.log_line(f"剪贴板还原 {result.code}")        # 只有代码；内容不进日志
+
+    def _set_clipboard_summary(self, text: str) -> None:
+        with self._clip_lock:
+            self.clipboard_summary = text
+
     # -- 事件广播 ------------------------------------------------------------
     def add_watcher(self, conn) -> None:
         with self._watch_lock:
@@ -492,6 +552,7 @@ class Server:
                              vad=session.vad_summary if session else "",
                              asr=session.asr_summary if session else "",
                              inject=session.inject_summary if session else "",
+                             clipboard=self.clipboard_summary,
                              backend=self.backend,
                              history=list(self.history[-6:]), **extra)
 
@@ -690,7 +751,7 @@ def cmd_stop() -> int:
 
 
 def cmd_status() -> int:
-    """一页看全四条链路：worker / 识别服务 / 上屏探测 / 弹窗。出问题就照这一页查。"""
+    """一页看全五条链路：worker / 识别服务 / 上屏探测 / 剪贴板还原 / 弹窗。出问题照这一页查。"""
     alive, reason = P.ping()
     print(f"worker     : {reason}")
     frame = _first(send("status")) if alive else {}
@@ -702,6 +763,9 @@ def cmd_status() -> int:
             print(f"  上次识别 : {frame['asr']}")
         if frame.get("inject"):
             print(f"  上次上屏 : {frame['inject']}")
+        if frame.get("clipboard"):
+            # 只报动作 + 类型 + 字节数；剪贴板里的内容一个字都不到这里（隐私判据钉这行）
+            print(f"  剪贴板   : {frame['clipboard']}")
         for line in frame.get("history") or []:
             print(f"  · {line}")
     else:
@@ -721,6 +785,9 @@ def cmd_status() -> int:
         print(f"  {line}")
     if not probe.verified:
         print(f"  怎么办   : {INJ.unverified_reason(probe)}")
+    print("剪贴板还原 : " + ("开（粘完条件还原，只在剪贴板还是我们写的那段时动手）"
+                            if INJ.restore_from_env() else
+                            "关（CAPSPLUS_VOICE_RESTORE_CLIPBOARD=0）⇒ 上屏会覆盖且不还原"))
 
     from capsplus import voice_osd                       # 只用到纯函数，不建窗
     print(f"确认弹窗   : " + ("可用（review 期会夺焦点）" if voice_osd.ui_available()

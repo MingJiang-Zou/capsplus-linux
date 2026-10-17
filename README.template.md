@@ -304,7 +304,8 @@ keyd `command()`（**以 root 执行**）→ `bin/capsplus-voice` 降权（runus
 `env -u` 摘掉）→ `capsplus/voice_worker.py`（Qbar 式 socket 单实例，`~/.local/state/capsplus/voice.sock`，
 **0600**）→ `arecord -f S16_LE -r 16000 -c 1` → 能量门 VAD → `POST http://127.0.0.1:18090/asr-upload?lang=zh`
 → **确认弹窗**（Enter 上屏 / Shift+Enter 换行 / Esc 丢弃）→ **窗口销毁之后**才发注入
-（`wl-copy` → `ydotool key 29:1 47:1 47:0 29:0`，键码从内核头文件现读，不写死数字）。
+（**先备份剪贴板** `wl-paste` → `wl-copy` → `ydotool key 29:1 47:1 47:0 29:0`，键码从内核头文件现读，
+不写死数字 → 过 `CLIPBOARD_SETTLE_MS`（300ms）**条件还原**原剪贴板，详见下面「这颗键对剪贴板做什么」）。
 
 实测数字（2026-10-17，本机，不是估算）：
 
@@ -330,17 +331,45 @@ keyd `command()`（**以 root 执行**）→ `bin/capsplus-voice` 降权（runus
 要现场指示：`CAPSPLUS_VOICE_BADGE=1`（自担风险），或事后看 `capsplus-voice status`。
 
 **为什么上屏走"剪贴板 + Ctrl+V"**：Wayland 下逐字打中文的路本机实测**全断**（三条协议/工具的逐条
-证据与复现方法在 [`docs/KNOWN-LIMITS.md`](docs/KNOWN-LIMITS.md)）。副作用必须说明白：**这一步会覆盖
-你剪贴板里原有的内容，当前没有"粘完再恢复"的实现**。探测没过（比如 `ydotoold` 不在跑）时自动降级成
-"只写进剪贴板、提示你自己按 Ctrl+V"，此时结果 `ok=False` —— **不算上屏成功，不许当成功报**。
+证据与复现方法在 [`docs/KNOWN-LIMITS.md`](docs/KNOWN-LIMITS.md)）。
+
+**这颗键对剪贴板做什么**（2026-10-17 起是实现了的行为，不是计划；顺序就是判据）：
+
+    snapshot（wl-paste）→ wl-copy <文本> → ydotool Ctrl+V → 等 300ms → **条件还原** → 释放快照
+
+三条边界必须一起读，少读一条就会按错的假设用：
+
+- **只在"剪贴板里还是我们写的那段"时才还原**。到点先读回现值逐字节比对；你（或别的应用）在这
+  300ms 里复制了新东西 ⇒ **一律不还原** —— 把人家刚拷的东西冲掉，比不还原更糟。
+  读不回现值同样不还原（宁可少还原一次，不可错盖一次）。
+- **快照只在内存，绝不落盘**：不进文件、不进 `voice.log`、不进 socket 事件帧；对外只有
+  "类型 + 字节数"。判据 `tests/test_voice_clipboard.py::TestSnapshotNeverHitsDisk`。
+- **读不了的类型会明确告知不还原**：备份只认 `image/png` → `text/uri-list` → `text/html` →
+  `text/plain`（挑最不可再生的那一种，一次只还原一种）。像 `wayland/roles`、
+  `x-special/gnome-copied-files` 这类目标读不了 ⇒ 状态里写「剪贴板里有 <类型> 无法备份，
+  本次会覆盖且不还原」，不想被覆盖就设 `CAPSPLUS_VOICE_BACKEND=manual`。
+
+另外三点：原本剪贴板为空时还原动作是**清空**（`wl-copy --clear`，本机 wl-clipboard 2.2.1 的
+`--help` 实测有；**探不到就退化成"不还原 + 说明"**，不假设别的机器也有）；为什么必须等 300ms —
+`wl-copy` 只是挂上选区所有权，目标应用是**异步**来取数据的，太早回写等于把刚递出去的文本抽走；
+Wayland 还要求接走数据源的客户端**有键盘焦点**，常驻 worker 多半没有 ⇒ 真机可能出现"rc=0 但没还原"，
+所以还原后会**回读核对**，核对不过就报 `verify_mismatch` 而不是谎报"已还原"。
+
+探测没过（比如 `ydotoold` 不在跑）时自动降级成"只写进剪贴板、提示你自己按 Ctrl+V"，此时结果
+`ok=False` —— **不算上屏成功，不许当成功报**；这种降级**故意不还原**（你还没粘出去，还原始会把
+你要的文本抽走），粘贴那步本身失败时同样不还原。开关与口径见 [`docs/PRIVACY.md`](docs/PRIVACY.md) 第四节。
 
 依赖与开关：`ydotool` / `wl-clipboard` / `arecord`（PipeWire 的 ALSA 兼容层）/ GTK3（`python3-gi`），
 外加识别服务 `voice-svc`（`systemctl --user enable --now voice-svc`；unit 模板在 `~/voice-svc/
 voice-svc-user.service`，模型在 `~/.cache/sherpa-onnx/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-int8-2025-09-09/`）。
-可覆盖：`CAPSPLUS_VOICE_BACKEND=clipboard|primary|manual`、`CAPSPLUS_ASR_HOST/PORT/LANG`。
+可覆盖：`CAPSPLUS_VOICE_BACKEND=clipboard|primary|manual`、`CAPSPLUS_VOICE_RESTORE_CLIPBOARD=0`
+（关掉还原，回到"覆盖且不还原"的老行为；默认开）、`CAPSPLUS_ASR_HOST/PORT/LANG`。
 
 **未实测清单（别当已验证，这几条只有真桌面 + 真人能清）**：① 弹窗销毁后焦点是否真还给原文档；
 ② `Ctrl+V` 在 Edge / Chrome / GNOME 终端 / LibreOffice / VS Code 里的实际落点与适用面；
+②b **剪贴板还原的真机时序**：300ms 够不够（目标应用异步取数据要多久）、worker 无键盘焦点时
+`wl-copy` 能不能真把选区所有权接回去（判据只能验到"回读一致才算已还原"，真机成不成还没测）；
+②c **中途改剪贴板**的实测手感：300ms 内你自己拷了东西，还原会不会被频繁判否（`not_ours`）；
 ③ **ibus / libpinyin 在场时 Enter 会不会被输入法吃掉** —— 头号风险，代码里已有 `key_action`
 但没在真输入法下跑过；④ 打字中途按 `Caps+M`，键声会不会被误判成语音（完全未测）；
 ⑤ 跨线程碰 GTK 会**段错误 rc=139**（试过，已在代码里禁止，但真 Wayland 下的长期稳定性未测）。
@@ -594,9 +623,11 @@ keyd 的一条 `macro(...)` 里累计发出的按键事件**超过 15 个就不�
 那是加了语音输入**之前**的结论，现已不成立，别再照它行事。
 但它会在 `~/.local/state/capsplus/` 与 `~/.config/capsplus/` 里写文件，其中两处**真的会记下你搜过什么**：
 `qbar-history.json` 的键是最终 URL（带 URL 编码的关键词），`qbar.log` 的 `activate` 行带结果标题
-（形如「必应搜索：<关键词>」）；另外 `voice.log` **只记状态与字节数、不记你说过的话**，
-而上屏那一步**会覆盖系统剪贴板且当前不恢复**。位置、保留策略、怎么清、贴截图/日志之前该删什么，
-逐条写在 [`docs/PRIVACY.md`](docs/PRIVACY.md)。
+（形如「必应搜索：<关键词>」）；另外 `voice.log` **只记状态与字节数、不记你说过的话**。
+上屏那一步会覆盖系统剪贴板，但**粘完之后会条件还原**（口径修正说明：本句原先写"当前不恢复"，
+那是实现之前的事实，2026-10-17 已落地，别再照旧句行事）—— 三条边界：
+**只在剪贴板还是我们写的那段时才还原**、**快照只在内存不落盘**、**读不了的类型会明确告知不还原**。
+位置、保留策略、怎么清、贴截图/日志之前该删什么，逐条写在 [`docs/PRIVACY.md`](docs/PRIVACY.md)。
 
 ## 许可与上游
 

@@ -53,6 +53,7 @@ WORKER_PATH = REPO / "capsplus" / "voice_worker.py"
 MAIN_PATH_FUNCS = frozenset({
     "serve_forever", "_watchdog_tick", "_run_fallback_loop", "_open_review",
     "_on_review_outcome", "_review_failed", "_schedule_inject",
+    "_fire_clipboard_restore",
     "post", "after_ms", "request_quit", "main",
 })
 SLEEP_EXEMPT = frozenset({"wait_for_worker"})
@@ -249,6 +250,28 @@ def wait_for_worker():
         src = "threading.Thread(target=lambda: voice_osd.VoiceUi().show(), daemon=True)"
         rules = {v.split(":", 1)[0] for v in static_violations(src)}
         self.assertIn("UI-IN-THREAD", rules)
+
+    def test_clipboard_restore_callback_must_not_block(self):
+        """反例具型（2026-10-17 剪贴板还原这一轮加）：主循环到点的那个回调里一旦有阻塞调用，
+        `BLOCK-ON-MAIN-PATH` 必须红 —— 它是 `after_ms` 直接派发的，睡过去就是又一轮「无响应」。"""
+        src = '''
+class Server:
+    def _fire_clipboard_restore(self):
+        self._idle_evt.wait(1.0)          # 等子进程读写完（错误写法）
+        threading.Thread(target=self.run_clipboard_restore, daemon=True).start()
+'''
+        hits = static_violations(src)
+        self.assertTrue(any(v.startswith("BLOCK-ON-MAIN-PATH") for v in hits), hits)
+        self.assertIn("_fire_clipboard_restore", "\n".join(hits))
+
+    def test_the_shipped_callback_only_hands_the_work_over(self):
+        """正例具型：现在交付的 `_fire_clipboard_restore` 只起线程，必须在绿的那一侧。"""
+        src = '''
+class Server:
+    def _fire_clipboard_restore(self):
+        threading.Thread(target=self.run_clipboard_restore, daemon=True).start()
+'''
+        self.assertEqual(static_violations(src), [])
 
 
 # ── 无头行为：主线程门岗与三条降级（所有机器都跑，不开窗）───────────────────────

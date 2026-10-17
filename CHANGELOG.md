@@ -18,7 +18,7 @@ GitHub 仓库的 Releases 页。版本号唯一落点是 `capsplus/__init__.py` 
 → `voice_worker.py`（Qbar 式 socket 单实例，`~/.local/state/capsplus/voice.sock`，0600）
 → `arecord -f S16_LE -r 16000 -c 1` → 能量门 VAD → `POST http://127.0.0.1:18090/asr-upload?lang=zh`
 → **可编辑确认弹窗**（Enter 上屏 / Shift+Enter 换行 / Esc 丢弃）→ **窗口销毁之后**才注入
-（`wl-copy` → `ydotool key 29:1 47:1 47:0 29:0`）。
+（**备份剪贴板** `wl-paste` → `wl-copy` → `ydotool key 29:1 47:1 47:0 29:0` → 300ms 后**条件还原**）。
 
 ### 实测数字（2026-10-17，本机，不是估算）
 
@@ -45,16 +45,36 @@ GitHub 仓库的 Releases 页。版本号唯一落点是 `capsplus/__init__.py` 
 
 ### 现状与未做（写清楚，别让下一个人以为已完成）
 
-- **剪贴板会被覆盖且不恢复**：`voice_inject.py` 里没有 `wl-paste` 备份、没有延时回写（grep 得空）。
-  计划形态是"临时写入 → 粘贴 → 约 800ms 后恢复原内容"，**这轮没实现**。详见 `docs/PRIVACY.md` 第四节。
+- **剪贴板备份 + 条件还原（本轮补上）**：上屏那一步过去**只覆盖不恢复**（`voice_inject.py` 里
+  `grep wl-paste` 得空），而我早先对外说过"约 800ms 后自动恢复" —— 那句话当时没有实现撑着。
+  现在按 `snapshot → wl-copy → Ctrl+V → 等 `CLIPBOARD_SETTLE_MS`(300ms) → **条件还原** → 释放` 做成了
+  事实（`voice_inject.snapshot_clipboard` / `check_still_ours` / `perform_restore`，等待由 worker 的
+  主循环 `after_ms` 计时、读写在后台线程）。三条边界：
+  **只在剪贴板还是我们写的那段时才还原**（被别人改过就明说"剪贴板已被别处更新，未还原"，
+  不硬盖）、**快照只在内存**（不落盘、不进 `voice.log`、不进事件帧，对外只有类型与字节数）、
+  **读不了的类型明确告知不还原**（备份只认 `image/png`/`text/uri-list`/`text/html`/`text/plain`；
+  挑最不可再生的那一种，一次只还原一种）。原本剪贴板为空 ⇒ 还原是 `wl-copy --clear`（本机
+  wl-clipboard 2.2.1 的 `--help` 实测有 `--clear`；**探不到就退化成"不还原 + 说明"**，不假设）；
+  降级（`needs_manual_paste`）与粘贴失败两种情况**故意不还原**（那时文本还要留给用户自己粘）。
+  开关 `CAPSPLUS_VOICE_RESTORE_CLIPBOARD=0` 关掉还原（回到老行为，且连备份读都不做）。
+  `capsplus-voice status` 新增一行「剪贴板」，能看出上次是否真还原了。
 - **未实测清单**（只有真桌面 + 真人能清）：① 弹窗销毁后焦点是否真还给原文档；② `Ctrl+V` 在
-  Edge / Chrome / GNOME 终端 / LibreOffice / VS Code 的实际落点与适用面；③ **ibus / libpinyin 在场时
+  Edge / Chrome / GNOME 终端 / LibreOffice / VS Code 的实际落点与适用面；②b **剪贴板还原的真机
+  时序** —— 300ms 够不够、常驻 worker 没有键盘焦点时 `wl-copy` 能不能真把选区所有权接回去
+  （实现只做"回读不一致就报 `verify_mismatch`"，不谎报已还原；真机成不成未测）；②c **中途改
+  剪贴板**的实测手感（300ms 内自己拷了东西会不会频繁判否）；③ **ibus / libpinyin 在场时
   Enter 会不会被输入法吃掉**（头号风险，`voice_osd.key_action` 已备但没在真输入法下跑过）；
   ④ 打字中途按 `Caps+M`，键声会不会被误判成语音；⑤ 跨线程碰 GTK 会**段错误 rc=139**
   （试过、已在代码里禁止，但真 Wayland 下长期稳定性未测）。
 - 判据：新增 `tests/test_voice_{proto,vad,asr,inject,portability}.py` 五个模块（含"假探针不许碰真系统"、
-  "底噪必须判无语音"、"探测没过绝不发命令"这类反例具型）。2026-10-17 实跑
-  `python3 -m unittest discover -s tests` → **579 条 OK（skipped=44）**。
+  "底噪必须判无语音"、"探测没过绝不发命令"这类反例具型）。剪贴板这一轮再加
+  `tests/test_voice_clipboard.py`（顺序 / 条件还原两个方向 / 空剪贴板走 `--clear` / 隐私四条，
+  五条反例具型逐条真红过：把快照挪到 `wl-copy` 之后、删掉还原步、去掉现值检查、空剪贴板改写空串、
+  摘要里漏出快照字节）+ `tests/test_voice_mainloop.py` 两条（新增的 `after_ms` 回调进主线程名单，
+  反例具型是"回调里 `wait()` 必须红"）。2026-10-17 实跑
+  `python3 -m unittest discover -s tests` → **649 条 OK（skipped=46）**（同轮早前是 579 条）。
+  ⚠ 本轮踩到一条 GLib 事实：`idle_add` 的源会被更高优先级的挂起事件**饿死** —— 判据里用
+  `timeout_add(1)` 派发，并留 8s 硬兜底（同进程同时加载 `test_voice_mainloop` 时曾把整套卡死 45s+）。
 - 运维副作用（都不在本仓安装范围内，属本机配置）：新增依赖 `ydotool` / `wl-clipboard` / `arecord` /
   GTK3；注入守护走 **system 级 root 单元** `ydotoold.service`（原因：组变更对已跑会话无效，
   不能等用户注销重登），本用户加入 `input` 组，包自带的同名 user 单元已 `disable` 防撞车；
