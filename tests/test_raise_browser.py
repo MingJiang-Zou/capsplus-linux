@@ -265,7 +265,12 @@ class TestExtensionStatusReport(unittest.TestCase):
 
     def test_install_script_honours_quiet(self):
         t = (REPO / "tools" / "install-extension.sh").read_text(encoding="utf-8")
-        self.assertIn('"$1" = "--quiet"', t, "install-extension.sh 不支持 --quiet，unit 会刷屏")
+        # 2026-10-19：这条原先钉字面量 `"$1" = "--quiet"`。那个写法在 `set -eu` 下
+        # **无参运行会当场崩**（`parameter not set`，脚本一个文件都不复制 —— 实测过）。
+        # 所以钉的形态改成带默认值的 `${1:-}`：既保 `--quiet` 被认，又保无参不崩。
+        # 牙口不变：把它改回裸 `"$1"` 这条立刻红。
+        self.assertIn('[ "${1:-}" = "--quiet" ]', t,
+                      "install-extension.sh 的 --quiet 分支没了默认值 ⇒ 无参运行会崩（unit 会静默什么都不装）")
         self.assertIn("say()", t, "输出没走 say()，--quiet 就是假的")
 
 

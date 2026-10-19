@@ -14,7 +14,7 @@ set -eu
 
 # --quiet：只报错误与"下一步该干什么"，给 systemd oneshot 用
 QUIET=0
-[ "$1" = "--quiet" ] && QUIET=1
+[ "${1:-}" = "--quiet" ] && QUIET=1
 say() { [ "$QUIET" = 1 ] || printf '%s\n' "$1"; }
 
 UUID="raise-browser@capsplus.example"
