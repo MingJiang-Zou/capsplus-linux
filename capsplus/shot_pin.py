@@ -105,7 +105,8 @@ def pin(png_path, x: int = None, y: int = None, *, emit_fn=None, wait_fn=None,
     if emit_fn is None:
         from capsplus import shot_capture as SC
         emit_fn = lambda: SC.emit(SC.build_connection(), SF.M_PIN, SF.PIN_SIG,   # noqa: E731
-                                  SF.pin_signal_args(raw_path, width, height, int(x), int(y), ack)[4])
+                                  SF.pin_signal_args(src, raw_path, width, height,
+                                                     int(x), int(y), ack)[4])
     emit_fn()
     ok, waited = (wait_fn or (lambda p, ms: SF.wait_for_file(p, ms)))(str(ack), PIN_TIMEOUT_MS)
     if not ok:
@@ -115,3 +116,30 @@ def pin(png_path, x: int = None, y: int = None, *, emit_fn=None, wait_fn=None,
     info = parse_ack(ack.read_text(encoding="utf-8") if ack.exists() else "")
     return True, (f"✓ 已钉到 ({x}, {y})：{width}×{height}，屏幕上共 {info.get('count', '?')} 张"
                   f"（原图 {raw_path}，等了 {waited}ms）")
+
+
+def clear(*, emit_fn=None, wait_fn=None, ack_path=None, timeout_ms: int = PIN_TIMEOUT_MS) -> tuple:
+    """`Caps+Esc` 的活儿：清空屏幕上所有贴图。返回 `(ok, 说明)`。
+
+    **没有贴图时也安全**（扩展侧只是清 0 张 + 写 ack 一行 `cleared=0`）——
+    这条是硬口径：全局热键最怕"没东西时按一下就报错"，那会让明江不敢按。
+    """
+    ack = Path(ack_path) if ack_path else (raw_dir() / f"clear-{os.getpid()}.ack")
+    ack.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        if ack.exists():
+            ack.unlink()
+    except OSError as exc:
+        return False, f"✗ 清不掉旧 ack {ack}：{exc}"
+
+    if emit_fn is None:
+        from capsplus import shot_capture as SC
+        emit_fn = lambda: SC.emit(SC.build_connection(), SF.M_CLEAR, SF.CLEAR_SIG,   # noqa: E731
+                                  SF.clear_signal_args(ack)[4])
+    emit_fn()
+    ok, waited = (wait_fn or (lambda p, ms: SF.wait_for_file(p, ms)))(str(ack), timeout_ms)
+    if not ok:
+        return False, SF.timeout_report(str(ack), waited, what="清空贴图", log_grep="pin")
+    info = parse_ack(ack.read_text(encoding="utf-8") if ack.exists() else "")
+    cleared = info.get("cleared", "?")
+    return True, f"✓ 已清空贴图（清掉 {cleared} 张，屏幕上剩 {info.get('left', '?')} 张，等了 {waited}ms）"

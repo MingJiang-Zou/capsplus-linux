@@ -1,69 +1,79 @@
+#!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-2.0-only
 # Copyright (c) 2026 capsplus-linux contributors
 # 本文件属 capsplus-linux —— CapsLock+ v3.3.0 的 Linux 移植（衍生作品）；按键映射数据译自上游：
 #   上游 https://github.com/wo52616111/capslock-plus （GPL-2.0，© wo52616111）；改动见 README「许可与上游」。
-"""选区遮罩（第一批第 2 步）：GTK3 全屏半透明遮罩 + 橡皮筋 + 实时宽×高读数。
+"""选区遮罩（第二批 P0 重写）：**冻结帧当背景** + 全局坐标选区（可跨屏）+ 贴边吸附。
 
-**绝不闪**（明江换掉 Snipaste 就是因为闪）——所以本文件里没有一处动画：不 `ease`、不
-`set_opacity` 过渡、不 CSS transition，窗口一 map 就是最终样子。判据
-（`tests/test_shot_overlay.py::TestNoAnimation`）就是在扫这件事。
+为什么重写（2026-10-19 明江真机：「框选的时候全黑屏是盲选，而且貌似无法全屏选择」）：
+旧版是"全屏半透明窗 + 压暗 + 指望合成器把桌面透出来"。Wayland 下拿不到 ARGB 表面时那层
+"透明"就是**全黑** ⇒ 盲选；而 xvfb 里（X11 有 ARGB 视觉）**永远复现不了**，所以当时的像素判据
+全绿。现在：窗口背景 = **该屏的冻结图**（`capsplus/shot_frames.py` 抓的），**不透明**，
+就算 alpha 一点都拿不到，用户看到的也是真实屏幕画面 —— 盲选**从结构上不可能再发生**。
 
-顶层**不 import gi / cairo**（CI 不装 PyGObject 与 pycairo，判据：`tests/test_no_gi_smoke.py`）：
-两边都在 `_gtk()` / `_cairo()` 里懒加载。所以本文件的纯逻辑与 `paint()` 在没 gi、没显示服务器的
-机器上照样能测 —— `paint()` 只吃一个 cairo 上下文，判据把它渲染到 `ImageSurface` 上**逐像素断言**。
+同时把两件事一起治了：
+  * **跨屏/整屏**：选区用**全局逻辑坐标**，拖出单屏也照收；每块屏只画自己那一块（按屏裁剪）。
+    `Ctrl+A` = 整个联合矩形，双击 = 指针所在那块屏，拖到屏幕边缘自动吸附。
+  * **不用二次抓帧**：确认后直接从冻结图裁剪（跨屏就每屏各裁一块再拼），
+    所以旧版那套"藏窗 → settle → 再抓一帧"整段删掉了 —— 那个 settle 正是为了躲自己的遮罩，
+    现在结构上不存在这个问题。
 
-三条定死的口径：
+**绝不闪**（明江换掉 Snipaste 就是因为闪）：本文件没有一处动画。判据
+（`tests/test_shot_overlay.py::TestNoAnimation`）在扫这件事。
 
-  1. **一屏一窗**（`fullscreen_on_monitor`）。Wayland 下 GTK 不能自由摆放窗口，跨屏一次拖拽做不到；
-     每块屏各自可拖，选区坐标统一换算成**全局逻辑坐标**再交给抓帧（抓帧用的就是这套坐标）。
-  2. **放行键盘失败不能让人卡住**：鼠标那条路（右键确认）永远有效；键盘（Enter/Esc）只在窗口
-     拿到焦点时才到 —— 提示行两种都写了。全文件不 `grab` 输入（Wayland 上 grab 不可靠，
-     还会把别人的输入吞掉）。
-  3. **确认 → 先藏窗、等一帧、再交坐标**：我们这扇窗必须在抓帧前从屏幕上消失（否则截图里
-     会带着自己的遮罩）。藏窗之后由调用方负责下发抓帧，中间隔 `settle_ms` 让合成器提交移除。
+顶层**不 import gi / cairo**（CI 不装 PyGObject 与 pycairo）：两边都在 `_gtk()` / `_cairo()` 里懒加载。
+`paint()` 只吃一个 cairo 上下文，判据把它渲染到 `ImageSurface` 上**逐像素断言**。
 """
 
 from __future__ import annotations
 
-import time
-
 # ---------------------------------------------------------------- 常量（判据按它们断言）
 
-DIM_ALPHA = 0.35          # 选区外压暗的强度
-BORDER_WIDTH = 1          # 选区内缘描边（像素）
-CORNER_LEN = 10           # 四角角标长度
+DIM_ALPHA = 0.35          # 选区外压暗的强度（压在**冻结图上**，所以再暗也看得见内容）
+BORDER_WIDTH = 1
+CORNER_LEN = 12           # 四角角标长度
 CORNER_WIDTH = 2
+HANDLE_SIZE = 7           # 四角 + 四边中点的小方块（拖着调大小用）
 READOUT_PAD = 6
 FONT_SIZE = 14
+HINT_FONT_SIZE = 13
 COLOR_DIM = (0.0, 0.0, 0.0, DIM_ALPHA)
-COLOR_BORDER = (0.30, 0.85, 0.95, 1.0)        # 亮青：在暗背景上够显眼，也不必用动画强调
+COLOR_BORDER = (0.30, 0.85, 0.95, 1.0)
+COLOR_HANDLE = (1.0, 1.0, 1.0, 0.95)
 COLOR_READOUT_BG = (0.0, 0.0, 0.0, 0.72)
 COLOR_READOUT_FG = (1.0, 1.0, 1.0, 1.0)
-HINT_TEXT = "拖动选择 · Enter/右键确认 · Esc 取消"
+COLOR_CROSSHAIR = (1.0, 1.0, 1.0, 0.35)
+FALLBACK_BG = (0.10, 0.10, 0.12, 1.0)      # 没有冻结图时的兜底底色（**不透明**，绝不画透明）
+HINT_TEXT = ("拖动选择 · 双击整屏 · Ctrl+A 全选 · Enter/右键确认 · Esc 取消")
 
 ACTION_IGNORE = "ignore"
-ACTION_START = "start"     # 左键按下：开始/重划选区
-ACTION_UPDATE = "update"   # 拖动中
+ACTION_START = "start"
+ACTION_UPDATE = "update"
 ACTION_CONFIRM = "confirm"
 ACTION_CANCEL = "cancel"
+ACTION_FULL = "full"            # Ctrl+A / 双击：直接给出整个联合矩形（或某块屏）
+ACTION_SNAP = "snap"            # 松手时吸附到了屏幕边缘
 
 
 # ------------------------------------------------------------------------ 纯逻辑（可单测）
 
-def key_action(keyval_name: str):
-    """键盘 → 动作。只认 Esc 与 Enter（含小键盘 Enter），其余不处理。"""
+def key_action(keyval_name: str, ctrl: bool = False):
+    """键盘 → 动作。Esc 取消、Enter 确认、Ctrl+A 全选；其余不处理。
+
+    ⚠ 刻意**不占用 Esc 之外的任何字母键**：遮罩窗会短暂持有键盘焦点，
+    抢键等于偷明江的输入（`Caps+Esc` 那种"一不小心全关掉"的热键留在 keyd 侧，见贴图那条）。
+    """
     if keyval_name == "Escape":
         return ACTION_CANCEL
     if keyval_name in ("Return", "KP_Enter"):
         return ACTION_CONFIRM
+    if ctrl and keyval_name.lower() == "a":
+        return ACTION_FULL
     return None
 
 
-def button_action(button: int, has_selection: bool) -> str:
-    """鼠标 → 动作。
-
-    左键 = 开始/重划；右键 = 确认；**右键时还没有选区就当取消**（点一下什么都不发生会让人以为卡了）。
-    """
+def button_action(button: int, has_selection: bool, double: bool = False) -> str:
+    """鼠标 → 动作。左键拖 = 画；双击 = 整屏；右键 = 确认（没选区时算取消）。"""
     if button == 1:
         return ACTION_START
     if button == 3:
@@ -85,13 +95,18 @@ def to_local(monitor, rect) -> tuple:
 
 
 def to_global(monitor, rect) -> tuple:
-    """该屏本地 → 全局（交抓帧用）。"""
+    """该屏本地 → 全局。"""
     return (rect[0] + monitor[0], rect[1] + monitor[1], rect[2], rect[3])
 
 
 def readout_text(rect) -> str:
-    """实时读数：`宽 × 高`（Snipaste 也是这个习惯；再带一处起点坐标，方便对齐）。"""
+    """实时读数：`宽 × 高`（Snipaste 也是这个习惯）。"""
     return f"{rect[2]} × {rect[3]}"
+
+
+def coord_text(rect) -> str:
+    """起点坐标 —— 对齐、报数时都要它（Snipaste 也在读数里显示）。"""
+    return f"{rect[0]}, {rect[1]}"
 
 
 def readout_position(rect, area) -> tuple:
@@ -105,11 +120,18 @@ def readout_position(rect, area) -> tuple:
     return (x, y)
 
 
-def dim_bands(rect, area) -> list:
-    """选区**外面**要压暗的矩形（上/下/左/右四条带）。
+def hint_position(area) -> tuple:
+    """提示条固定在窗口**底部居中**（放左上角会盖住内容，也不像截图工具）。"""
+    w, h = text_box(HINT_TEXT, HINT_FONT_SIZE)
+    ax, ay, aw, ah = area
+    return (ax + max(8, (aw - w) // 2), ay + ah - h - 10)
 
-    为什么用四条带而不是"整屏压暗 + 挖洞"：挖洞要靠 `OPERATOR_CLEAR` 之类的合成技巧，
-    多一层隐式依赖；四条带在像素上等价，判据一眼能算出来。
+
+def dim_bands(rect, area) -> list:
+    """选区**外面**要压暗的四条带（上/下/左/右）。
+
+    为什么是四条带而不是"整屏压暗 + 挖洞"：挖洞要靠 `OPERATOR_CLEAR` 之类的合成技巧，
+    而**透明正是这次 P0 的病根**（拿不到 ARGB 就变黑）。四条带在像素上等价，判据一眼能算出来。
     """
     ax, ay, aw, ah = area
     x, y, w, h = rect
@@ -127,55 +149,96 @@ def dim_bands(rect, area) -> list:
     return [b for b in bands if b[2] > 0 and b[3] > 0]
 
 
+def handle_points(rect) -> list:
+    """八个可抓手柄：四角 + 四边中点（Snipaste 那种"拖角调大小"）。"""
+    x, y, w, h = rect
+    return [(x, y), (x + w / 2, y), (x + w, y),
+            (x + w, y + h / 2), (x + w, y + h),
+            (x + w / 2, y + h), (x, y + h), (x, y + h / 2)]
+
+
+def handle_at(rect, xy, tolerance: int = HANDLE_SIZE) -> bool:
+    """点在不在某个手柄上（命中判定，判据能直接调）。"""
+    if not rect or rect[2] <= 0 or rect[3] <= 0:
+        return False
+    for hx, hy in handle_points(rect):
+        if abs(hx - xy[0]) <= tolerance and abs(hy - xy[1]) <= tolerance:
+            return True
+    return False
+
+
 def _cairo():
     import cairo
     return cairo
 
 
-def text_box(text: str) -> tuple:
+def text_box(text: str, font_size: int = FONT_SIZE) -> tuple:
     """一行文字的底色框尺寸（宽度按字数估：这层不引 Pango，用 cairo 的 toy 字体 API）。"""
-    return (12 + 9 * len(text), FONT_SIZE + 2 * READOUT_PAD)
+    return (12 + int(font_size * 0.65) * len(text), font_size + 2 * READOUT_PAD)
 
 
-def paint(cr, area, rect, hint: bool = True) -> None:
+def paint(cr, area, rect, frame=None, hint: bool = True, crosshair=None, handles: bool = True):
     """把遮罩画到 cairo 上下文上（**不碰 gi**，判据直接渲染到 ImageSurface 上断言像素）。
 
     像素口径（判据照这个算）：
-      * 先用 `OPERATOR_SOURCE` 把整块画布清成**全透明** —— GTK 的 draw 里不画的地方是未定义内容，
-        不显式清一遍就可能出现"半透明压暗却是脏底色"的怪相；清过之后：
-        选区**外** = 黑 α=DIM_ALPHA，选区**内** = 全透明（屏幕原样透出来）。
-      * 选区内缘 1px 亮青描边 + 四角加粗角标
-      * 读数（宽×高）画在选区上方外侧；`hint` 为真时在左上角画一行操作提示
+      1. **背景必须是冻结图**（`frame`，与窗口同尺寸的 surface）：整块先铺它 —— 不透明，
+         所以"全黑盲选"不可能出现；`frame=None` 时铺 `FALLBACK_BG`（不透明的近黑），
+         **绝不铺透明**（透明 = 这次 P0 的病根）。
+      2. 选区**外**压一层黑 α=DIM_ALPHA（压在冻结图上：暗了但内容看得见）。
+      3. 选区内：1px 亮青描边 + 四角角标 + 八个白色手柄。
+      4. 读数（宽 × 高 + 起点坐标）在选区上方外侧；`crosshair` 给定时画十字准线。
+      5. `hint` 为真时底部居中画一行操作提示。
     """
     cairo = _cairo()
     ax, ay, aw, ah = area
-    cr.save()
-    cr.set_operator(cairo.OPERATOR_SOURCE)
-    cr.set_source_rgba(0, 0, 0, 0)
-    cr.paint()
-    cr.restore()
-
-    if rect and rect[2] > 0 and rect[3] > 0:
-        bands = dim_bands(rect, area)
+    if frame is not None:
+        # **显式映射**：帧的像素尺寸与绘制区域**不一定相等** ——
+        # 2026-10-19 实测同一台机同一天：三屏联合（逻辑 4800×1080）回来的图是 **6400×1440（1.3333×）**，
+        # 而单屏 (0,0,1920,1080) 回来的是 **1920×1080（1×）**；窗口的 scale_factor 还可能是 2。
+        # 所以必须按"帧多大就铺多满"来缩放，不能假设 1:1（假设了就会只画出一角/被拉错位）。
+        fw, fh = frame.get_width(), frame.get_height()
+        if fw > 0 and fh > 0:
+            cr.save()
+            cr.translate(ax, ay)
+            cr.scale(aw / fw, ah / fh)
+            cr.set_source_surface(frame, 0, 0)
+            cr.paint()
+            cr.restore()
     else:
-        bands = [(ax, ay, aw, ah)]
+        cr.set_source_rgba(*FALLBACK_BG)
+        cr.rectangle(ax, ay, aw, ah)
+        cr.fill()
+
+    has_rect = bool(rect and rect[2] > 0 and rect[3] > 0)
+    bands = dim_bands(rect, area) if has_rect else [(ax, ay, aw, ah)]
     cr.set_source_rgba(*COLOR_DIM)
     for bx, by, bw, bh in bands:
         cr.rectangle(bx, by, bw, bh)
     cr.fill()
 
+    if crosshair is not None:
+        cx, cy = crosshair
+        cr.set_source_rgba(*COLOR_CROSSHAIR)
+        cr.set_line_width(1)
+        cr.move_to(ax, cy + 0.5)
+        cr.line_to(ax + aw, cy + 0.5)
+        cr.move_to(cx + 0.5, ay)
+        cr.line_to(cx + 0.5, ay + ah)
+        cr.stroke()
+
     if hint:
-        hw, hh = text_box(HINT_TEXT)
+        hx, hy = hint_position(area)
+        hw, hh = text_box(HINT_TEXT, HINT_FONT_SIZE)
         cr.set_source_rgba(*COLOR_READOUT_BG)
-        cr.rectangle(ax + 8, ay + 8, hw, hh)
+        cr.rectangle(hx, hy, hw, hh)
         cr.fill()
         cr.set_source_rgba(*COLOR_READOUT_FG)
         cr.select_font_face("Sans")
-        cr.set_font_size(FONT_SIZE)
-        cr.move_to(ax + 8 + READOUT_PAD, ay + 8 + FONT_SIZE + READOUT_PAD - 3)
+        cr.set_font_size(HINT_FONT_SIZE)
+        cr.move_to(hx + READOUT_PAD, hy + HINT_FONT_SIZE + READOUT_PAD - 3)
         cr.show_text(HINT_TEXT)
 
-    if not (rect and rect[2] > 0 and rect[3] > 0):
+    if not has_rect:
         return
 
     x, y, w, h = rect
@@ -184,7 +247,6 @@ def paint(cr, area, rect, hint: bool = True) -> None:
     cr.rectangle(x + 0.5, y + 0.5, max(w - 1, 1), max(h - 1, 1))
     cr.stroke()
 
-    # 四角角标：比 1px 边框更容易看清选区边界（纯静态，不用动画）
     cr.set_line_width(CORNER_WIDTH)
     for cx, cy, dx, dy in ((x, y, 1, 1), (x + w, y, -1, 1), (x, y + h, 1, -1), (x + w, y + h, -1, -1)):
         cr.move_to(cx, cy + dy * CORNER_LEN)
@@ -192,18 +254,88 @@ def paint(cr, area, rect, hint: bool = True) -> None:
         cr.line_to(cx + dx * CORNER_LEN, cy)
     cr.stroke()
 
-    text = readout_text(rect)
+    if handles:
+        cr.set_source_rgba(*COLOR_HANDLE)
+        for hx, hy in handle_points(rect):
+            cr.rectangle(hx - HANDLE_SIZE / 2, hy - HANDLE_SIZE / 2, HANDLE_SIZE, HANDLE_SIZE)
+        cr.fill()
+
     rx, ry = readout_position(rect, area)
-    tw, th = text_box(text)
     cr.set_source_rgba(*COLOR_READOUT_BG)
-    cr.rectangle(rx, ry, tw, th)
+    cr.rectangle(rx, ry, text_box(readout_text(rect))[0],
+                 text_box(readout_text(rect))[1] + FONT_SIZE + 4)
     cr.fill()
     cr.set_source_rgba(*COLOR_READOUT_FG)
+    cr.select_font_face("Sans")
+    cr.set_font_size(FONT_SIZE)
     cr.move_to(rx + READOUT_PAD, ry + FONT_SIZE + READOUT_PAD - 3)
-    cr.show_text(text)
+    cr.show_text(readout_text(rect))
+    cr.move_to(rx + READOUT_PAD, ry + 2 * FONT_SIZE + READOUT_PAD + 1)
+    cr.set_source_rgba(0.75, 0.85, 0.95, 1.0)
+    cr.show_text(coord_text(rect))
 
 
 # ------------------------------------------------------------------------------ GTK 部分
+
+# ── 窗口几何（2026-10-19 P0 的病根就在这三行）────────────────────────────────
+# 实测（xvfb 复现 lead 的真机数字）：
+#   ① `realize()` → `fullscreen_on_monitor()` → `show_all()`  ⇒ device **200×200**
+#      （200×200 是 GTK toplevel 的默认尺寸；mutter 把这张 stale 缓冲**拉伸铺满整块屏**，
+#       于是"整屏纯黑 / 一块矩形、看不到画面"——正是明江看到的现象）
+#   ② `set_default_size(mon_w, mon_h)` → `fullscreen_on_monitor()` → `show_all()` ⇒ device 1600×900 ✓
+# 所以：**先给尺寸，再全屏，最后显示**；并且不要提前 `realize()`。
+OVERLAY_MIN_SETTLE = 150          # map 之后等一小会儿再量尺寸（合成器要一帧提交）
+OVERLAY_MAX_CHECKS = 10           # 自检重试次数（每次 ~150ms ⇒ 最多约 1.5s，防合成器慢造成误判）
+
+
+def overlay_geometry(win, screen, idx, monitor) -> None:
+    """把窗口**显式**设成该屏尺寸，再全屏到该屏。顺序不许改（见上面的实测）。"""
+    win.set_default_size(int(monitor[2]), int(monitor[3]))
+    win.fullscreen_on_monitor(screen, idx)
+
+
+def geometry_expectation(monitor, scale: int = 1) -> tuple:
+    """该屏**设备像素**下应当多大的窗口（逻辑尺寸 × 该屏 scale_factor）。"""
+    return (int(monitor[2]) * int(scale), int(monitor[3]) * int(scale))
+
+
+def acceptable_sizes(monitor, scale: int = 1) -> set:
+    """这个窗口**可以**是多少像素。
+
+    两种解释都放行（Wayland 上 GDK 报的到底是设备像素还是逻辑像素有歧义，2026-10-19 没能在无头环境
+    里定论 —— 只认一种的话，万一认错就是"每次都自检失败、遮罩每次自己关掉"，比原来的 bug 更糟）：
+      * 设备像素：逻辑尺寸 × scale；
+      * 逻辑像素：逻辑尺寸本身。
+    两者都**远大于** GTK 的默认 200×200 ⇒ 今天这个 bug 照样被抓住（200×200 两种解释都不合法）。
+    """
+    w, h = int(monitor[2]), int(monitor[3])
+    sizes = {(w * int(scale), h * int(scale)), (w, h)}
+    # 允许 ±2px 的四舍五入（有些合成器会少给几个像素）
+    return {s for exact in sizes for s in [(exact[0] + d1, exact[1] + d2)
+                                           for d1 in (-2, -1, 0, 1, 2) for d2 in (-2, -1, 0, 1, 2)]}
+
+
+def geometry_problems(monitors, sizes, scales) -> list:
+    """自检：每块屏的窗口尺寸对不对。返回问题清单（空 = 全对）。
+
+    **不许静默**：量出来不对就得说清"期望多少、实得多少"，调用方据此关窗报错
+    （把黑遮罩留在屏幕上、或者拿一个错误的窗口去截图，都比直接说"这次没成"更糟）。
+    """
+    problems = []
+    for idx, monitor in enumerate(monitors):
+        expected = acceptable_sizes(monitor, scales[idx] if idx < len(scales) else 1)
+        got = tuple(sizes[idx]) if idx < len(sizes) and sizes[idx] else (0, 0)
+        if got not in expected:
+            want = f"{monitor[2]}×{monitor[3]}（或 ×{scales[idx] if idx < len(scales) else 1} 的设备像素）"
+            problems.append(f"屏{idx}：期望 {want}，实得 {got[0]}×{got[1]}")
+    return problems
+
+
+def geometry_message(problems) -> str:
+    return ("✗ 遮罩窗口尺寸没对上（" + "；".join(problems) + "）—— 已关掉遮罩，"
+            "没有拿这张图去截（宁可不截，也不给一张全黑的）。"
+            "这台机是 Wayland：窗口尺寸按理由合成器定，若反复出现请把 monitors/scale 记下来报上来")
+
 
 def _gtk():
     import gi
@@ -227,28 +359,34 @@ def monitor_rects():
 
 
 class Overlay:
-    """选区遮罩窗口组。**每个方法内部**才碰 gi，模块导入本身不需要 gi。"""
+    """选区遮罩窗口组（一屏一窗，每窗背景 = 那块屏的冻结图）。**每个方法内部**才碰 gi。"""
 
-    def __init__(self, settle_ms: int = None, on_confirm=None, monitors=None):
-        from capsplus.shot_frame import SETTLE_MS
-        self.settle_ms = SETTLE_MS if settle_ms is None else settle_ms
+    def __init__(self, frames=None, on_confirm=None, monitors=None, snap=True):
+        self.frames = list(frames or [])
         self.on_confirm = on_confirm
         self.monitors = monitors
-        self.rect = None            # 全局逻辑坐标下的选区
-        self.active = None          # 选区所在屏的索引
+        self.rect = None            # 全局逻辑坐标下的选区（允许跨屏）
+        self.active = None          # 选区"主屏"索引（画交互提示用）
+        self.pointer = None         # 最后一次指针位置（本地坐标 + 屏索引）
         self.dragging = False
-        self._anchor = None         # 本地坐标的起点
+        self._anchor = None         # **全局**坐标的起点（跨屏拖拽靠它才不乱）
         self.windows = []
         self.result = None
-        self.outcome = None         # "confirm" / "cancel"
+        self.outcome = None         # "confirm" / "cancel" / "geometry-fail"
+        self.geometry_ok = None     # map 后自检结果（None = 还没量）
+        self.failure = ""           # 自检失败时给调用方的话
+        self.snap = snap
 
-    # ---- 事件（纯状态机，事件对象只用到 .x/.y/.button/.keyval 四个属性 → 判据能造假的）----
-    def on_press(self, local_xy, button: int):
-        action = button_action(button, self.rect is not None)
+    # ---- 事件（纯状态机；事件对象只用到 .x/.y/.button 三个属性 → 判据能造假的）----
+    def on_press(self, monitor_idx: int, local_xy, button: int = 1, double: bool = False):
+        action = button_action(button, self.rect is not None, double=double)
         if action == ACTION_START:
+            if double:
+                return self.select_monitor(monitor_idx)
             self.dragging = True
-            self._anchor = local_xy
+            self._anchor = self._global_of(monitor_idx, local_xy)
             self.rect = None
+            self.active = monitor_idx
             return ACTION_START
         if action == ACTION_CONFIRM:
             return self.confirm()
@@ -257,43 +395,69 @@ class Overlay:
         return ACTION_IGNORE
 
     def on_motion(self, monitor_idx: int, local_xy):
+        self.pointer = (monitor_idx, local_xy)
         if not self.dragging or self._anchor is None:
             return ACTION_IGNORE
         from capsplus.shot_frame import normalize_rect
-        local = normalize_rect(self._anchor[0], self._anchor[1], local_xy[0], local_xy[1])
+        here = self._global_of(monitor_idx, local_xy)
+        # 起点与当前点都在**全局**坐标里算 ⇒ 拖到另一块屏照样对（旧版用本地坐标，跨屏必错）
+        rect = normalize_rect(self._anchor[0], self._anchor[1], here[0], here[1])
+        self.rect = rect
         self.active = monitor_idx
-        self.rect = to_global(self.monitors[monitor_idx], local)
         return ACTION_UPDATE
 
     def on_release(self):
-        """松手**不确认**（按第 2 步的口径：右键或 Enter 才确认）—— 松手后还能重划、还能微调。"""
+        """松手**不确认**（右键/Enter 才确认）—— 松手后还能重划，并顺手做贴边吸附。"""
         self.dragging = False
+        if self.rect and self.snap:
+            from capsplus.shot_frames import snap_rect
+            snapped = snap_rect(self.rect, self.monitors or [])
+            if snapped != self.rect:
+                self.rect = snapped
+                return ACTION_SNAP
         return ACTION_IGNORE
 
-    def on_key(self, keyval_name: str):
-        action = key_action(keyval_name)
+    def on_key(self, keyval_name: str, ctrl: bool = False):
+        action = key_action(keyval_name, ctrl=ctrl)
         if action == ACTION_CONFIRM:
             return self.confirm()
         if action == ACTION_CANCEL:
             return self.cancel()
+        if action == ACTION_FULL:
+            return self.select_all()
+        return ACTION_IGNORE
+
+    # ---- 整屏 / 单屏两种捷径 ----
+    def select_all(self):
+        """Ctrl+A：整个联合矩形（"全屏选择"一键到位）。"""
+        from capsplus.shot_frames import union_rect
+        self.rect = union_rect(self.monitors or [])
+        self.active = 0 if self.monitors else None
+        return ACTION_FULL
+
+    def select_monitor(self, monitor_idx: int):
+        """双击：指针所在那块屏的整块（多屏时不至于被迫全选）。"""
+        if self.monitors and 0 <= monitor_idx < len(self.monitors):
+            self.rect = tuple(self.monitors[monitor_idx])
+            self.active = monitor_idx
+            return ACTION_FULL
         return ACTION_IGNORE
 
     # ---- 收尾 ----
     def confirm(self):
-        """确认选区。**注意不要在这里退出主循环**：要等 settle 那一下过完再退。
+        """确认选区：有合法选区才认（太小 = 手抖，别给出 1×1 的垃圾图）。
 
-        2026-10-19 实测踩到的坑（xvfb 真事件判据抓出来的）：第一版在事件处理器里
-        `if self.outcome: self._quit()` —— 确认后主循环立刻退出，settle 的 timeout 根本没机会跑，
-        于是"藏窗 → 等一帧 → 交坐标"里的"等一帧"从来没发生过，抓帧有可能把遮罩自己拍进去。
-        现在：确认只**排** settle，由 `_tick` 到点后交坐标并退出循环；取消才是立刻退。
+        这里**不再等 settle**：确认后调用方直接从冻结图裁剪，屏幕都不再看一眼，
+        所以"遮罩把自己拍进去"结构上不可能发生（旧版那套 settle 是为此存在的）。
         """
         from capsplus.shot_frame import accept_rect
         if not self.rect or not accept_rect(self.rect):
-            return ACTION_IGNORE        # 太小/没有选区：确认无效，别给出 1×1 的垃圾图
+            return ACTION_IGNORE
         self.outcome = "confirm"
         self.result = self.rect
         self.hide_all()
-        self._settle_then_fire()
+        self._fire()
+        self._quit_loop()
         return ACTION_CONFIRM
 
     def cancel(self):
@@ -301,38 +465,27 @@ class Overlay:
         self.result = None
         self.hide_all()
         self._fire()
+        self._quit_loop()
         return ACTION_CANCEL
 
     def hide_all(self):
-        for _win in self.windows:
-            _win.hide()
+        for win in self.windows:
+            win.hide()
 
     def _fire(self):
         if self.on_confirm:
             self.on_confirm(self.result)
 
-    def _settle_then_fire(self):
-        """藏窗之后等 `settle_ms` 再交坐标：合成器得把我们这扇窗的移除提交出去，
-        否则抓帧会把自己的遮罩拍进去。这期间主循环照跑（在 loop 里排的 timeout）。"""
-        _Gtk, _Gdk, GLib = _gtk()
-        # PyGObject 的 timeout_add 是 **(interval, callback)**，priority 只能当关键字传
-        # （`gi/overrides/GLib.py`：`timeout_add(interval, function, *user_data, priority=…)`）。
-        # 写成 GJS 那种 (priority, interval, cb) 会得到 `Callback needs to be a function or method
-        # not int` —— 那一下回调永远不排上，确认选区之后界面就卡住不动了（xvfb 界面判据抓到的）。
-        GLib.timeout_add(max(int(self.settle_ms), 0), self._tick)
-
-    def _tick(self):
-        self._fire()            # 交坐标（调用方拿到时，遮罩已经藏了 settle_ms）
-        self._quit_loop()
-        return False
-
     def _quit_loop(self):
-        """退出主循环（未建窗时 `_quit` 不存在 —— 纯状态机判据里就是这么跑的）。"""
         quit_fn = getattr(self, "_quit", None)
         if callable(quit_fn):
             quit_fn()
 
-    # ---- 建窗与主循环（只在真跑时用）----
+    def _global_of(self, monitor_idx: int, local_xy) -> tuple:
+        monitor = self.monitors[monitor_idx]
+        return (local_xy[0] + monitor[0], local_xy[1] + monitor[1])
+
+    # ---- 建窗与主循环 ----
     def build(self, display, loop_quit):
         Gtk, Gdk, _GLib = _gtk()
         screen = Gdk.Screen.get_default()
@@ -341,73 +494,126 @@ class Overlay:
             win.set_decorated(False)
             win.set_resizable(False)
             win.set_accept_focus(True)
-            win.set_app_paintable(True)
             win.set_skip_taskbar_hint(True)
             win.set_skip_pager_hint(True)
-            visual = screen.get_rgba_visual()
-            if visual is not None:
-                win.set_visual(visual)
+            # 背景是冻结图（不透明）⇒ 不需要 RGBA visual、更不 `set_app_paintable`。
+            # 旧版正是依赖"能拿到 ARGB 表面"，拿不到就全黑 —— 这条别再改回去。
             win.add_events(Gdk.EventMask.BUTTON_PRESS_MASK | Gdk.EventMask.BUTTON_RELEASE_MASK |
                            Gdk.EventMask.POINTER_MOTION_MASK | Gdk.EventMask.KEY_PRESS_MASK |
                            Gdk.EventMask.STRUCTURE_MASK)
-            win.connect("draw", self._on_draw)
-            win.connect("button-press-event", self._on_press_event)
-            win.connect("motion-notify-event", self._on_motion_event)
-            win.connect("button-release-event", lambda *_a: self.on_release())
-            win.connect("key-press-event", self._on_key_event)
-            win.realize()
+            win.connect("draw", self._on_draw, idx)
+            win.connect("button-press-event", self._on_press_event, idx)
+            win.connect("motion-notify-event", self._on_motion_event, idx)
+            win.connect("button-release-event", self._on_release_event, idx)
+            win.connect("key-press-event", self._on_key_event, idx)
             # GTK3 的签名是 `fullscreen_on_monitor(screen, gint monitor)` —— **监控器序号**，
-            # 不是 Gdk.Monitor 对象（传对象会得到 `Must be number, not X11Monitor`；
-            # GTK4 才是传对象）。`monitor_rects()` 的顺序与 display.get_monitor(i) 一致，所以给 idx。
-            win.fullscreen_on_monitor(screen, idx)
+            # 不是 Gdk.Monitor 对象（传对象会得到 `Must be number, not X11Monitor`）。
+            # ⚠ 这里**不许提前 `realize()`**，也**不许省掉 `set_default_size`**：见 overlay_geometry 的实测。
+            overlay_geometry(win, screen, idx, mon)
             win.show_all()
             self.windows.append(win)
         self._quit = loop_quit
+        self._schedule_geometry_check()
 
-    def _on_draw(self, widget, cr):
-        area = (0, 0, widget.get_allocated_width(), widget.get_allocated_height())
-        local = None
-        if self.rect and self.active is not None:
-            local = to_local(self.monitors[self.active], self.rect)
-        paint(cr, area, local)
+    # ---- map 之后自检尺寸（不对就关窗报错，绝不留一张黑遮罩）----
+    def _schedule_geometry_check(self, attempt: int = 0) -> None:
+        _Gtk, _Gdk, GLib = _gtk()
+        GLib.timeout_add(OVERLAY_MIN_SETTLE, self._check_geometry, attempt)
 
-    def _monitor_index_of(self, widget):
+    def _check_geometry(self, attempt: int = 0):
+        """量每块屏的窗口 device 尺寸；不对就重试 `resize`，再不对就关窗 + 交一句可操作的话。"""
+        sizes, scales = [], []
         for idx, win in enumerate(self.windows):
-            if win is widget:
-                return idx
+            window = win.get_window()
+            sizes.append((window.get_width(), window.get_height()) if window else (0, 0))
+            scales.append(win.get_scale_factor())
+        problems = geometry_problems(self.monitors, sizes, scales)
+        if not problems:
+            if attempt == 0:
+                # 这行是给真机验收用的：一眼看出"窗口 device 尺寸 = 屏幕逻辑尺寸 × scale"
+                expect = [geometry_expectation(mon, scales[i] if i < len(scales) else 1)
+                          for i, mon in enumerate(self.monitors)]
+                print(f"[capsplus] overlay geometry ok sizes={sizes} scales={scales} "
+                      f"monitors={self.monitors} expect_device={expect}")
+            self.geometry_ok = True
+            return False
+        if attempt + 1 < OVERLAY_MAX_CHECKS:
+            for idx, win in enumerate(self.windows):          # 再试一次显式 resize
+                win.resize(self.monitors[idx][2], self.monitors[idx][3])
+            self._schedule_geometry_check(attempt + 1)
+            return False
+        self.geometry_ok = False
+        self.failure = geometry_message(problems)
+        self.outcome = "geometry-fail"
+        self.result = None
+        self.hide_all()
+        self._quit_loop()
+        return False
+
+    def _frame_for(self, idx: int):
+        for frame in self.frames:
+            if frame.rect == tuple(self.monitors[idx]):
+                return frame.surface
+        if 0 <= idx < len(self.frames):
+            return self.frames[idx].surface
         return None
 
-    def _on_press_event(self, widget, event):
-        idx = self._monitor_index_of(widget)
-        if idx is None:
-            return False
-        self.on_press((int(event.x), int(event.y)), event.button)
-        if self.outcome == "cancel":
-            self._quit()          # 确认走 settle 那条路（见 confirm）
-        elif not self.outcome:
+    def _local_rect(self, idx: int):
+        """该屏本地坐标系下的选区（跨屏时可能是负坐标/超出屏宽 —— cairo 自己会裁）。"""
+        if not self.rect:
+            return None
+        return to_local(self.monitors[idx], self.rect)
+
+    def _on_draw(self, widget, cr, idx):
+        # 只依赖传进来的 widget 与显示器几何 —— **不查 self.windows**：
+        # 这样判据能拿一个 `Gtk.OffscreenWindow + DrawingArea` 走**真实 draw 处理器**渲染（见
+        # test_shot_overlay 的 TestRealWidgetDrawPath），而不是只调 paint() 绕开 GTK 这一层。
+        area = (0, 0, max(widget.get_allocated_width(), self.monitors[idx][2]),
+                max(widget.get_allocated_height(), self.monitors[idx][3]))
+        crosshair = None
+        if self.pointer and self.pointer[0] == idx:
+            crosshair = self.pointer[1]
+        paint(cr, area, self._local_rect(idx), frame=self._frame_for(idx), crosshair=crosshair)
+        # ⚠ **必须 return True**（2026-10-19 真机事故）：`GtkWidget::draw` 的默认处理器跑在自定义
+        # 处理器**之后**，会把控件自己的主题背景刷在我们的画上面 —— 表现就是"三个窗口尺寸都对，
+        # 屏幕上却是整块纯白"（Adwaita 的 #fafafa ≈ 250；明江看到纯白、我抓屏读数也是均匀 250，
+        # 两者一致）。返回 True = 停止信号发射 ⇒ 默认背景不再覆盖。
+        # 反例：删掉这一行 → `tests/test_shot_overlay.TestWindowsBackgroundNotOverpaint` 必红
+        #（那条判据必须用真 `Gtk.Window`；`Gtk.DrawingArea` 本来就没背景，测不出来，会假绿）。
+        return True
+
+    def _on_press_event(self, _widget, event, idx):
+        double = bool(getattr(event, "type", None) == 16)      # Gdk.EventType.DOUBLE_BUTTON_PRESS
+        self.on_press(idx, (int(event.x), int(event.y)), event.button, double=double)
+        if not self.outcome:
             self._redraw()
         return True
 
-    def _on_motion_event(self, widget, event):
-        idx = self._monitor_index_of(widget)
-        if idx is None:
-            return False
-        if self.on_motion(idx, (int(event.x), int(event.y))) == ACTION_UPDATE:
+    def _on_motion_event(self, _widget, event, idx):
+        if self.on_motion(idx, (int(event.x), int(event.y))) != ACTION_IGNORE:
             self._redraw()
+        else:
+            self._redraw()          # 十字准线跟着指针走
         return True
 
-    def _on_key_event(self, _widget, event):
-        name = ""
+    def _on_release_event(self, _widget, _event, idx):
+        self.on_release()
+        self._redraw()
+        return True
+
+    def _on_key_event(self, _widget, event, idx):
+        name, ctrl = "", False
         try:
             import gi
             gi.require_version("Gdk", "3.0")
             from gi.repository import Gdk
             name = Gdk.keyval_name(event.keyval) or ""
+            ctrl = bool(event.state & Gdk.ModifierType.CONTROL_MASK)
         except Exception:
-            name = ""
-        self.on_key(name)
-        if self.outcome == "cancel":
-            self._quit()
+            name, ctrl = "", False
+        self.on_key(name, ctrl=ctrl)
+        if not self.outcome:
+            self._redraw()
         return True
 
     def _redraw(self):
@@ -416,20 +622,23 @@ class Overlay:
                 win.get_window().invalidate_rect(None, False)
 
 
-def select_region(settle_ms: int = None, on_confirm=None, monitors=None) -> tuple:
-    """跑一次选区：返回 `(global_rect | None)`，取消返回 None。
+def select_region(frames, monitors=None, on_confirm=None) -> tuple:
+    """跑一次选区：返回 `(global_rect | None)`；取消返回 None。
 
-    调用方拿到坐标时，**遮罩窗已经藏好并过了 settle**（见 `Overlay.confirm`）。
+    `frames` 是 `shot_frames.freeze()` 的产物（每屏一块冻结图）—— **必须给**：
+    没有冻结图就没有背景，那正是要根治的"全黑盲选"，所以这里不做"没有也凑合开窗"的兜底。
     """
     Gtk, _Gdk, GLib = _gtk()
+    _ = Gtk
     if monitors is None:
         monitors, display = monitor_rects()
     else:
         display = _Gdk.Display.get_default()
     if not monitors or display is None:
         return None
-    overlay = Overlay(settle_ms=settle_ms, on_confirm=on_confirm, monitors=monitors)
+    overlay = Overlay(frames=frames, on_confirm=on_confirm, monitors=monitors)
     loop = GLib.MainLoop()
     overlay.build(display, loop.quit)
     loop.run()
-    return overlay.result
+    # 返回 `(rect, failure)`：几何自检没过时必须让调用方**知道**，不能静默给个 None 就当"用户取消了"
+    return overlay.result, (overlay.failure or None)

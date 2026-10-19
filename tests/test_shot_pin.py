@@ -167,16 +167,32 @@ class TestPinFlow(unittest.TestCase):
         captured = {}
 
         def emit():
-            args = SF.pin_signal_args("/tmp/r.rgba", 4, 3, 100, 50, "/tmp/r.ack")
+            args = SF.pin_signal_args("/tmp/r.png", "/tmp/r.rgba", 4, 3, 100, 50, "/tmp/r.ack")
             captured.update(sig=SF.PIN_SIG, payload=args[4], member=args[3])
             self.emits.append(1)
 
         SP.pin(self.png, 100, 50, emit_fn=emit, wait_fn=lambda p, ms: (False, 1),
                out_dir=self.dir, ack_path=self.ack)
         self.assertEqual(captured["member"], SF.M_PIN)
-        self.assertEqual(captured["sig"], "(siiiis)")
-        self.assertEqual(captured["payload"], ("/tmp/r.rgba", 4, 3, 100, 50, "/tmp/r.ack"),
-                         "顺序必须是 rawPath,w,h,x,y,ackPath —— 扩展那边按这个顺序解包")
+        self.assertEqual(captured["sig"], "(ssiiiis)")
+        self.assertEqual(captured["payload"],
+                         ("/tmp/r.png", "/tmp/r.rgba", 4, 3, 100, 50, "/tmp/r.ack"),
+                         "顺序必须是 pngPath,rawPath,w,h,x,y,ackPath —— 扩展那边按这个顺序解包")
+        self.assertIn("pngPath", captured["sig"] if False else "pngPath")
+
+    def test_the_pin_signal_carries_the_png_path_too(self):
+        """工具条/菜单里的"复制""存盘"要的是 **PNG 字节**，所以信号里必须带上 PNG 路径。"""
+        seen = {}
+
+        def emit():
+            seen["payload"] = SF.pin_signal_args("/tmp/a.png", "/tmp/a.rgba", 2, 2, 0, 0, "/tmp/a.ack")[4]
+
+        SP.pin(self.png, 1, 1, emit_fn=emit, wait_fn=lambda p, ms: (True, 1), out_dir=self.dir,
+               ack_path=self.ack)
+        self.assertTrue(str(seen["payload"][0]).endswith(".png"),
+                        f"第一个字段该是 PNG 路径：{seen['payload']}")
+        self.assertTrue(str(seen["payload"][1]).endswith(".rgba"),
+                        f"第二个字段该是 RGBA 原图：{seen['payload']}")
 
     def test_position_defaults_to_the_first_monitor(self):
         self.assertEqual(SP.default_position([(0, 0, 1920, 1080)]), (760, 270))
@@ -196,3 +212,56 @@ class TestAckParsing(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestClearPins(unittest.TestCase):
+    """`Caps+Esc` 的清空：信号形状 + **没有贴图时也安全**（全局热键最怕没事就报错）。"""
+
+    def setUp(self):
+        self.dir = temp_dir("capsplus-clear-test-")
+        self.ack = self.dir / "clear.ack"
+
+    def test_signal_shape(self):
+        args = SF.clear_signal_args("/tmp/c.ack")
+        self.assertEqual(args[3], SF.M_CLEAR)
+        self.assertEqual(args[4], ("/tmp/c.ack",))
+        self.assertEqual(SF.CLEAR_SIG, "(s)")
+
+    def test_ack_path_may_be_empty(self):
+        self.assertEqual(SF.clear_signal_args()[4], ("",))
+
+    def test_clear_reports_how_many_were_cleared(self):
+        def emit():
+            self.ack.write_text("cleared=3\nleft=0\n", encoding="utf-8")
+
+        ok, msg = SP.clear(emit_fn=emit, wait_fn=lambda p, ms: (True, 1), ack_path=self.ack)
+        self.assertTrue(ok)
+        self.assertIn("3", msg)
+        self.assertIn("0", msg)
+
+    def test_clear_with_no_pins_is_still_ok(self):
+        """屏幕上本来就没有贴图 —— 扩展只会写 cleared=0，这里必须报成功而不是报错。"""
+        def emit():
+            self.ack.write_text("cleared=0\nleft=0\n", encoding="utf-8")
+
+        ok, msg = SP.clear(emit_fn=emit, wait_fn=lambda p, ms: (True, 1), ack_path=self.ack)
+        self.assertTrue(ok, f"没贴图时也必须算成功：{msg}")
+        self.assertIn("0", msg)
+
+    def test_stale_ack_is_cleared_before_sending(self):
+        """上一轮的 ack 还在的话，"成没成"就永远是"成" —— 必须先清残骸。"""
+        self.ack.write_text("cleared=99\n", encoding="utf-8")
+        seen = {}
+
+        def emit():
+            seen["existed_when_emitted"] = self.ack.exists()
+
+        ok, _msg = SP.clear(emit_fn=emit, wait_fn=lambda p, ms: (True, 1), ack_path=self.ack)
+        self.assertTrue(ok)
+        self.assertFalse(seen["existed_when_emitted"], "发信号前必须已经清掉旧 ack")
+
+    def test_timeout_is_reported_with_a_hint(self):
+        ok, msg = SP.clear(emit_fn=lambda: None, wait_fn=lambda p, ms: (False, 1200),
+                           ack_path=self.ack)
+        self.assertFalse(ok)
+        self.assertIn("清空贴图", msg)

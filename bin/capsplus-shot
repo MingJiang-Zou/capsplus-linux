@@ -1,17 +1,103 @@
-#!/usr/bin/env python3
+#!/bin/sh
 # SPDX-License-Identifier: GPL-2.0-only
 # Copyright (c) 2026 capsplus-linux contributors
 # 本文件属 capsplus-linux —— CapsLock+ v3.3.0 的 Linux 移植（衍生作品）；按键映射数据译自上游：
 #   上游 https://github.com/wo52616111/capslock-plus （GPL-2.0，© wo52616111）；改动见 README「许可与上游」。
-"""capsplus-shot 入口：截图（抓帧走 GNOME 扩展，不闪）。用法见 --help。"""
-import os
-import sys
+# keyd 用：`command(...)` 以 **root** 执行，而截图链路要 GTK 窗 + 会话总线 ——
+# root 直接跑会在"显示服务授权"那一关**静默失败**（2026-10-19 主代理实测，与"按了没反应"完全对应）：
+#   $ sudo -n env -u XDG_RUNTIME_DIR -u WAYLAND_DISPLAY -u DBUS_SESSION_BUS_ADDRESS \
+#       capsplus-shot --region
+#   Authorization required, but no authorization protocol specified
+#   已取消（没抓图）        rc=0
+# 所以：root（keyd 场景）→ 降权 + 注入用户会话环境后 exec；用户本人（终端 / 设置页 / 标注窗内部
+# 调用）→ 直接 exec，不绕 runuser 那一道。整段写法照抄 `bin/keyd-qbar-cmd` 与 `bin/capsplus-voice`。
+#
+# 三条不许改的口径（都是踩过的，别自己发明）：
+#   ① shebang 必须是 `#!/bin/sh`（本机是 dash）—— **不许用 bash 数组**，`A=(…)` 会当场
+#      syntax error，而 keyd 那边不报错、只是按键没反应（Caps+Q 就这么哑过一次，
+#      当时判据只跑 `bash -n` 没跑 `sh -n`，把错遮住了）。校验走 `tests/test_portability.py`
+#      的"按各自 shebang 选解释器"那一套 + 本批新增的 `tests/test_shot_launcher.py`。
+#   ② 用户名 / uid / 家目录**一律不写死**：目标用户 = `CAPSPLUS_USER`，否则取本文件（软链解析后）
+#      的属主 —— install.sh 把入口软链进用户自己的 ~/.local/bin，属主就是装它的那个人。
+#   ③ 显示后端**只报一个**，并把另一个从环境里**摘掉**（`env -u`）：同时给两个会让 Chromium 系
+#      另起实例；GTK 侧拿到两个也容易连错后端。
+#
+# 四个入口（--region / --capture / --annotate / --pin）走的都是这一条路，参数原样透传。
+set -eu
 
-REPO = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
-if REPO not in sys.path:
-    sys.path.insert(0, REPO)
+SELF="$(readlink -f "$0" 2>/dev/null || echo "$0")"
+# CAPSPLUS_REPO 可指到别处的仓（打包/测试用）；否则用软链解析出来的仓库目录。
+REPO_DIR="${CAPSPLUS_REPO:-$(dirname "$(dirname "$SELF")")}"
+ENTRY="$REPO_DIR/capsplus/shot_entry.py"
+if [ ! -f "$ENTRY" ]; then
+    echo "capsplus-shot: 找不到 $ENTRY（CAPSPLUS_REPO 指对了吗？先跑一次 ./install.sh）" >&2
+    exit 1
+fi
 
-from capsplus.shot_capture import main  # noqa: E402
+USER_NAME="${CAPSPLUS_USER:-$(stat -Lc '%U' "$SELF" 2>/dev/null || id -un)}"
+USER_UID="$(id -u "$USER_NAME" 2>/dev/null || id -u)"
+USER_HOME="$(getent passwd "$USER_NAME" 2>/dev/null | cut -d: -f6)"
+if [ -z "${USER_HOME:-}" ]; then
+    USER_HOME="$(eval echo "~$USER_NAME" 2>/dev/null || echo "/home/$USER_NAME")"
+fi
+# CAPSPLUS_RUN_DIR：运行目录覆盖口。两个用处 —— ① 非标准的 seat 布局；
+# ② 判据能在**没有 root、没有真 Wayland socket** 的机器上把"后端只报一个"的四种场景真跑一遍
+#    （只 grep 源码是测不出分支走错的，`bin/capsplus-voice` 的注释里也记着这条）。
+RUN_DIR="${CAPSPLUS_RUN_DIR:-/run/user/$USER_UID}"
 
-if __name__ == "__main__":
-    raise SystemExit(main(sys.argv[1:]))
+# ── 解释器 ──────────────────────────────────────────────────────────────────
+PYTHON="${CAPSPLUS_PYTHON:-}"
+if [ -z "$PYTHON" ]; then
+    for c in "$(command -v python3 2>/dev/null || true)" /usr/bin/python3; do
+        if [ -n "$c" ] && [ -x "$c" ]; then PYTHON="$c"; break; fi
+    done
+fi
+if [ -z "$PYTHON" ]; then
+    echo "capsplus-shot: 找不到 python3" >&2
+    exit 1
+fi
+
+# ── 显示后端：只报一个，且不凭空造（同 keyd-qbar-cmd / capsplus-voice）─────────
+SET_U=""
+if [ -n "${WAYLAND_DISPLAY:-}" ]; then
+    DISPLAY_ENV="WAYLAND_DISPLAY=$WAYLAND_DISPLAY"
+    SET_U="-u DISPLAY"
+elif [ -S "$RUN_DIR/wayland-0" ]; then
+    DISPLAY_ENV="WAYLAND_DISPLAY=wayland-0"
+    SET_U="-u DISPLAY"
+elif [ -n "${DISPLAY:-}" ]; then
+    DISPLAY_ENV="DISPLAY=$DISPLAY"
+    SET_U="-u WAYLAND_DISPLAY"
+else
+    DISPLAY_ENV="DISPLAY=:0"
+    SET_U="-u WAYLAND_DISPLAY"
+fi
+
+# 会话环境：三项一份，两条 exec 路径共用。这三项一个都不能少 ——
+#   HOME 给 GTK/GLib 找配置；XDG_RUNTIME_DIR 是 Wayland socket 的所在；
+#   DBUS_SESSION_BUS_ADDRESS 是这条链路真正下发信号要走的总线（少它 = 抓帧永远超时）。
+ENV_HOME="HOME=$USER_HOME"
+ENV_RUNTIME="XDG_RUNTIME_DIR=$RUN_DIR"
+ENV_DBUS="DBUS_SESSION_BUS_ADDRESS=unix:path=$RUN_DIR/bus"
+
+# root（keyd 的 command()）才需要降权；用户自己在终端敲就别绕 runuser 那一道了。
+if [ "$(id -u)" -eq 0 ]; then
+    # runuser 在 /usr/sbin，root 的 PATH 里也不一定带 —— 三个位置挨个试；
+    # CAPSPLUS_RUNUSER 是覆盖口（判据用假桩捕获 argv，不必真 root）。
+    RUNUSER="${CAPSPLUS_RUNUSER:-}"
+    if [ -z "$RUNUSER" ]; then
+        for c in "$(command -v runuser 2>/dev/null || true)" /usr/sbin/runuser /sbin/runuser; do
+            if [ -n "$c" ] && [ -x "$c" ]; then RUNUSER="$c"; break; fi
+        done
+    fi
+    if [ -z "$RUNUSER" ]; then
+        echo "capsplus-shot: 找不到 runuser（属于 util-linux）；也可以设 CAPSPLUS_RUNUSER 指定" >&2
+        exit 1
+    fi
+    exec "$RUNUSER" -u "$USER_NAME" -- env $SET_U \
+        "$ENV_HOME" "$ENV_RUNTIME" "$DISPLAY_ENV" "$ENV_DBUS" \
+        "$PYTHON" "$ENTRY" "$@"
+fi
+
+exec env $SET_U "$ENV_HOME" "$ENV_RUNTIME" "$DISPLAY_ENV" "$ENV_DBUS" \
+    "$PYTHON" "$ENTRY" "$@"

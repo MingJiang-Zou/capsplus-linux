@@ -87,8 +87,16 @@ class TestSignalArgs(unittest.TestCase):
                          " 出来的是错位的值")
 
     def test_pin_signature_matches_arg_count(self):
-        self.assertEqual(SF.PIN_SIG, "(siiiis)")
-        self.assertEqual(len(SF.pin_signal_args("/tmp/r.raw", 2, 3, 4, 5, "/tmp/a")[4]), 6)
+        self.assertEqual(SF.PIN_SIG, "(ssiiiis)",
+                         "pngPath + rawPath + w,h,x,y + ackPath（2026-10-19 加了 PNG 路径："
+                         "贴图工具条的复制/存盘要 PNG 字节）")
+        self.assertEqual(SF.CLEAR_SIG, "(s)")
+        self.assertEqual(len(SF.pin_signal_args("/tmp/r.png", "/tmp/r.raw", 2, 3, 4, 5,
+                                                "/tmp/a")[4]), 7,
+                         "tuple 里的元素个数必须等于签名里的类型个数（7 个），"
+                         "不然 shell 那边 deepUnpack 出来的是错位的值")
+        self.assertEqual(len(SF.clear_signal_args("/tmp/a.ack")[4]), 1)
+        self.assertEqual(SF.M_CLEAR, "ClearPins")
 
     def test_members_are_distinct(self):
         members = {SF.M_CAPTURE, SF.M_PIN}

@@ -118,7 +118,7 @@ class TestExtensionShape(unittest.TestCase):
                             "本机实测：tuple variant 的 unpack() 返回 5 个空对象，只有 deepUnpack() 对")
 
     def test_writes_a_part_file_then_renames(self):
-        self.assertIn("${outPath}.part", self.code,
+        self.assertIn(".part`", self.code,
                       "必须先写 .part 再 rename：调用方靠「文件出现」判断成功，"
                       "直接写目标文件会让他读到半张图")
         self.assertIn("part.replace(", self.code)
@@ -162,11 +162,14 @@ class TestExtensionShape(unittest.TestCase):
         查两件事：① 真的往 ackPath 里写；② 这行**受 `if (ackPath)` 管**而不是被某个恒假条件挡掉
         （第一版只查 ①，把条件改成 `if (false)` 时判据照样绿 —— 那也是有牙没牙的分界）。
         """
-        self.assertIn("GLib.file_set_contents(ackPath,", self.code)
-        self.assertIn("if (ackPath)", self.code,
+        # 只看 `pinImage()` 的函数体：`clearPins()` 里也有一处写 ack，
+        # 拿整份文件找下标会把两处混在一起（2026-10-19 加了 ClearPins 之后这里真红过一次）。
+        body = _function_body(self.code, "function pinImage(")
+        self.assertIn("GLib.file_set_contents(ackPath,", body)
+        self.assertIn("if (ackPath)", body,
                       "ack 写入被别的条件挡着（比如恒假），capsplus 就会一直等到超时")
-        self.assertLess(self.code.index("addTopChrome(actor)"),
-                        self.code.index("GLib.file_set_contents(ackPath,"),
+        self.assertLess(body.index("addTopChrome(actor)"),
+                        body.index("GLib.file_set_contents(ackPath,"),
                         "顺序必须是「先真挂上去、再写 ack」：反了会报成功但屏幕上什么都没有")
 
     def test_pin_journal_line_is_parsed_by_python(self):
@@ -230,3 +233,21 @@ class TestGuardHasTeeth(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+def _function_body(code: str, header: str) -> str:
+    """从 `header` 那行开始，按花括号配平截出这个函数的**函数体**。
+
+    为什么要它：同一份文件里有多处写 ack / 多处 connect，判据必须只看目标函数那一段
+    —— 否则"新增一个函数"就会把老判据带红（或者更糟：老判据被新代码蒙对）。
+    """
+    start = code.index(header)
+    brace = code.index("{", start)
+    depth = 0
+    for idx in range(brace, len(code)):
+        if code[idx] == "{":
+            depth += 1
+        elif code[idx] == "}":
+            depth -= 1
+            if depth == 0:
+                return code[start:idx + 1]
+    raise AssertionError(f"{header} 的花括号没配平")

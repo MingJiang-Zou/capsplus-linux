@@ -39,6 +39,7 @@ import Meta from 'gi://Meta';
 import Shell from 'gi://Shell';
 import St from 'gi://St';
 import * as Main from 'resource:///org/gnome/shell/ui/main.js';
+import * as PopupMenu from 'resource:///org/gnome/shell/ui/popupMenu.js';
 
 const BUS_NAME = 'io.github.capsplus.RaiseBrowser';
 const OBJ_PATH = '/io/github/capsplus/RaiseBrowser';
@@ -48,12 +49,44 @@ const M_PROBE = 'Probe';
 const M_REPORT = 'ProbeReport';
 const M_CAPTURE = 'CaptureArea';
 const M_PIN = 'PinImage';
+const M_CLEAR = 'ClearPins';
 
 let _ownId = 0;
 let _subRaise = 0;
 let _subProbe = 0;
 let _subCapture = 0;
 let _subPin = 0;
+let _subClear = 0;
+
+/**
+ * 同一条信号被**两个订阅**收到的情况：扩展被 `gnome-extensions disable/enable` 热重载过。
+ * 旧实例的订阅摘不掉（这版 GJS 没有 `signal_remove`，见 `disable()`），于是每次请求都跑两遍：
+ *   * 抓帧：两条 handler 抢同一个 `.part` ⇒ 后一条触发 "Only one screenshot operation at a time"，
+ *     它的失败清理又删掉 `.part`，前一条 rename 时"没有那个文件" ⇒ **两条都失败**。
+ *     2026-10-19 实测（明江那边就是"按了没反应"）：每次抓帧都是两行 started + 两行 fail。
+ *   * 贴图：一张图会变成两张；清空：ack 写两遍。
+ *
+ * 所以用 shell 的 `global` 当**跨实例**去重表 —— 模块级变量各实例一份，挡不住这种重复。
+ * 窗口取 1 秒：人手重复触发不会这么快，而重复订阅一定是同一瞬间。
+ */
+function duplicateRequest(kind, key, windowMs = 1000) {
+    const now = GLib.get_monotonic_time() / 1000;
+    global.__capsplusSeen = global.__capsplusSeen || new Map();
+    const seen = global.__capsplusSeen;
+    const last = seen.get(`${kind}:${key}`);
+    seen.set(`${kind}:${key}`, now);
+    if (seen.size > 64) {
+        for (const [k, v] of seen) {
+            if (now - v > 10000)
+                seen.delete(k);
+        }
+    }
+    if (last !== undefined && (now - last) < windowMs) {
+        console.log(`[raise-browser] dup request=${kind} key=${key} —— 跳过（重复订阅）`);
+        return true;
+    }
+    return false;
+}
 
 function defaultBrowserDesktopId() {
     const info = Gio.AppInfo.get_default_for_type('x-scheme-handler/https', false);
@@ -195,7 +228,10 @@ function captureArea(x, y, width, height, outPath) {
     const sx = Math.round(x * scale), sy = Math.round(y * scale);
     const sw = Math.round(width * scale), sh = Math.round(height * scale);
     const rect = `rect=${sx},${sy},${sw},${sh} scale=${scale}`;
-    const part = Gio.File.new_for_path(`${outPath}.part`);
+    // `.part` 名字带**每次调用唯一**的后缀：万一还是有两个 handler 同时进来（老实例的订阅摘不掉），
+    // 它们各写各的，不会互相删文件 —— 只有 rename 到同一个 outPath 那一步会撞，谁先到谁赢（内容一样）。
+    const part = Gio.File.new_for_path(
+        `${outPath}.${GLib.get_monotonic_time().toString(36)}.part`);
     const out = Gio.File.new_for_path(outPath);
     console.log(`[raise-browser] shot result=started path=${outPath} ${rect}`);
 
@@ -260,17 +296,80 @@ function captureArea(x, y, width, height, outPath) {
 const PIN_MIN_SCALE = 0.2;
 const PIN_MAX_SCALE = 4.0;
 const PIN_DOUBLE_CLICK_MS = 350;      // 双击判定间隔（自己算，不依赖 event 的 click_count）
+const PIN_OPACITY_STEP = 0.1;
+const PIN_OPACITY_MIN = 0.2;          // 再低就找不着了（Snipaste 也有下限）
 
-let _pins = [];                        // 多张并存：每项 = {actor, scale, dragging, lastClickMs}
+let _pins = [];                        // 多张并存：每项 = {actor, scale, opacity, dragging, grab, ...}
 
 function pinLog(result, extra) {
     console.log(`[raise-browser] pin result=${result}${extra ? ' ' + extra : ''}`);
+}
+
+// ── 模态焦点：点/拖某张贴图 → 键盘归它，Esc 关掉它（明江 2026-10-19 要的就是 Snipaste 这套）──
+//
+// **本机实测**（不是照网上写法来的，2026-10-19 从 shell 自己的 JS 资源里读出来的：
+//   `gresource list /usr/lib/gnome-shell/libshell-18.so` → 抽 `/org/gnome/shell/ui/main.js`）：
+//   * `Main.pushModal(actor, params = {})` 内部是 `global.stage.grab(actor)`，**返回 `Clutter.Grab`**，
+//     默认 `actionMode: Shell.ActionMode.NONE`；它自己 `set_key_focus(actor)`
+//     —— 所以 `can_focus` 不参与（保持 false 挺好：普通焦点不会 Tab 到贴图上）；
+//   * `Main.popModal(grab)` 收的是**那个 grab**（不是 actor），找不到就 `throw new Error('incorrect pop')`
+//     ⇒ 必须自己存 grab、pop 之前先清引用，绝不二次 pop；
+//   * pushModal 还会 `actor.connect('destroy', …popModal)`：actor 一销毁就自动摘焦点。**仍然显式配对**，
+//     因为我们要保证"能 destroy 的每条路都先 pop"（宁可多一次显式调用，也不要赌自动那一下）。
+//   * 它是 `global.stage.grab`：**键盘和鼠标一起抓**。所以"点窗外"要主动交还焦点
+//     （见 `_isOutside`）—— 否则明江点到别的窗口会像"点不动"。
+//
+// ⚠ 灾难级失误的防线：pushModal 没配对 popModal = shell 卡在模态态、明江的键盘进不了任何应用。
+//   本文件里 pushModal **只有一处**（`grabPinFocus`），popModal **只有一处**（`releasePinFocus`），
+//   而所有销毁路径都必经 `destroyPin` → `releasePinFocus`。判据
+//   `tests/test_raise_pin_ui.py::TestModalFocusIsPaired` 就是钉这件事的（删掉 pop 必红）。
+function releasePinFocus(pin) {
+    if (!pin.grab)
+        return false;
+    const grab = pin.grab;
+    pin.grab = null;               // 先清引用：万一 popModal 抛了也不会有人再 pop 同一个 grab
+    try {
+        Main.popModal(grab);
+    } catch (e) {
+        console.error(`[raise-browser] popModal 失败：${e.message}`);
+    }
+    pin.actor.remove_style_class_name('capsplus-pin-active');
+    pinLog('focus-released', `left=${_pins.length}`);
+    return true;
+}
+
+function grabPinFocus(pin) {
+    if (pin.grab)
+        return true;               // 已经拿着了（重复点不该 push 第二次）
+    for (const other of _pins) {    // 焦点**只在该张上**：换一张就把上一张的交还
+        if (other !== pin)
+            releasePinFocus(other);
+    }
+    try {
+        pin.grab = Main.pushModal(pin.actor);
+    } catch (e) {
+        pin.grab = null;
+        pinLog('focus-fail', `why=${e.message}`);
+        return false;
+    }
+    pin.actor.add_style_class_name('capsplus-pin-active');
+    pinLog('focus', `left=${_pins.length}`);
+    return true;
 }
 
 function destroyPin(pin) {
     const idx = _pins.indexOf(pin);
     if (idx !== -1)
         _pins.splice(idx, 1);
+    releasePinFocus(pin);           // **唯一出口**：任何销毁路径都先摘焦点（配对纪律，见上面的注释）
+    if (pin.menu) {
+        try {
+            pin.menu.destroy();
+        } catch (e) {
+            console.error(`[raise-browser] pin 菜单销毁失败：${e.message}`);
+        }
+        pin.menu = null;
+    }
     try {
         Main.layoutManager.removeChrome(pin.actor);
     } catch (e) {
@@ -289,17 +388,140 @@ function destroyAllPins() {
         destroyPin(pin);
 }
 
+/** 全局兜底（keyd 的 `Caps+Esc` 走这里）：清空所有贴图，**没有贴图时也安全**。 */
+function clearPins(ackPath) {
+    const before = _pins.length;
+    destroyAllPins();
+    if (ackPath)
+        GLib.file_set_contents(ackPath, `cleared=${before}\nleft=${_pins.length}\n`);
+    pinLog('clear-all', `cleared=${before} left=${_pins.length}`);
+    return before;
+}
+
+// ── 工具条（hover 出现）的三件事：复制 / 存盘 / 关闭 ────────────────────────────
+// 为什么复制和存盘要 PNG 路径：`St.Clipboard.set_content(type, 'image/png', bytes)` 要**PNG 字节**，
+// 而贴图本体在 shell 这边是裸 RGBA（不解码是刻意的）。所以 PinImage 信号里多带一个 pngPath
+// —— capsplus 侧本来就生成过那个 PNG，白拿。（用法与 shell 自己的 screenshot.js 一致，实测同上。）
+
+function copyPin(pin) {
+    if (!pin.pngPath)
+        return pinLog('copy', 'why=没有 PNG 路径');
+    try {
+        const [ok, bytes] = GLib.file_get_contents(pin.pngPath);
+        if (!ok)
+            throw new Error(`读不到 ${pin.pngPath}`);
+        St.Clipboard.get_default().set_content(St.ClipboardType.CLIPBOARD, 'image/png',
+            GLib.Bytes.new(bytes));
+        pinLog('copy', `bytes=${bytes.length}`);
+    } catch (e) {
+        pinLog('copy-fail', `why=${e.message}`);
+    }
+}
+
+function savePin(pin) {
+    if (!pin.pngPath)
+        return pinLog('save', 'why=没有 PNG 路径');
+    try {
+        const dir = GLib.build_filenamev([GLib.get_home_dir(), 'Pictures', 'Screenshots']);
+        GLib.mkdir_with_parents(dir, 0o755);
+        const stamp = GLib.DateTime.new_now_local().format('%Y-%m-%d-%H%M%S');
+        const dest = GLib.build_filenamev([dir, `pin-${stamp}.png`]);
+        const [ok, bytes] = GLib.file_get_contents(pin.pngPath);
+        if (!ok)
+            throw new Error(`读不到 ${pin.pngPath}`);
+        GLib.file_set_contents(dest, bytes);
+        pinLog('save', `path=${dest} bytes=${bytes.length}`);
+    } catch (e) {
+        pinLog('save-fail', `why=${e.message}`);
+    }
+}
+
+function setPinOpacity(pin, op) {
+    pin.opacity = Math.min(1.0, Math.max(PIN_OPACITY_MIN, op));
+    pin.actor.set_opacity(Math.round(pin.opacity * 255));   // St 的 opacity 是 0–255
+    pinLog('opacity', `value=${pin.opacity.toFixed(2)}`);
+}
+
+function buildPinToolbar(pin) {
+    const bar = new St.BoxLayout({style_class: 'capsplus-pin-toolbar', reactive: true,
+                                  track_hover: true, visible: false});
+    for (const [label, cb] of [['复制', () => copyPin(pin)],
+                               ['存盘', () => savePin(pin)],
+                               ['×', () => destroyPin(pin)]]) {
+        const btn = new St.Button({label, style_class: 'capsplus-pin-tool', can_focus: false});
+        btn.connect('clicked', cb);
+        bar.add_child(btn);
+    }
+    // 工具条是**贴图的子 actor**：拖贴图时它跟着走，不用单独跟着算位置
+    bar.set_position(0, pin.height + 6);
+    if (pin.y + pin.height + 6 + 34 > global.stage.height)
+        bar.set_position(0, -34);                    // 底下放不下就放上面
+    bar.connect('enter-event', () => {
+        bar.show();
+        return Clutter.EVENT_PROPAGATE;
+    });
+    bar.connect('leave-event', () => {
+        bar.hide();
+        return Clutter.EVENT_PROPAGATE;
+    });
+    return bar;
+}
+
+function openPinMenu(pin) {
+    if (pin.menu) {
+        try {
+            pin.menu.destroy();
+        } catch (e) {
+            pin.menu = null;
+        }
+    }
+    // 签名实测自 shell 自己的 `backgroundMenu.js`：`new PopupMenu.PopupMenu(sourceActor, 0, St.Side.TOP)`
+    // + `layoutManager.uiGroup.add_child(menu.actor)` + `menu.open()`。
+    const menu = new PopupMenu.PopupMenu(pin.actor, 0, St.Side.TOP);
+    const add = (label, cb) => {
+        const item = new PopupMenu.PopupMenuItem(label);
+        item.connect('activate', cb);
+        menu.addMenuItem(item);
+    };
+    add('关闭这张（Esc）', () => destroyPin(pin));
+    add('复制到剪贴板', () => copyPin(pin));
+    add('存盘到图片目录', () => savePin(pin));
+    menu.addMenuItem(new PopupMenu.PopupSeparatorMenuItem());
+    add('更不透明（Ctrl+滚轮）', () => setPinOpacity(pin, pin.opacity + PIN_OPACITY_STEP));
+    add('更透明（Ctrl+滚轮）', () => setPinOpacity(pin, pin.opacity - PIN_OPACITY_STEP));
+    add('清空所有贴图', () => clearPins(''));
+    Main.layoutManager.uiGroup.add_child(menu.actor);
+    menu.open();
+    pin.menu = menu;
+    pinLog('menu-open', `left=${_pins.length}`);
+    return menu;
+}
+
+/** 这次点击在不在贴图（含工具条）身上 —— 抓了模态抓不到别人，得自己算。 */
+function isOutsidePin(pin, event) {
+    const [ex, ey] = event.get_coords();
+    const [ax, ay] = pin.actor.get_transformed_position();
+    const [, aw, ah] = [0, pin.width, pin.height];
+    const slack = 40;                                   // 工具条在下方 40px 内也算"贴图上"
+    return ex < ax || ey < ay || ex > ax + aw || ey > ay + ah + slack;
+}
+
 /**
  * 把一张**已经是 RGBA 原图**的文件钉成置顶图层 actor。
  * 为什么传原图而不是 PNG：shell 这边不做解码（GJS 里没有现成的 PNG→像素），解码由 capsplus
- * 侧用 PIL 做完（`capsplus/shot_pin.py`），少一整条会出错的路。
+ * 侧用 PIL 做完（`capsplus/shot_pin.py`），少一整条会出错的路。PNG 路径单独带进来，只给
+ * "复制/存盘"两个按钮用（见 `copyPin`）。
  *
- * 交互：左键拖动、滚轮缩放（0.2×–4×）、双击或点右上角 × 关闭、**不抢键盘焦点**
- * （× 按钮显式 `can_focus: false`，全文件不调 `grab_key_focus`）、可多张并存。
- * 成功写 ack 文件（内容含 left= 张数）—— 与抓帧"等产物"是同一条口径：没有回复通道，
+ * 交互（2026-10-19 按 Snipaste 对齐）：
+ *   * 左键拖动移动、滚轮缩放（0.2×–4×）、**Ctrl+滚轮调透明度**（0.2–1.0）；
+ *   * 点击/拖动 → 拿键盘焦点（模态），**Esc 关掉这张**；点窗外交还焦点；
+ *   * hover 出工具条（复制 / 存盘 / ×）；右键出菜单（关闭 / 复制 / 存盘 / 透明度 / 清空全部）；
+ *   * 双击关闭、点右上角 × 关闭、`Caps+Esc` 全局清空（走 D-Bus 的 ClearPins）。
+ * 五条路都归到 `destroyPin` 这一个出口 —— 焦点配对纪律全靠这一点。
+ * 成功写 ack 文件（内容含 left= 张数）—— 与抓帧"等产物"同一条口径：没有回复通道，
  * 所以"成没成"只认文件。
  */
-function pinImage(rawPath, width, height, x, y, ackPath) {
+function pinImage(pngPath, rawPath, width, height, x, y, ackPath) {
     const t0 = GLib.get_monotonic_time();
     const ms = () => Math.round((GLib.get_monotonic_time() - t0) / 1000);
     try {
@@ -319,30 +541,61 @@ function pinImage(rawPath, width, height, x, y, ackPath) {
                                       track_hover: true});
         holder.set_content(content);
         holder.set_size(width, height);
-        const close = new St.Button({label: '×', style_class: 'capsplus-pin-close',
-                                     can_focus: false});   // ← 不抢键盘焦点的关键
-        close.set_position(Math.max(width - 24, 0), 0);
 
-        const actor = new St.Widget({style_class: 'capsplus-pin-box', reactive: true});
+        const actor = new St.Widget({style_class: 'capsplus-pin-box', reactive: true,
+                                     track_hover: true});
         actor.add_child(holder);
-        actor.add_child(close);
         actor.set_size(width, height);
         actor.set_position(x, y);
         actor.set_pivot_point(0.5, 0.5);      // 缩放绕中心，不然会"跑"
 
-        const pin = {actor, scale: 1.0, dragging: null, lastClickMs: 0};
+        const pin = {actor, pngPath: pngPath || '', rawPath, width, height, x, y,
+                     scale: 1.0, opacity: 1.0, dragging: null, lastClickMs: 0, grab: null,
+                     menu: null};
         _pins.push(pin);
 
-        close.connect('clicked', () => destroyPin(pin));
-        actor.connect('button-press-event', (a, event) => {
-            if (event.get_button() !== 1)
+        const toolbar = buildPinToolbar(pin);
+        actor.add_child(toolbar);
+        pin.toolbar = toolbar;
+        actor.connect('enter-event', () => {
+            toolbar.show();
+            return Clutter.EVENT_PROPAGATE;
+        });
+        actor.connect('leave-event', () => {
+            toolbar.hide();
+            return Clutter.EVENT_PROPAGATE;
+        });
+
+        // Esc 关掉光标下这张 —— 只在拿到模态焦点时到得了（没焦点时不误伤别人）
+        actor.connect('key-press-event', (a, event) => {
+            if (event.get_key_symbol() !== Clutter.KEY_Escape)
                 return Clutter.EVENT_PROPAGATE;
+            pinLog('esc', `left=${Math.max(_pins.length - 1, 0)}`);
+            destroyPin(pin);
+            return Clutter.EVENT_STOP;
+        });
+
+        actor.connect('button-press-event', (a, event) => {
+            const button = event.get_button();
+            if (button === 3) {                        // 右键：菜单（Snipaste 也是右键出菜单）
+                grabPinFocus(pin);
+                openPinMenu(pin);
+                return Clutter.EVENT_STOP;
+            }
+            if (button !== 1)
+                return Clutter.EVENT_PROPAGATE;
+            if (pin.grab && isOutsidePin(pin, event)) {
+                // 模态抓着键盘+鼠标：点到窗外要**主动交还**，不然下一个窗口像"点不动"
+                releasePinFocus(pin);
+                return Clutter.EVENT_PROPAGATE;
+            }
             const now = GLib.get_monotonic_time() / 1000;
             if (now - pin.lastClickMs < PIN_DOUBLE_CLICK_MS) {
                 destroyPin(pin);
                 return Clutter.EVENT_STOP;
             }
             pin.lastClickMs = now;
+            grabPinFocus(pin);                          // 点/拖 = 键盘归它
             const [px, py] = event.get_coords();
             pin.dragging = [px - a.x, py - a.y];
             return Clutter.EVENT_STOP;
@@ -352,6 +605,8 @@ function pinImage(rawPath, width, height, x, y, ackPath) {
                 return Clutter.EVENT_PROPAGATE;
             const [px, py] = event.get_coords();
             a.set_position(px - pin.dragging[0], py - pin.dragging[1]);
+            pin.x = a.x;
+            pin.y = a.y;
             return Clutter.EVENT_STOP;
         });
         actor.connect('button-release-event', () => {
@@ -359,14 +614,17 @@ function pinImage(rawPath, width, height, x, y, ackPath) {
             return Clutter.EVENT_STOP;
         });
         actor.connect('scroll-event', (a, event) => {
+            const state = event.get_state();
             const dir = event.get_scroll_direction();
-            let next = pin.scale;
-            if (dir === Clutter.ScrollDirection.UP)
-                next = pin.scale * 1.1;
-            else if (dir === Clutter.ScrollDirection.DOWN)
-                next = pin.scale / 1.1;
-            else
-                return Clutter.EVENT_PROPAGATE;    // 触控板的 SMOOTH 事件先不管，别乱缩
+            const up = dir === Clutter.ScrollDirection.UP;
+            const down = dir === Clutter.ScrollDirection.DOWN;
+            if (!up && !down)
+                return Clutter.EVENT_PROPAGATE;    // 触控板的 SMOOTH 先不管，别乱缩/乱透
+            if (state & Clutter.ModifierType.CONTROL_MASK) {
+                setPinOpacity(pin, pin.opacity + (up ? PIN_OPACITY_STEP : -PIN_OPACITY_STEP));
+                return Clutter.EVENT_STOP;
+            }
+            let next = up ? pin.scale * 1.1 : pin.scale / 1.1;
             next = Math.min(PIN_MAX_SCALE, Math.max(PIN_MIN_SCALE, next));
             pin.scale = next;
             a.set_scale(next, next);
@@ -430,6 +688,8 @@ export default class RaiseBrowserExtension {
                     console.log(`[raise-browser] shot result=fail why=bad-rect w=${w} h=${h} path=${outPath}`);
                     return;
                 }
+                if (duplicateRequest('capture', String(outPath)))
+                    return;
                 captureArea(x, y, w, h, String(outPath));
             });
         // 这行是**增量标记**：改完扩展后 `gnome-extensions disable/enable` 到底有没有重新 import，
@@ -443,19 +703,41 @@ export default class RaiseBrowserExtension {
                     pinLog('fail', `why=bad-params:${e.message}`);
                     return;
                 }
-                if (!args || args.length < 6) {
+                if (!args || args.length < 7) {
                     pinLog('fail', `why=bad-params:n=${args ? args.length : 0}`);
                     return;
                 }
-                const [rawPath, w, h, x, y, ackPath] = args;
+                // (ssiiiis) = pngPath, rawPath, w, h, x, y, ackPath —— 与 capsplus 侧
+                // `shot_frame.PIN_SIG` 逐字对应（判据 `test_shot_extension` 在钉这件事）。
+                const [pngPath, rawPath, w, h, x, y, ackPath] = args;
                 if (!(w > 0 && h > 0) || !rawPath) {
                     pinLog('fail', `why=bad-image w=${w} h=${h} path=${rawPath}`);
                     return;
                 }
-                pinImage(String(rawPath), w, h, x, y, ackPath ? String(ackPath) : '');
+                if (duplicateRequest('pin', String(rawPath)))
+                    return;
+                pinImage(pngPath ? String(pngPath) : '', String(rawPath), w, h, x, y,
+                    ackPath ? String(ackPath) : '');
+            });
+        // 全局兜底：`Caps+Esc` 清空所有贴图（keyd 侧的热键是主代理的活儿）。
+        // **没有贴图时也安全**：只是清 0 张 + 写 ack 一行 cleared=0（判据会钉这条）。
+        _subClear = Gio.DBus.session.signal_subscribe(null, IFACE, M_CLEAR, null, null, null,
+            (_c, _sender, _path, _iface, _member, params) => {
+                let args;
+                try {
+                    args = params.deepUnpack();
+                } catch (e) {
+                    pinLog('clear-fail', `why=bad-params:${e.message}`);
+                    return;
+                }
+                const ackPath = (args && args.length >= 1 && args[0]) ? String(args[0]) : '';
+                if (duplicateRequest('clear', ackPath || 'default'))
+                    return;
+                clearPins(ackPath);
             });
         console.log(`[raise-browser] ready capture=${_subCapture ? 'on' : 'off'} ` +
-            `pin=${_subPin ? 'on' : 'off'} promisified=${_areaPromisified} ${report('')}`);
+            `pin=${_subPin ? 'on' : 'off'} clear=${_subClear ? 'on' : 'off'} ` +
+            `toolbar+menu+modal=on promisified=${_areaPromisified} ${report('')}`);
     }
 
     disable() {
@@ -480,6 +762,10 @@ export default class RaiseBrowserExtension {
             if (_subPin) {
                 conn.signal_remove(_subPin);
                 _subPin = 0;
+            }
+            if (_subClear) {
+                conn.signal_remove(_subClear);
+                _subClear = 0;
             }
         } else {
             console.log('[raise-browser] 这版 GJS 没有 signal_remove，留到 shell 重启再清');

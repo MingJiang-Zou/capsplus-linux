@@ -1,0 +1,77 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
+/* Copyright (c) 2026 capsplus-linux contributors
+ * 本文件属 capsplus-linux —— CapsLock+ v3.3.0 的 Linux 移植（衍生作品）；按键映射数据译自上游：
+ *   上游 https://github.com/wo52616111/capslock-plus （GPL-2.0，© wo52616111）；改动见 README「许可与上游」。
+ *
+ * 贴图（pin）的样式。**这个文件以前不存在** —— 而 extension.js 里早就在用
+ * `capsplus-pin` / `capsplus-pin-close` / `capsplus-pin-box` 三个 class（2026-10-19 主代理查证）。
+ * 没有样式表 = 那些 class 一个都不生效：`×` 是裸 `St.Button`，没尺寸、没背景、没 hover 反馈，
+ * 明江的原话就是"贴出来的图 删都删不掉"（看不出那儿能点）。
+ *
+ * GNOME 会把扩展目录下的同名 `stylesheet.css` 自动加载（不用在 metadata.json 里声明，也不用 reload）；
+ * 改这个文件之后 `gnome-extensions disable/enable <uuid>` 即生效（不需要注销重登）。
+ * 用的是 St 的 CSS 子集：`box-shadow` / `border-radius` / `spacing` / `padding` 都在支持范围内
+ * （shell 自己的主题就大量用这几样）。
+ */
+
+/* 贴图本体：浮起来一眼看出是"贴"在屏幕上的东西，不是桌面壁纸的一部分 */
+.capsplus-pin-box {
+    border: 1px solid rgba(255, 255, 255, 0.55);
+    border-radius: 4px;
+    box-shadow: 0 6px 20px rgba(0, 0, 0, 0.55);
+}
+
+/* 拿到键盘焦点（点/拖之后）时的反馈：明江要能看出"键现在归它" */
+.capsplus-pin-box.capsplus-pin-active {
+    border: 1px solid rgba(90, 200, 255, 0.95);
+    box-shadow: 0 0 0 1px rgba(90, 200, 255, 0.65), 0 6px 22px rgba(0, 0, 0, 0.6);
+}
+
+.capsplus-pin {
+    border-radius: 3px;
+}
+
+/* hover 出来的小工具条 */
+.capsplus-pin-toolbar {
+    spacing: 3px;
+    padding: 3px;
+    background-color: rgba(22, 22, 26, 0.94);
+    border-radius: 7px;
+    box-shadow: 0 4px 14px rgba(0, 0, 0, 0.6);
+}
+
+.capsplus-pin-tool {
+    min-width: 30px;
+    height: 26px;
+    border-radius: 5px;
+    color: #ffffff;
+    font-size: 12px;
+    text-align: center;
+}
+
+.capsplus-pin-tool:hover {
+    background-color: rgba(255, 255, 255, 0.22);
+}
+
+.capsplus-pin-tool:active {
+    background-color: rgba(255, 255, 255, 0.34);
+}
+
+/* 兼容早期那版独立 `×` 按钮（现在是工具条里的一个按钮；留着这行为的是别让老代码裸奔） */
+.capsplus-pin-close {
+    width: 22px;
+    height: 22px;
+    border-radius: 11px;
+    color: #ffffff;
+    font-size: 14px;
+    background-color: rgba(0, 0, 0, 0.6);
+}
+
+.capsplus-pin-close:hover {
+    background-color: #d9534f;
+}
+
+/* 右键菜单（PopupMenu 自带 popup-menu 那套样式，这里只补贴图特有的观感） */
+.capsplus-pin-menu .popup-menu-item {
+    padding: 4px 12px;
+}

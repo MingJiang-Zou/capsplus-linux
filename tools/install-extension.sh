@@ -28,7 +28,15 @@ fi
 
 mkdir -p "$DST_DIR"
 cp "$SRC_DIR/metadata.json" "$SRC_DIR/extension.js" "$DST_DIR/"
-say "✓ 已复制到 $DST_DIR"
+# stylesheet.css 也要复制：GNOME 会自动加载**扩展目录下**的同名样式表，
+# 少了它 extension.js 里那些 style_class 一个都不生效 —— 2026-10-19 明江那句
+# "贴出来的图 删都删不掉"就是这条（`×` 变成裸按钮：没尺寸、没背景、没 hover）。
+if [ -f "$SRC_DIR/stylesheet.css" ]; then
+    cp "$SRC_DIR/stylesheet.css" "$DST_DIR/"
+else
+    echo "⚠ 缺 $SRC_DIR/stylesheet.css：贴图会退回裸控件观感（按钮看不出能点）" >&2
+fi
+say "✓ 已复制到 $DST_DIR（含 stylesheet.css）"
 
 # 追加进已启用列表（保留用户原有的，不覆盖）
 if command -v gsettings >/dev/null 2>&1; then

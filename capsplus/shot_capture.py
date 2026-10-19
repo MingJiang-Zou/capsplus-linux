@@ -107,27 +107,87 @@ def capture(x: int, y: int, w: int, h: int, out_path, *, timeout_ms: int = SF.CA
     return True, f"✓ {out}（{check[1]}，等了 {waited}ms）"
 
 
-def command_region(args, deps=None) -> int:
-    """选区 → 抓帧 → 标注窗。`deps` 是给判据用的注入点（真跑时全走默认实现）。"""
+def command_clear_pins(args, deps=None) -> int:
+    """`Caps+Esc` 的活儿：清空所有贴图。
+
+    为什么要它（2026-10-19 明江「贴出来的图 删都删不掉」）：贴图是 shell 的图层 actor，
+    只有 shell 能销毁；而"点某张图上的 ×""右键菜单""Esc（拿到焦点后）"都在那张图上 ——
+    万一哪条不好使，得有**不看光标在哪**的全局兜底。这条走的就是已有的 D-Bus 信号通道。
+    """
     deps = deps or {}
-    select = deps.get("select") or _default_select
+    clear_fn = deps.get("clear")
+    if clear_fn is None:
+        from capsplus import shot_pin
+        clear_fn = shot_pin.clear
+    ok, msg = clear_fn()
+    print(msg, file=sys.stdout if ok else sys.stderr)
+    return 0 if ok else 1
+
+
+def command_region(args, deps=None) -> int:
+    """先冻结帧 → 选区（冻结图当背景）→ **从冻结图裁剪** → 标注窗。
+
+    `deps` 是给判据用的注入点（真跑时全走默认实现）：
+      `monitors` 显示器几何、`capture` 抓帧、`select` 选区、`freeze` 整段冻结、`annotate` 标注、`pin` 钉屏。
+
+    顺序不能改（2026-10-19 P0）：**抓帧必须在遮罩出现之前**。旧版反着来（先开遮罩、确认后再抓），
+    于是遮罩只能靠"透明"露出桌面，Wayland 下直接全黑。
+    """
+    deps = deps or {}
+    select = deps.get("select")
     capture_fn = deps.get("capture") or (lambda x, y, w, h, out: capture(
         x, y, w, h, out, timeout_ms=args.timeout_ms))
     annotate_fn = deps.get("annotate") or _default_annotate
+    providers = deps.get("providers")
+    if providers is None and not deps.get("no_text"):
+        from capsplus import shot_text
+        providers = shot_text.TextProviders()
     pin_fn = deps.get("pin")
     if pin_fn is None and not deps.get("no_pin"):
         from capsplus import shot_pin
         pin_fn = shot_pin.pin
 
-    rect = select()
+    from capsplus import shot_frames as SFR
+    monitors = deps.get("monitors")
+    if monitors is None:
+        monitors, _display = _monitor_geometry(deps)
+    freeze_fn = deps.get("freeze") or (lambda mons: SFR.freeze(mons, capture_fn))
+    frames, union, fmsg = freeze_fn(monitors)
+    if not frames:
+        print(f"✗ 先冻结再选这条链没走通：{fmsg}", file=sys.stderr)
+        print("  没有冻结帧就不开遮罩 —— 那样只能靠透明露桌面，Wayland 下就是全黑盲选",
+              file=sys.stderr)
+        return 1
+    print(fmsg)
+
+    if select is None:
+        def select(_frames, _mons):
+            from capsplus import shot_overlay
+            return shot_overlay.select_region(_frames, monitors=_mons)
+    # 注入点一律 `select(frames, monitors)`：**冻结帧是选区的必需品**（没它就没背景），
+    # 所以签名里必须有它 —— 判据注入的桩也照这个签名写。
+    # 返回值：`(rect, failure)`；`failure` 是遮罩**自检没过**时的那句可操作的话
+    # （2026-10-19：窗口尺寸没对上时宁可说"这次没成"，也不拿一张全黑的去截）。
+    outcome = select(frames, monitors)
+    rect, failure = outcome if isinstance(outcome, tuple) else (outcome, None)
+    if failure:
+        print(failure, file=sys.stderr)
+        return 1
     if not rect:
         print("已取消（没抓图）")
         return 0
+
     out = Path(args.out) if args.out else SF.unique_path(SF.save_dir(), SF.shot_filename())
-    ok, msg = capture_fn(rect[0], rect[1], rect[2], rect[3], out)
-    print(msg, file=sys.stdout if ok else sys.stderr)
-    if not ok:
+    try:
+        surface = SFR.crop_from_frames(rect, frames)
+    except ValueError as exc:
+        print(f"✗ 裁剪失败：{exc}", file=sys.stderr)
         return 1
+    from capsplus.shot_annotate import png_bytes
+    Path(out).write_bytes(png_bytes(surface))
+    print(f"✓ {out}（{Path(out).stat().st_size} 字节，{rect[2]}×{rect[3]}，从冻结图裁剪）")
+    if args.no_annotate:
+        return 0
     if args.no_annotate:
         return 0
 
@@ -140,7 +200,7 @@ def command_region(args, deps=None) -> int:
         tmp.write_bytes(png_bytes(surface))
         return pin_fn(tmp)
 
-    result, saved, message = annotate_fn(str(out), on_pin)
+    result, saved, message = annotate_fn(str(out), on_pin, providers)
     if message:
         print(message)
     if saved:
@@ -189,15 +249,25 @@ def command_pin(args, deps=None) -> int:
     return 0 if ok else 1
 
 
-def _default_select():
-    """真跑：起选区遮罩（第 2 步），返回全局逻辑坐标的矩形；取消返回 None。"""
+def _monitor_geometry(deps=None):
+    """显示器几何（全局逻辑坐标）。判据注入假的；真跑走 GDK（与抓帧坐标同一套）。"""
+    deps = deps or {}
+    try:
+        from capsplus import shot_overlay
+        return shot_overlay.monitor_rects()
+    except Exception:
+        return [], None
+
+
+def _default_select(frames, monitors):
+    """真跑：起选区遮罩（冻结帧当背景），返回 `(矩形 | None, 失败说明 | None)`。"""
     from capsplus import shot_overlay
-    return shot_overlay.select_region()
+    return shot_overlay.select_region(frames, monitors=monitors)
 
 
-def _default_annotate(png_path, on_pin):
+def _default_annotate(png_path, on_pin, providers=None):
     from capsplus import shot_annotate
-    return shot_annotate.annotate(png_path, on_pin=on_pin)
+    return shot_annotate.annotate(png_path, on_pin=on_pin, providers=providers)
 
 
 def parse_args(argv):
@@ -210,6 +280,13 @@ def parse_args(argv):
                    help="拖一个选区（遮罩不闪）→ 抓帧 → 开标注窗")
     p.add_argument("--annotate", metavar="PNG", help="对一张已有的图开标注窗")
     p.add_argument("--pin", metavar="PNG", help="把一张图钉在屏幕上（真置顶）")
+    p.add_argument("--clear-pins", action="store_true",
+                   help="清空屏幕上所有贴图（`Caps+Esc` 全局兜底走这条；没有贴图时也安全）")
+    p.add_argument("--ocr-status", action="store_true", help="看 OCR 两条后端现在什么状态")
+    p.add_argument("--install-local-ocr", action="store_true",
+                   help="一条命令装本地 OCR（下载 ~136MB、占盘 ~392MB、模型随包带；走镜像约 40 秒）")
+    p.add_argument("--translate-status", action="store_true",
+                   help="看翻译两条后端现在什么状态（本机模型起没起、云端有没有凭据）")
     p.add_argument("--at", nargs=2, type=int, metavar=("X", "Y"),
                    help="钉屏位置（默认主屏中间偏上）；逻辑坐标")
     p.add_argument("--no-annotate", action="store_true", help="--region 抓完不开标注窗")
@@ -230,6 +307,21 @@ def main(argv=None) -> int:
             print(rec.get("raw", ""))
         return 0
 
+    if args.ocr_status:
+        from capsplus import shot_ocr
+        print(shot_ocr.describe())
+        return 0
+    if args.install_local_ocr:
+        from capsplus import shot_ocr
+        ok, msg = shot_ocr.install_local()
+        print(msg, file=sys.stdout if ok else sys.stderr)
+        return 0 if ok else 1
+    if args.translate_status:
+        from capsplus import shot_translate
+        print(shot_translate.describe())
+        return 0
+    if args.clear_pins:
+        return command_clear_pins(args)
     if args.region:
         return command_region(args)
     if args.annotate:
@@ -239,7 +331,8 @@ def main(argv=None) -> int:
 
     if not args.capture:
         print("用法：capsplus-shot --region | --capture X Y W H [--out FILE] | "
-              "--annotate PNG | --pin PNG [--at X Y]（--help 看全部）", file=sys.stderr)
+              "--annotate PNG | --pin PNG [--at X Y] | --clear-pins（--help 看全部）",
+              file=sys.stderr)
         return 2
 
     x, y, w, h = args.capture

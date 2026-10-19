@@ -2,22 +2,25 @@
 # Copyright (c) 2026 capsplus-linux contributors
 # 本文件属 capsplus-linux —— CapsLock+ v3.3.0 的 Linux 移植（衍生作品）；按键映射数据译自上游：
 #   上游 https://github.com/wo52616111/capslock-plus （GPL-2.0，© wo52616111）；改动见 README「许可与上游」。
-"""判据：选区遮罩（第 2 步）—— 事件口径、几何换算、遮罩**像素**，以及"绝不闪"这条硬要求。
+"""判据：选区遮罩（第二批 P0 重写版）—— **背景必须是冻结图**、选区跨屏、整屏捷径、贴边吸附。
 
-为什么像素也要机器判：明江换掉 Snipaste 的理由就是"截图会闪一下"。闪是**表现**，
-机器只能钉住"没有任何动画"（`TestNoAnimation` 扫源码）与"遮罩画出来的样子符合口径"
-（`TestPaintPixels` 渲染到 ImageSurface 上逐像素断言：**选区内全透明、选区外压暗**、
-边框是亮青色）。这两条一起，人才不用靠肉眼去分辨闪没闪。
+这一版为什么重写（2026-10-19 明江真机「框选的时候全黑屏是盲选」）：
+旧版是「全屏半透明窗 + 压暗 + 指望合成器把桌面透出来」，Wayland 下拿不到 ARGB 就是**全黑**，
+而 xvfb（X11 有 ARGB 视觉）**永远复现不了** —— 当时那批像素判据全绿却拦不住真机 bug。
 
-GUI 用例（`TestRealWindow`）默认 skip：只有 `CAPSPLUS_GUI=1` 才跑，且 GDK 连到**真实 Wayland
-桌面**时整类拒跑（`CAPSPLUS_WAYLAND=1` 才放行）—— 与 `tests/test_settings_window.py` 同一套口径，
-理由也一样：这台机是明江干活的机器，不许判据把窗口弹到他屏幕上。
+所以判据分两层，**关键的那层不看 alpha**：
+  * `TestFrozenBackgroundIsTheContent`：拿一张**有图案的假冻结图**当背景，断言「选区里能看到图案」
+    —— 拦的是「背景不是冻结图」（透明、纯色、纯黑都会红）；
+  * `TestNoTransparencyReliance`：再补一条「整块画布每个像素都不透明」，把病根直接焊死；
+  * `TestNoAnimation`：不闪（明江换掉 Snipaste 就是因为闪）—— 扫源码里不许出现动画 API。
+
+GUI 用例默认 skip：`CAPSPLUS_GUI=1` 才跑，且 GDK 连到**真实 Wayland 桌面**时整类拒跑
+（`CAPSPLUS_WAYLAND=1` 才放行）—— 这台机是明江干活的机器，不许判据把窗口弹到他屏幕上。
 CI 里用虚拟显示真跑：`xvfb-run -a env -u WAYLAND_DISPLAY GDK_BACKEND=x11 CAPSPLUS_GUI=1
 python3 -m unittest tests.test_shot_overlay`。
 """
 
-import ast
-import math
+import inspect
 import os
 import pathlib
 import re
@@ -27,29 +30,30 @@ import unittest
 REPO = pathlib.Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO))
 
-from capsplus import shot_overlay as OV          # noqa: E402
-from capsplus import shot_frame as SF            # noqa: E402
+from capsplus import shot_frames as SFR        # noqa: E402
+from capsplus import shot_overlay as OV        # noqa: E402
 
 try:
     import cairo
     HAVE_CAIRO = True
-except Exception:                                 # pragma: no cover - 无 pycairo 的机器
+except Exception:
     cairo = None
     HAVE_CAIRO = False
 
 RUN_GUI = os.environ.get("CAPSPLUS_GUI") == "1"
 ALLOW_WAYLAND_DESKTOP = os.environ.get("CAPSPLUS_WAYLAND") == "1"
 
-MONITORS = [(0, 0, 1920, 1080), (1920, 0, 1920, 1080), (3840, 540, 960, 540)]
+BLUE = (0.2, 0.4, 0.9)
+GREEN = (0.1, 0.85, 0.3)
 
 
-def desktop_risk() -> str:
-    """GDK 连上的到底是不是**真实 Wayland 桌面**（照抄 test_settings_window 的口径：
-    `import gi` 之后再设 `GDK_BACKEND=x11` 无效，只能跑之前查）。"""
+def guard() -> str:
+    """没设 CAPSPLUS_GUI=1、或 GDK 连的是明江的真实 Wayland 桌面，就别跑界面用例。"""
     if not RUN_GUI:
         return "没设 CAPSPLUS_GUI=1"
     try:
         import gi
+        gi.require_version("Gtk", "3.0")
         gi.require_version("Gdk", "3.0")
         from gi.repository import Gdk
     except Exception as exc:
@@ -57,375 +61,820 @@ def desktop_risk() -> str:
     disp = Gdk.Display.get_default()
     if disp is None:
         return "连不上显示服务器"
-    backend = type(disp).__name__
-    if "Wayland" in backend and not ALLOW_WAYLAND_DESKTOP:
-        return (f"GDK 连的是真实 Wayland 桌面（{backend}）：按口径拒跑，"
-                "要用虚拟显示请先 `env -u WAYLAND_DISPLAY GDK_BACKEND=x11`")
+    if "Wayland" in type(disp).__name__ and not ALLOW_WAYLAND_DESKTOP:
+        return "GDK 连的是真实 Wayland 桌面：按口径拒跑"
     return ""
 
 
-GUI_SKIP = desktop_risk()
+GUI_SKIP = guard()
 
 
-def stub_overlay(settle_ms=0, **kw):
-    """判据用的遮罩对象：**不建真窗**，用假窗口列表；settle 直接同步执行。"""
-    ov = OV.Overlay(settle_ms=settle_ms, monitors=MONITORS, **kw)
-    ov.windows = [_FakeWin(), _FakeWin(), _FakeWin()]
-    ov._settle_then_fire = ov._fire          # 判据不跑主循环，settle 那一下直接落地
-    return ov
+def pattern_surface(w: int, h: int, left=BLUE, right=GREEN):
+    """左半一种颜色、右半另一种：跨屏/裁切都能一眼看出「哪一块来自哪张冻结图」。"""
+    surface = cairo.ImageSurface(cairo.FORMAT_ARGB32, max(1, w), max(1, h))
+    cr = cairo.Context(surface)
+    cr.set_source_rgb(*left)
+    cr.rectangle(0, 0, w / 2, h)
+    cr.fill()
+    cr.set_source_rgb(*right)
+    cr.rectangle(w / 2, 0, w / 2, h)
+    cr.fill()
+    return surface
 
 
-class _FakeWin:
-    def __init__(self):
-        self.hidden = False
+def px(surface, x: int, y: int):
+    surface.flush()
+    data = bytes(surface.get_data())
+    off = y * surface.get_stride() + x * 4
+    return (data[off + 2], data[off + 1], data[off], data[off + 3])   # r, g, b, a
 
-    def hide(self):
-        self.hidden = True
+
+def render(area, rect, frame=None, **kw):
+    surface = cairo.ImageSurface(cairo.FORMAT_ARGB32, area[2], area[3])
+    cr = cairo.Context(surface)
+    OV.paint(cr, area, rect, frame=frame, **kw)
+    return surface
 
 
-class TestEventMapping(unittest.TestCase):
-    def test_esc_cancels_and_enter_confirms(self):
+class TestKeyAndButtonMap(unittest.TestCase):
+    def test_escape_cancels_and_enter_confirms(self):
         self.assertEqual(OV.key_action("Escape"), OV.ACTION_CANCEL)
         self.assertEqual(OV.key_action("Return"), OV.ACTION_CONFIRM)
-        self.assertEqual(OV.key_action("KP_Enter"), OV.ACTION_CONFIRM,
-                         "小键盘回车也要算确认（外接键盘上很常见）")
+        self.assertEqual(OV.key_action("KP_Enter"), OV.ACTION_CONFIRM)
 
-    def test_other_keys_do_nothing(self):
-        for name in ("a", "Control_L", "space", ""):
-            self.assertIsNone(OV.key_action(name))
+    def test_ctrl_a_is_full_screen(self):
+        self.assertEqual(OV.key_action("a", ctrl=True), OV.ACTION_FULL)
+        self.assertEqual(OV.key_action("A", ctrl=True), OV.ACTION_FULL)
 
-    def test_left_button_starts_and_right_button_confirms(self):
+    def test_letter_keys_are_not_stolen_without_ctrl(self):
+        """遮罩窗短暂持有键盘焦点：**不许**抢明江的普通按键（'a' 不该被当成全选）。"""
+        for name in ("a", "c", "s", "z", "space", "F5", ""):
+            self.assertIsNone(OV.key_action(name), f"{name} 不该被遮罩吃掉")
+
+    def test_buttons(self):
         self.assertEqual(OV.button_action(1, False), OV.ACTION_START)
         self.assertEqual(OV.button_action(3, True), OV.ACTION_CONFIRM)
-
-    def test_right_click_without_selection_cancels(self):
         self.assertEqual(OV.button_action(3, False), OV.ACTION_CANCEL,
-                         "点了没反应会让人以为卡住了：右键在没选区时就当取消")
-
-    def test_middle_button_is_ignored(self):
+                         "右键时没选区 = 取消（点一下什么都不发生会让人以为卡了）")
         self.assertEqual(OV.button_action(2, True), OV.ACTION_IGNORE)
 
 
-class TestGeometry(unittest.TestCase):
+class TestGeometryHelpers(unittest.TestCase):
+    def setUp(self):
+        self.monitors = [(0, 0, 800, 600), (800, 0, 1200, 800)]
+
     def test_monitor_at(self):
-        self.assertEqual(OV.monitor_at(MONITORS, 10, 10), 0)
-        self.assertEqual(OV.monitor_at(MONITORS, 2000, 500), 1)
-        self.assertEqual(OV.monitor_at(MONITORS, 4000, 600), 2)
-        self.assertIsNone(OV.monitor_at(MONITORS, 4000, 100), "第三块屏 y 从 540 起，100 不在它上面")
+        self.assertEqual(OV.monitor_at(self.monitors, 10, 10), 0)
+        self.assertEqual(OV.monitor_at(self.monitors, 900, 10), 1)
+        self.assertIsNone(OV.monitor_at(self.monitors, 5000, 5000))
 
-    def test_local_global_roundtrip(self):
-        mon = MONITORS[2]
-        g = OV.to_global(mon, (10, 20, 30, 40))
-        self.assertEqual(g, (3850, 560, 30, 40))
-        self.assertEqual(OV.to_local(mon, g), (10, 20, 30, 40))
+    def test_local_global_round_trip(self):
+        for mon in self.monitors:
+            rect = (mon[0] + 5, mon[1] + 7, 20, 30)
+            local = OV.to_local(mon, rect)
+            self.assertEqual(OV.to_global(mon, local), rect)
 
-    def test_dim_bands_cover_everything_except_the_selection(self):
-        area = (0, 0, 100, 100)
-        rect = (20, 30, 40, 50)
-        bands = OV.dim_bands(rect, area)
-        covered = sum(b[2] * b[3] for b in bands)
-        self.assertEqual(covered, 100 * 100 - 40 * 50,
-                         "四条带的面积必须正好等于『整屏减去选区』，不多不少（多一块=选区被压暗了）")
-        for bx, by, bw, bh in bands:
-            self.assertFalse(bx < 60 and bx + bw > 20 and by < 80 and by + bh > 30
-                             and (bw * bh) > 0 and bx >= 20 and by >= 30 and bx + bw <= 60
-                             and by + bh <= 80, "压暗带不许伸进选区里")
+    @unittest.skipUnless(HAVE_CAIRO, "这条要造 cairo 假冻结图")
+    def test_union_and_frame_at(self):
+        self.assertEqual(SFR.union_rect(self.monitors), (0, 0, 2000, 800))
+        frames = [SFR.Frame((0, 0, 800, 600), pattern_surface(800, 600)),
+                  SFR.Frame((800, 0, 1200, 800), pattern_surface(1200, 800))]
+        self.assertIs(frames[1], SFR.frame_at(frames, 900, 100))
+        self.assertIsNone(SFR.frame_at(frames, 5000, 100))
 
-    def test_selection_touching_the_edge_omits_that_band(self):
-        self.assertEqual(len(OV.dim_bands((0, 0, 100, 100), (0, 0, 100, 100))), 0,
-                         "选区铺满整屏时没有一条带")
+    def test_readout_shows_size_and_coordinates(self):
+        self.assertEqual(OV.readout_text((10, 20, 640, 480)), "640 × 480")
+        self.assertEqual(OV.coord_text((10, 20, 640, 480)), "10, 20")
 
-    def test_readout_moves_inside_near_the_top_edge(self):
+    def test_readout_flips_inside_when_at_the_top_edge(self):
         area = (0, 0, 800, 600)
-        x, y = OV.readout_position((10, 0, 100, 100), area)
-        self.assertGreaterEqual(y, 0)
-        x2, y2 = OV.readout_position((10, 300, 100, 100), area)
-        self.assertLess(y2, 300, "正常情况下读数在选区上方外侧")
+        self.assertLess(OV.readout_position((10, 0, 100, 100), area)[1], 100)
 
-    def test_readout_text_is_width_by_height(self):
-        self.assertEqual(OV.readout_text((5, 5, 1280, 720)), "1280 × 720")
+    def test_hint_bar_sits_at_the_bottom(self):
+        _x, y = OV.hint_position((0, 0, 800, 600))
+        self.assertGreater(y, 600 - OV.FONT_SIZE - 40, "提示条要贴底，别盖住内容")
 
+    def test_dim_bands_never_cover_the_selection(self):
+        area = (0, 0, 800, 600)
+        rect = (100, 100, 400, 300)
+        for bx, by, bw, bh in OV.dim_bands(rect, area):
+            self.assertFalse(bx < rect[0] + rect[2] and bx + bw > rect[0] and
+                             by < rect[1] + rect[3] and by + bh > rect[1],
+                             f"压暗带 {(bx, by, bw, bh)} 压到选区里了")
 
-class TestOverlayStateMachine(unittest.TestCase):
-    """交互状态机（不建真窗、不跑主循环）。反例：删掉 `confirm` 里的 `accept_rect` 就红。"""
+    def test_no_bands_when_the_selection_covers_everything(self):
+        self.assertEqual(OV.dim_bands((0, 0, 800, 600), (0, 0, 800, 600)), [])
 
-    def test_drag_then_enter_gives_global_rect(self):
-        got = []
-        ov = stub_overlay(on_confirm=got.append)
-        self.assertEqual(ov.on_press((100, 100), 1), OV.ACTION_START)
-        self.assertEqual(ov.on_motion(1, (300, 250)), OV.ACTION_UPDATE)
-        self.assertEqual(ov.on_release(), OV.ACTION_IGNORE, "松手不确认（第 2 步的口径：右键/Enter 才确认）")
-        self.assertEqual(ov.on_key("Return"), OV.ACTION_CONFIRM)
-        self.assertEqual(got, [(2020, 100, 200, 150)],
-                         "选区必须换算成**全局逻辑坐标**（抓帧用的是这套坐标）")
-        self.assertTrue(all(w.hidden for w in ov.windows), "确认后遮罩窗必须全部藏起来，"
-                                                          "否则抓帧会把自己的遮罩拍进去")
-
-    def test_reverse_drag_is_normalized(self):
-        got = []
-        ov = stub_overlay(on_confirm=got.append)
-        ov.on_press((300, 300), 1)
-        ov.on_motion(0, (100, 100))
-        ov.on_key("Return")
-        self.assertEqual(got, [(100, 100, 200, 200)])
-
-    def test_tiny_selection_is_not_confirmed(self):
-        got = []
-        ov = stub_overlay(on_confirm=got.append)
-        ov.on_press((100, 100), 1)
-        ov.on_motion(0, (101, 101))
-        self.assertEqual(ov.on_key("Return"), OV.ACTION_IGNORE)
-        self.assertEqual(got, [], "1×1 的选区不许出图（那只是一次手抖）")
-        self.assertFalse(any(w.hidden for w in ov.windows))
-
-    def test_right_click_confirms_after_release(self):
-        got = []
-        ov = stub_overlay(on_confirm=got.append)
-        ov.on_press((10, 10), 1)
-        ov.on_motion(0, (110, 60))
-        ov.on_release()
-        self.assertEqual(ov.on_press((0, 0), 3), OV.ACTION_CONFIRM)
-        self.assertEqual(got, [(10, 10, 100, 50)])
-
-    def test_esc_gives_none_and_hides_windows(self):
-        got = []
-        ov = stub_overlay(on_confirm=got.append)
-        ov.on_press((10, 10), 1)
-        ov.on_motion(0, (110, 60))
-        self.assertEqual(ov.on_key("Escape"), OV.ACTION_CANCEL)
-        self.assertEqual(got, [None], "取消也要回调一次（否则主循环没人退出）")
-        self.assertTrue(all(w.hidden for w in ov.windows))
-
-    def test_second_drag_replaces_the_first_selection(self):
-        ov = stub_overlay()
-        ov.on_press((10, 10), 1)
-        ov.on_motion(0, (110, 60))
-        ov.on_release()
-        ov.on_press((200, 200), 1)
-        self.assertIsNone(ov.rect, "重新按下即重划：旧选区先清掉")
-        ov.on_motion(0, (260, 240))
-        self.assertEqual(ov.rect, (200, 200, 60, 40))
-
-
-class TestNoAnimation(unittest.TestCase):
-    """**"绝不闪"这条硬要求**的机器判据：遮罩文件里不许有任何动画机制。"""
-
-    SRC = (REPO / "capsplus" / "shot_overlay.py").read_text(encoding="utf-8")
-
-    @staticmethod
-    def code_only(text: str) -> str:
-        """去掉注释与 docstring：注释里解释"我们不用 ease/transition"不算实现。"""
-        text = re.sub(r'"""[\s\S]*?"""', "", text)
-        text = re.sub(r"/\*[\s\S]*?\*/", "", text)
-        return "\n".join(re.sub(r"#.*$", "", line) for line in text.splitlines())
-
-    def test_source_has_no_animation_primitives(self):
-        code = self.code_only(self.SRC)
-        # 用 `\b` 卡词首：`on_release(` 里也有 "ease("，别把 release 当成 ease（第一次就误报过）
-        for banned in ("ease(", "set_opacity", "transition", "Clutter", "animate",
-                       "fade", "FadeIn", "Gtk.Window.set_opacity"):
-            self.assertIsNone(re.search(r"\b" + re.escape(banned), code),
-                              f"{banned} 是动画/过渡机制：明江换掉 Snipaste 就是因为截图会闪一下，"
-                              "遮罩必须一 map 就是最终样子")
-
-    def test_no_per_frame_timer(self):
-        """允许的定时器只有一个：藏窗后的 settle（等合成器提交一帧）。"""
-        self.assertEqual(self.code_only(self.SRC).count("timeout_add("), 1,
-                         "多出来的定时器多半是动画/轮询：抓帧前那一个 settle 才是要的")
-
-    def test_only_cairo_draws_the_mask(self):
-        src = ast.parse(self.SRC)
-        imported = set()
-        for node in src.body:                     # 只看**模块级**：函数里的懒加载正是我们要的
-            if isinstance(node, ast.Import):
-                imported.update(a.name.split(".")[0] for a in node.names)
-            elif isinstance(node, ast.ImportFrom) and node.module:
-                imported.add(node.module.split(".")[0])
-        self.assertEqual(imported, {"__future__", "time"},
-                         f"顶层不许 import gi / cairo（CI 不装它们），实际：{sorted(imported)}")
-        self.assertIn("_gtk()", self.SRC)
-        self.assertIn("_cairo()", self.SRC)
+    def test_eight_handles_and_hit_test(self):
+        rect = (100, 100, 400, 300)
+        self.assertEqual(len(OV.handle_points(rect)), 8)
+        self.assertTrue(OV.handle_at(rect, (100, 100)))
+        self.assertTrue(OV.handle_at(rect, (300, 100)))       # 上边中点
+        self.assertFalse(OV.handle_at(rect, (250, 250)))
+        self.assertFalse(OV.handle_at(None, (100, 100)))
 
 
 @unittest.skipUnless(HAVE_CAIRO, "没有 pycairo：像素判据跳过")
-class TestPaintPixels(unittest.TestCase):
-    """把遮罩渲染到 ImageSurface 上，逐像素核对口径 —— 不需要显示服务器。"""
+class TestFrozenBackgroundIsTheContent(unittest.TestCase):
+    """**关键判据**：选区里的内容必须来自冻结图。这条不看 alpha，只看「图案在不在」。"""
 
-    W, H = 200, 160
+    def setUp(self):
+        self.area = (0, 0, 800, 600)
+        self.frame = pattern_surface(800, 600)
 
-    def _render(self, rect, hint=False):
-        surface = cairo.ImageSurface(cairo.FORMAT_ARGB32, self.W, self.H)
-        cr = cairo.Context(surface)
-        OV.paint(cr, (0, 0, self.W, self.H), rect, hint=hint)
-        return surface
+    def test_pattern_is_visible_inside_the_selection(self):
+        rect = (100, 100, 300, 200)
+        out = render(self.area, rect, frame=self.frame)
+        inside_left = px(out, 150, 200)
+        inside_right = px(out, 350, 200)
+        self.assertGreater(inside_left[2], 0.7, f"选区左半该是冻结图的蓝色，实际 {inside_left}")
+        self.assertGreater(inside_right[1], 0.7, f"选区右半该是冻结图的绿色，实际 {inside_right}")
+
+    def test_selection_is_brighter_than_the_dimmed_outside(self):
+        rect = (100, 100, 300, 200)
+        out = render(self.area, rect, frame=self.frame)
+        inside = px(out, 150, 200)
+        outside = px(out, 700, 500)
+        self.assertGreater(sum(inside[:3]), sum(outside[:3]),
+                           "选区外要压暗（压暗是压在冻结图上，不是压在透明上）")
+
+    def test_outside_still_shows_the_frame_content(self):
+        """压暗之后**内容还得看得见** —— 这正是「盲选」的反面。"""
+        out = render(self.area, (300, 200, 100, 100), frame=self.frame)
+        left_outside = px(out, 100, 500)
+        right_outside = px(out, 700, 500)
+        self.assertGreater(left_outside[2], left_outside[1],
+                           f"选区外左半边仍该能看出冻结图的蓝色，实际 {left_outside}")
+        self.assertGreater(right_outside[1], right_outside[2],
+                           f"选区外右半边仍该能看出冻结图的绿色，实际 {right_outside}")
+
+    def test_no_rect_still_draws_the_frozen_desktop(self):
+        """还没开始拖的时候，看到的也得是屏幕内容（旧版这时候是**全黑**）。"""
+        out = render(self.area, None, frame=self.frame)
+        self.assertGreater(px(out, 100, 300)[2], 0.4)
+        self.assertGreater(px(out, 700, 300)[1], 0.4)
+
+    def test_missing_frame_falls_back_to_an_opaque_background(self):
+        """没有冻结图时（理论上不该发生）也不许画透明 —— 那正是这次 P0 的病根。"""
+        out = render(self.area, None, frame=None)
+        self.assertEqual(px(out, 10, 10)[3], 255, "兜底底色也必须不透明")
+
+
+@unittest.skipUnless(HAVE_CAIRO, "没有 pycairo：像素判据跳过")
+class TestNoTransparencyReliance(unittest.TestCase):
+    """把病根焊死：整块画布**每个像素**都必须不透明（拿不到 ARGB 也不会变黑）。"""
+
+    def test_every_pixel_is_opaque(self):
+        area = (0, 0, 200, 120)
+        frame = pattern_surface(200, 120)
+        for rect in (None, (10, 10, 50, 40), (0, 0, 200, 120)):
+            with self.subTest(rect=rect):
+                out = render(area, rect, frame=frame)
+                out.flush()
+                data = bytes(out.get_data())
+                alphas = {data[i] for i in range(3, len(data), 4)}
+                self.assertEqual(alphas, {255},
+                                 f"画布上出现了非不透明像素（rect={rect}）：alpha 取值 {alphas}")
+
+    def test_source_code_does_not_clear_to_transparent(self):
+        """源码层再补一刀：`OPERATOR_SOURCE` + 全透明是旧病根，不许再出现。"""
+        body = _overlay_body()
+        self.assertNotIn("OPERATOR_SOURCE", body,
+                         "不许出现 OPERATOR_SOURCE：清成透明就是「盲选」的来路")
+        self.assertNotIn("set_app_paintable", body)
+
+    def test_no_rgba_visual_dependency(self):
+        self.assertNotIn("get_rgba_visual", _overlay_body(),
+                         "背景是冻结图 ⇒ 不需要 RGBA visual；依赖它就又回到「拿不到就全黑」")
+
+
+def _overlay_body() -> str:
+    """遮罩源码去掉注释后的正文（反面教材写在注释里，扫全文会误报）。"""
+    text = (REPO / "capsplus" / "shot_overlay.py").read_text(encoding="utf-8")
+    return "\n".join(l.split("#", 1)[0] for l in text.splitlines()
+                     if not l.strip().startswith("#"))
+
+
+@unittest.skipUnless(HAVE_CAIRO, "没有 pycairo：像素判据跳过")
+class TestCrossScreenRendering(unittest.TestCase):
+    """跨屏：每块屏只画自己那一块（按屏裁剪），拼起来才是完整选区。"""
+
+    def setUp(self):
+        self.monitors = [(0, 0, 800, 600), (800, 0, 800, 600)]
+        self.frames = [SFR.Frame((0, 0, 800, 600), pattern_surface(800, 600)),
+                       SFR.Frame((800, 0, 800, 600), pattern_surface(800, 600))]
+
+    def test_each_monitor_draws_its_own_slice_of_a_spanning_selection(self):
+        rect = (700, 100, 200, 100)          # 横跨两块屏
+        left = render((0, 0, 800, 600), OV.to_local(self.monitors[0], rect),
+                      frame=self.frames[0].surface)
+        right = render((0, 0, 800, 600), OV.to_local(self.monitors[1], rect),
+                       frame=self.frames[1].surface)
+        self.assertGreater(px(left, 750, 150)[2], 0.7, "第一块屏上这 100px 该是冻结图内容")
+        self.assertGreater(px(right, 50, 150)[1], 0.7, "第二块屏上这 100px 该是冻结图内容")
+        self.assertLess(sum(px(left, 300, 150)[:3]), sum(px(left, 750, 150)[:3]),
+                        "超出本屏的那一半在这块屏上是压暗的（不是内容）")
+
+    def test_window_draws_the_local_slice_not_the_global_rect(self):
+        """每块屏画的是**本屏本地坐标**下的那一块（跨屏选区靠这个各自裁剪）。
+
+        这条直接钉 `_local_rect()`：之前只测 `to_local()` 的话，把 `_local_rect` 改成返回
+        全局矩形也照样全绿（2026-10-19 反例具型 W 实测漏过）。
+        """
+        ov = OV.Overlay(monitors=self.monitors)
+        ov.rect = (700, 100, 200, 100)
+        self.assertEqual(ov._local_rect(0), (700, 100, 200, 100))
+        self.assertEqual(ov._local_rect(1), (-100, 100, 200, 100),
+                         "第二块屏的本地坐标要减掉它自己的偏移（800）")
+
+    def test_local_rect_may_be_negative_and_cairo_clips(self):
+        rect = (-50, 10, 200, 100)
+        local = OV.to_local(self.monitors[0], rect)
+        self.assertLess(local[0], 0)
+        out = render((0, 0, 800, 600), local, frame=self.frames[0].surface)
+        self.assertGreater(px(out, 20, 50)[2], 0.7)
+
+    def test_crop_from_frames_reassembles_both_halves(self):
+        out = SFR.crop_from_frames((700, 100, 200, 100), self.frames)
+        self.assertEqual((out.get_width(), out.get_height()), (200, 100))
+        self.assertGreater(px(out, 10, 50)[2], 0.7, "左半来自第一块屏")
+        self.assertGreater(px(out, 190, 50)[1], 0.7, "右半来自第二块屏")
+
+    def test_crop_refuses_a_rect_outside_every_screen(self):
+        with self.assertRaises(ValueError):
+            SFR.crop_from_frames((5000, 5000, 100, 100), self.frames)
+
+
+class TestOverlayStateMachine(unittest.TestCase):
+    """纯状态机（不建窗）：跨屏拖拽、整屏捷径、贴边吸附、确认/取消的收尾。"""
+
+    def setUp(self):
+        self.monitors = [(0, 0, 800, 600), (800, 0, 800, 600)]
+        self.fired = []
+        self.ov = OV.Overlay(frames=[], monitors=self.monitors, on_confirm=self.fired.append)
+
+    def test_drag_start_clears_the_old_selection(self):
+        self.ov.rect = (1, 2, 3, 4)
+        self.assertEqual(self.ov.on_press(0, (10, 10)), OV.ACTION_START)
+        self.assertIsNone(self.ov.rect)
+        self.assertTrue(self.ov.dragging)
+
+    def test_anchor_is_global_so_a_cross_screen_drag_works(self):
+        """起点在**第二块屏**（有 800 偏移）、拖回第一块屏：选区必须横跨两屏。
+
+        起点特意选有偏移的那块屏 —— 从 (0,0) 那块屏起手时本地坐标恰好等于全局坐标，
+        锚点用错坐标系也测不出来（2026-10-19 反例具型 X 实测漏过）。
+        """
+        self.ov.on_press(1, (100, 100))          # 全局 (900, 100)
+        self.assertEqual(self.ov.on_motion(0, (700, 200)), OV.ACTION_UPDATE)   # 全局 (700, 200)
+        self.ov.on_release()
+        self.assertEqual(self.ov.rect, (700, 100, 200, 100),
+                         f"跨屏拖拽算错了（锚点必须是全局坐标）：{self.ov.rect}")
+
+    def test_anchor_offset_is_applied_going_the_other_way_too(self):
+        self.ov.on_press(0, (700, 100))          # 全局 (700, 100)
+        self.ov.on_motion(1, (100, 200))         # 全局 (900, 200)
+        self.ov.on_release()
+        self.assertEqual(self.ov.rect, (700, 100, 200, 100))
+
+    def test_snap_on_release(self):
+        self.ov.on_press(0, (3, 4))
+        self.ov.on_motion(0, (797, 596))
+        self.assertEqual(self.ov.on_release(), OV.ACTION_SNAP)
+        self.assertEqual(self.ov.rect, (0, 0, 800, 600), "贴边要吸附到屏幕边界（全屏要能一拖就到）")
+
+    def test_snap_can_be_switched_off(self):
+        ov = OV.Overlay(monitors=self.monitors, snap=False)
+        ov.on_press(0, (3, 4))
+        ov.on_motion(0, (797, 596))
+        self.assertEqual(ov.on_release(), OV.ACTION_IGNORE)
+        self.assertEqual(ov.rect, (3, 4, 794, 592))
+
+    def test_ctrl_a_selects_the_whole_union(self):
+        self.assertEqual(self.ov.on_key("a", ctrl=True), OV.ACTION_FULL)
+        self.assertEqual(self.ov.rect, (0, 0, 1600, 600))
+
+    def test_double_click_selects_that_single_monitor(self):
+        self.assertEqual(self.ov.on_press(1, (100, 100), button=1, double=True), OV.ACTION_FULL)
+        self.assertEqual(self.ov.rect, (800, 0, 800, 600), "双击 = 指针那块屏（多屏时别被迫全选）")
+
+    def test_confirm_requires_a_usable_selection(self):
+        self.assertEqual(self.ov.on_key("Return"), OV.ACTION_IGNORE, "没有选区时回车无效")
+        self.ov.rect = (10, 10, 1, 1)
+        self.assertEqual(self.ov.on_key("Return"), OV.ACTION_IGNORE, "1×1 的垃圾选区不认")
+        self.ov.rect = (10, 10, 100, 100)
+        self.assertEqual(self.ov.on_key("Return"), OV.ACTION_CONFIRM)
+        self.assertEqual(self.ov.result, (10, 10, 100, 100))
+        self.assertEqual(self.fired, [(10, 10, 100, 100)])
+
+    def test_cancel_reports_none(self):
+        self.ov.rect = (10, 10, 100, 100)
+        self.assertEqual(self.ov.on_key("Escape"), OV.ACTION_CANCEL)
+        self.assertIsNone(self.ov.result)
+        self.assertEqual(self.fired, [None])
+
+    def test_confirm_quits_the_loop_without_a_settle_dance(self):
+        """确认后**立刻**交坐标：现在从冻结图裁剪，屏幕一眼都不看（旧版的 settle 已删）。"""
+        quit_calls = []
+        self.ov._quit = lambda: quit_calls.append(True)
+        self.ov.rect = (10, 10, 100, 100)
+        self.ov.on_key("Return")
+        self.assertEqual(quit_calls, [True])
+        self.assertFalse(hasattr(OV.Overlay, "_settle_then_fire"),
+                         "settle 那套逻辑应当已经删掉（它是为「躲自己的遮罩」存在的）")
+
+
+class TestNoAnimation(unittest.TestCase):
+    """明江换掉 Snipaste 的原因就是「截图会闪一下」：源码里不许出现动画。"""
+
+    def test_no_animation_api_in_source(self):
+        body = _overlay_body()
+        for bad in ("ease", "transition", "set_opacity", "animate", "add_transition"):
+            self.assertIsNone(re.search(rf"\b{re.escape(bad)}", body),
+                              f"遮罩里出现了动画相关调用：{bad}（明江要的是「绝不闪」）")
+
+    def test_windows_are_shown_not_faded(self):
+        self.assertIn("win.show_all()", _overlay_body())
+
+
+@unittest.skipUnless(HAVE_CAIRO, "没有 pycairo：这条要造帧与棋盘格")
+class TestFrameIsMappedToTheArea(unittest.TestCase):
+    """帧的像素尺寸**不一定**等于绘制区域 —— 必须显式映射。
+
+    实测（2026-10-19 同一台机同一天）：三屏联合（逻辑 4800×1080）回来的图是 6400×1440（1.3333×），
+    单屏 (0,0,1920,1080) 回来的是 1920×1080（1×）；窗口 scale_factor 还可能是 2。
+    旧写法 `set_source_surface(frame, 0, 0); paint()` 假设 1:1 ⇒ 大帧只画出一角 / 拉错位。
+    """
 
     @staticmethod
-    def _px(surface, x, y):
-        surface.flush()
-        stride = surface.get_stride()
-        buf = bytes(surface.get_data())
-        off = y * stride + x * 4
-        b, g, r, a = buf[off], buf[off + 1], buf[off + 2], buf[off + 3]     # ARGB32 是小端 BGRA
-        return (r / 255, g / 255, b / 255, a / 255)
+    def checkerboard(w, h, cells=2):
+        """已知图案：左半蓝、右半绿，并且上下两条不同深浅（判断纵向映射）。"""
+        surface = cairo.ImageSurface(cairo.FORMAT_ARGB32, w, h)
+        cr = cairo.Context(surface)
+        cr.set_source_rgb(*BLUE)
+        cr.rectangle(0, 0, w / 2, h / 2)
+        cr.fill()
+        cr.set_source_rgb(0.05, 0.15, 0.75)
+        cr.rectangle(0, h / 2, w / 2, h / 2)
+        cr.fill()
+        cr.set_source_rgb(*GREEN)
+        cr.rectangle(w / 2, 0, w / 2, h / 2)
+        cr.fill()
+        cr.set_source_rgb(0.05, 0.75, 0.2)
+        cr.rectangle(w / 2, h / 2, w / 2, h / 2)
+        cr.fill()
+        return surface
 
-    def test_everything_is_dimmed_when_there_is_no_selection(self):
-        s = self._render(None)
-        for x, y in ((1, 1), (100, 80), (198, 158)):
-            self.assertAlmostEqual(self._px(s, x, y)[3], OV.DIM_ALPHA, places=2)
+    def _render(self, area, frame, rect=None):
+        surface = cairo.ImageSurface(cairo.FORMAT_ARGB32, area[2], area[3])
+        cr = cairo.Context(surface)
+        OV.paint(cr, area, rect, frame=frame, hint=False)
+        return surface
 
-    def test_outside_is_dimmed_and_inside_is_untouched(self):
-        s = self._render((40, 40, 60, 50))
-        for x, y in ((5, 5), (5, 100), (150, 40), (150, 140)):
-            self.assertAlmostEqual(self._px(s, x, y)[3], OV.DIM_ALPHA, places=2,
-                                   msg=f"({x},{y}) 在选区外，必须被压暗")
-        for x, y in ((50, 50), (90, 80), (95, 85), (45, 45)):   # 都躲开 1px 边框
-            self.assertEqual(self._px(s, x, y)[3], 0.0,
-                             f"({x},{y}) 在选区内，必须全透明（否则用户在遮罩里看到的不是屏幕原样）")
+    def test_oversized_frame_is_scaled_down_to_fill_the_area(self):
+        """1.3333× 的大帧：四个象限的内容都要落在正确位置（不是只看"非黑"）。"""
+        area = (0, 0, 600, 300)
+        frame = self.checkerboard(800, 400)          # 1.3333×
+        out = self._render(area, frame)
+        left_up = px(out, 150, 75)
+        left_down = px(out, 150, 225)
+        right_up = px(out, 450, 75)
+        right_down = px(out, 450, 225)
+        self.assertGreater(left_up[2], left_up[1], f"左上该是帧的蓝：{left_up}")
+        self.assertGreater(left_down[2], left_down[1], f"左下该是深蓝：{left_down}")
+        self.assertLess(left_down[2], left_up[2], "上下两条深浅不同 ⇒ 纵向映射真的生效了")
+        self.assertGreater(right_up[1], right_up[2], f"右上该是绿：{right_up}")
+        self.assertLess(right_down[1], right_up[1], "下半该更深")
+        self.assertGreater(left_up[2], left_down[2] - 1)
 
-    def test_selection_border_is_the_accent_colour(self):
-        s = self._render((40, 40, 60, 50))
-        r, g, b, a = self._px(s, 70, 40)
-        self.assertGreater(a, 0.9, "边框必须是不透明的")
-        self.assertGreater(b, 0.5)
-        self.assertLess(r, 0.5)
+    @staticmethod
+    def gradient(w, h):
+        """横向线性渐变当**映射标尺**：第 x 列亮度 = x/w。
 
-    def test_readout_text_is_drawn(self):
-        s = self._render((40, 80, 60, 50))
-        box_x, box_y = OV.readout_position((40, 80, 60, 50), (0, 0, self.W, self.H))
-        found = any(self._px(s, x, y)[3] > 0.5 and self._px(s, x, y)[0] > 0.8
-                    for x in range(box_x, min(box_x + 80, self.W))
-                    for y in range(box_y, min(box_y + OV.FONT_SIZE + 2 * OV.READOUT_PAD, self.H)))
-        self.assertTrue(found, "选区定了以后必须能看见「宽 × 高」读数")
-
-    def test_paint_is_idempotent_and_deterministic(self):
-        """同一状态画两遍像素完全一样 —— 顺带钉住"没有逐帧动画"这件事。"""
-        a = bytes(self._render((40, 40, 60, 50)).get_data())
-        b = bytes(self._render((40, 40, 60, 50)).get_data())
-        self.assertEqual(a, b)
-
-
-@unittest.skipUnless(not GUI_SKIP, f"跳过界面用例：{GUI_SKIP}")
-class TestRealWindow(unittest.TestCase):
-    """真建窗（只在 CAPSPLUS_GUI=1 且不是真实 Wayland 桌面时跑）。"""
-
-    def test_windows_are_built_per_monitor_without_animating(self):
-        ov = OV.Overlay(settle_ms=0, monitors=MONITORS[:1])
-        loops = []
-        ok = {"v": False}
-
-        def build_and_stop():
-            try:
-                import gi
-                gi.require_version("Gdk", "3.0")
-                from gi.repository import Gdk, GLib
-                display = Gdk.Display.get_default()
-                loop = GLib.MainLoop()
-                ov.build(display, loop.quit)
-                ok["v"] = len(ov.windows) == 1 and ov.windows[0].get_visible()
-                GLib.timeout_add(200, lambda: (loop.quit(), False)[1])
-                loop.run()
-            except Exception as exc:      # pragma: no cover
-                loops.append(repr(exc))
-            return False
-
-        import gi
-        gi.require_version("GLib", "2.0")
-        from gi.repository import GLib
-        loop = GLib.MainLoop()
-        GLib.timeout_add(0, lambda: (build_and_stop(), False)[1])
-        GLib.timeout_add(1500, lambda: (loop.quit(), False)[1])
-        loop.run()
-        self.assertEqual(loops, [], f"建窗抛异常：{loops}")
-        self.assertTrue(ok["v"], "遮罩窗没建出来（或不可见）")
-        ov.hide_all()
-
-    def _sender(self, gw):
-        """造事件并**走 GDK 真派发**（`Gtk.main_do_event`）。
-
-        为什么不用 `Gdk.test_simulate_button`：本机 xvfb 实测（2026-10-19）它一个事件都送不到
-        （内部拿不到 pointer device，只留一句 `gdk_device_grab_info: assertion 'GDK_IS_DEVICE …'`）；
-        `Gtk.main_do_event` 这条路是真通的（事件会带着 `send_event=True` 走 GTK 的正常派发）。
+        比"看象限颜色"精确得多 —— 象限判据对 1.3333× 这种"稍微大一点"的帧区分不出来
+        （反例具型 AT 第一次就只在 2× 那档红）。渐变帧下，映射错一点亮度就错一点，跑不掉。
         """
+        surface = cairo.ImageSurface(cairo.FORMAT_ARGB32, w, h)
+        cr = cairo.Context(surface)
+        gradient = cairo.LinearGradient(0, 0, w, 0)
+        gradient.add_color_stop_rgb(0, 0, 0, 0)
+        gradient.add_color_stop_rgb(1, 1, 1, 1)
+        cr.set_source(gradient)
+        cr.paint()
+        return surface
+
+    def test_gradient_frame_maps_exactly_for_1x_1_33x_and_2x(self):
+        """1× / 1.3333× / 2× 三种帧：区域内每一列的亮度都必须等于 x/区域宽。"""
+        area = (0, 0, 480, 240)
+        for factor in (1, 1.3333, 2):
+            with self.subTest(factor=factor):
+                frame = self.gradient(int(480 * factor), int(240 * factor))
+                # 选区盖满整块区域 ⇒ 没有压暗带（否则亮度被乘 0.65，标尺就不准了）
+                out = self._render(area, frame, rect=(0, 0, 480, 240))
+                for x in (60, 200, 400):
+                    got = px(out, x, 120)[0] / 255
+                    expect = x / area[2]
+                    self.assertAlmostEqual(got, expect, delta=0.04,
+                                           msg=f"{factor}× 帧在第 {x} 列映射错了："
+                                               f"亮度 {got:.3f}，应当 {expect:.3f}")
+
+    def test_quadrant_orientation_survives_scaling(self):
+        area = (0, 0, 480, 240)
+        for factor in (1, 1.3333, 2):
+            with self.subTest(factor=factor):
+                frame = self.checkerboard(int(480 * factor), int(240 * factor))
+                out = self._render(area, frame)
+                self.assertGreater(px(out, 120, 60)[2], px(out, 120, 60)[1],
+                                   f"{factor}× 帧的左上应仍是蓝")
+                self.assertGreater(px(out, 360, 60)[1], px(out, 360, 60)[2],
+                                   f"{factor}× 帧的右上应仍是绿")
+
+    def test_selection_rect_still_uses_logical_coordinates(self):
+        """选区矩形是**逻辑坐标**（窗口那一层），帧的缩放不该把它带偏。
+
+        用**单色**帧来比压暗：不同象限的深浅本来就不同，拿两种颜色比"谁亮"没有意义（第一版就写错了）。
+        """
+        area = (0, 0, 400, 200)
+        frame = cairo.ImageSurface(cairo.FORMAT_ARGB32, 533, 266)   # 1.3333×
+        cr = cairo.Context(frame)
+        cr.set_source_rgb(*BLUE)
+        cr.paint()
+        out = self._render(area, frame, rect=(100, 50, 200, 100))
+        inside = px(out, 200, 100)
+        outside = px(out, 20, 20)
+        self.assertAlmostEqual(inside[2] / 255, BLUE[2], delta=0.02,
+                               msg=f"选区内该是帧的原色（不压暗）：{inside}")
+        self.assertLess(outside[2] / 255, BLUE[2] - 0.1, f"选区外该压暗：{outside}")
+
+
+class TestWindowGeometryIsSetExplicitly(unittest.TestCase):
+    """窗口几何：**必须显式设尺寸再全屏**。这条正是今天的病根。
+
+    实测（xvfb 复现了 lead 的真机数字）：`realize()` → `fullscreen_on_monitor()` → `show_all()`
+    得到 device **200×200**（GTK 默认尺寸，被 mutter 拉伸铺满 ⇒ 全黑/一块矩形）；
+    `set_default_size(mon_w, mon_h)` → 全屏 → show 得到 1600×900 ✓（期望值）。
+    """
+
+    class FakeWin:
+        def __init__(self):
+            self.calls = []
+
+        def set_default_size(self, w, h):
+            self.calls.append(("set_default_size", w, h))
+
+        def fullscreen_on_monitor(self, screen, idx):
+            self.calls.append(("fullscreen_on_monitor", screen, idx))
+
+    def test_size_is_set_before_fullscreen(self):
+        win = self.FakeWin()
+        OV.overlay_geometry(win, "SCREEN", 1, (1920, 0, 1920, 1080))
+        self.assertEqual(win.calls,
+                         [("set_default_size", 1920, 1080), ("fullscreen_on_monitor", "SCREEN", 1)],
+                         "必须先给尺寸再全屏（反了就是 200×200 的 stale 缓冲）")
+
+    def test_uses_the_monitor_size_not_a_hardcoded_one(self):
+        for monitor in ((0, 0, 1920, 1080), (3840, 540, 960, 540)):
+            win = self.FakeWin()
+            OV.overlay_geometry(win, "S", 0, monitor)
+            self.assertEqual((win.calls[0][1], win.calls[0][2]), (monitor[2], monitor[3]))
+
+    def test_build_calls_overlay_geometry_for_every_monitor(self):
+        import inspect
+        source = inspect.getsource(OV.Overlay.build)
+        self.assertIn("overlay_geometry(win, screen, idx, mon)", source,
+                      "build() 必须走 overlay_geometry（不然又会退回 200×200）")
+        self.assertNotIn("win.realize()", source,
+                         "提前 realize() 会让随后的全屏不生效（实测）")
+
+    def test_expectation_accounts_for_the_monitor_scale(self):
+        self.assertEqual(OV.geometry_expectation((0, 0, 960, 540), 2), (1920, 1080))
+        self.assertEqual(OV.geometry_expectation((0, 0, 1920, 1080), 1), (1920, 1080))
+
+
+class TestGeometrySelfCheck(unittest.TestCase):
+    """map 之后自检：**不许静默**（不对就关窗 + 说清期望/实得）。"""
+
+    def test_detects_the_exact_bug_from_today(self):
+        problems = OV.geometry_problems([(0, 0, 1920, 1080)], [(200, 200)], [1])
+        self.assertEqual(len(problems), 1)
+        self.assertIn("200", problems[0])
+        self.assertIn("1920", problems[0])
+
+    def test_silent_when_correct(self):
+        self.assertEqual(OV.geometry_problems([(0, 0, 1920, 1080)], [(1920, 1080)], [1]), [])
+
+    def test_scale_two_monitor_accepts_both_interpretations(self):
+        """2× 屏：设备像素（1920×1080）与逻辑像素（960×540）**都放行**。
+
+        为什么不做严格判定：Wayland 上 GDK 报的是设备还是逻辑像素，我在无头环境里没能定论；
+        只认一种的话，认错就是"每次自检失败、遮罩每次自己关掉" —— 比原来的 bug 更糟。
+        而 200×200 两种解释都不合法 ⇒ 今天这个 bug 照样被抓住（见上一条）。
+        """
+        self.assertEqual(OV.geometry_problems([(0, 0, 960, 540)], [(1920, 1080)], [2]), [])
+        self.assertEqual(OV.geometry_problems([(0, 0, 960, 540)], [(960, 540)], [2]), [])
+        self.assertEqual(len(OV.geometry_problems([(0, 0, 960, 540)], [(200, 200)], [2])), 1,
+                         "200×200 无论怎么解释都不合法")
+
+    def test_small_rounding_is_tolerated(self):
+        self.assertEqual(OV.geometry_problems([(0, 0, 1920, 1080)], [(1919, 1078)], [1]), [],
+                         "差一两像素别判失败（有些合成器会少给一点）")
+
+    def test_message_says_both_numbers_and_what_happened(self):
+        msg = OV.geometry_message(OV.geometry_problems([(0, 0, 1920, 1080)], [(200, 200)], [1]))
+        self.assertIn("1920", msg)
+        self.assertIn("200", msg)
+        self.assertIn("已关掉遮罩", msg, "要告诉用户遮罩没留在屏幕上")
+        self.assertIn("没有拿这张图去截", msg)
+
+    def test_overlay_starts_unknown_and_select_region_reports_the_failure(self):
+        ov = OV.Overlay(monitors=[(0, 0, 10, 10)])
+        self.assertIsNone(ov.geometry_ok, "还没量过就是 None（不许默认 True）")
+        self.assertEqual(ov.failure, "")
+        import inspect
+        source = inspect.getsource(OV.select_region)
+        self.assertIn("overlay.failure", source, "自检失败的话要交回调用方")
+
+    @unittest.skipUnless(HAVE_CAIRO, "这条要造一张假冻结图（cairo）")
+    def test_region_flow_refuses_when_the_overlay_reports_failure(self):
+        """自检没过 ⇒ 不写文件、退出码非零（宁可说"这次没成"，也不给一张全黑的图）。"""
+        import contextlib
+        import io
+        import tempfile
+        from capsplus import shot_capture as SC
+        tmp = pathlib.Path(tempfile.mkdtemp(prefix="capsplus-geom-test-"))
+        out = tmp / "should-not-exist.png"
+        monitors = [(0, 0, 800, 600)]
+
+        def capture(x, y, w, h, path):
+            pattern_surface(max(1, w), max(1, h)).write_to_png(str(path))
+            return True, "✓"
+
+        deps = {
+            "monitors": monitors,
+            "capture": capture,
+            "freeze": lambda mons: SFR.freeze(mons, capture, out_dir=tmp),
+            "select": lambda frames, mons: (None, "✗ 遮罩窗口尺寸没对上（期望 1920×1080，实得 200×200）"),
+            "annotate": lambda *a, **k: ("close", None, ""),
+            "no_pin": True, "no_text": True,
+        }
+        args = SC.parse_args(["--region", "--out", str(out)])
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            code = SC.command_region(args, deps)
+        self.assertEqual(code, 1, "几何失败必须非零退出")
+        self.assertIn("200×200", err.getvalue(), "要把期望/实得说给他听")
+        self.assertFalse(out.exists(), "几何失败时什么都不许写")
+
+@unittest.skipUnless(not GUI_SKIP, "跳过界面用例")
+class TestWindowsBackgroundNotOverpaint(unittest.TestCase):
+    """**真 `Gtk.Window`** 的背景覆盖：自定义绘制必须 `return True`。
+
+    2026-10-19 真机事故（lead 的证据）：窗口尺寸修对之后，屏幕上变成**整块纯白**（抓屏实测
+    均匀 250.0、标准差 0.0 = Adwaita 的 `#fafafa`）。原因：`GtkWidget::draw` 的**默认处理器跑在
+    自定义处理器之后**，把控件自己的主题背景刷在我们画的内容上面 ⇒ 必须 `return True`
+    停止信号发射。修后同一块量到"平均 163.3 = 250×0.65、标准差 19.3"——正是"真实桌面 × 压暗"。
+
+    ⚠ **不许用 `Gtk.DrawingArea` 代替 `Gtk.Window`**：DrawingArea 自己没有背景，
+    拿它测这条会**假绿**（上一批的 `TestRealWidgetDrawPath` 就是这么漏掉整屏白的）。
+    这里用 `Gtk.OffscreenWindow`（它就是 `Gtk.Window` 子类，有真实的主题背景绘制路径）。
+    """
+
+    def _render_through_a_real_window(self, monitors, frames, rect=None):
         import gi
+        gi.require_version("Gtk", "3.0")
         gi.require_version("Gdk", "3.0")
         from gi.repository import Gdk, Gtk
+        ov = OV.Overlay(monitors=monitors)
+        ov.frames = frames
+        ov.rect = rect
+        width, height = monitors[0][2], monitors[0][3]
+        win = Gtk.OffscreenWindow()                 # ← 真 GtkWindow（有主题背景）
+        win.set_default_size(width, height)
+        win.connect("draw", lambda widget, cr: ov._on_draw(widget, cr, 0))
+        win.show_all()
+        for _ in range(60):
+            while Gtk.events_pending():
+                Gtk.main_iteration_do(False)
+        window = win.get_window()
+        pixbuf = Gdk.pixbuf_get_from_window(window, 0, 0, width, height)
+        data, stride, n = pixbuf.get_pixels(), pixbuf.get_rowstride(), pixbuf.get_n_channels()
 
-        def send(kind, **kw):
-            ev = Gdk.Event.new(kind)
-            ev.window = gw
-            ev.send_event = True
-            for key, value in kw.items():
-                setattr(ev, key, value)
-            Gtk.main_do_event(ev)
-        return send
+        def sample(x, y):
+            off = y * stride + x * n
+            return tuple(data[off + i] / 255 for i in range(3))
 
-    def test_real_events_drive_a_full_selection(self):
-        """真事件走一遍：按下 → 拖动 → 松手（不确认）→ 回车确认 → 拿到全局坐标、窗已藏。
+        samples = [sample(x, y) for x in range(5, width - 5, 17) for y in range(5, height - 5, 11)]
+        mean = sum(sum(s) / 3 for s in samples) / len(samples)
+        var = sum((sum(s) / 3 - mean) ** 2 for s in samples) / len(samples)
+        win.destroy()
+        return {"sample": sample, "mean": mean, "std": var ** 0.5,
+                "size": (pixbuf.get_width(), pixbuf.get_height())}
 
-        这条是**唯一**能证明"窗口上的事件真的接到了状态机上、并且 settle 真的等过"的判据
-        （纯逻辑那组测的是状态机本身）。它一上线就抓出过一个真 bug：确认时把主循环立刻退了，
-        settle 的 timeout 从来没跑过 —— 那样抓帧有可能把遮罩自己拍进去。
+    @staticmethod
+    def _frame(w, h):
+        """左半蓝、右半绿：用来断言"看到的是帧的内容"，而不是主题底色。"""
+        return pattern_surface(w, h)
+
+    def test_not_the_theme_background(self):
+        """整块不能是主题底色（Adwaita ≈ 250 均匀灰）—— 这正是真机上那一片纯白。"""
+        monitors = [(0, 0, 400, 200)]
+        frames = [SFR.Frame((0, 0, 400, 200), self._frame(400, 200))]
+        out = self._render_through_a_real_window(monitors, frames)
+        self.assertEqual(out["size"], (400, 200))
+        self.assertGreater(out["std"], 0.02,
+                           f"整块是均匀色 ⇒ 主题背景/纯色盖住了内容：mean={out['mean']:.3f} "
+                           f"std={out['std']:.3f}")
+        self.assertGreater(abs(out["mean"] - 250 / 255), 0.03,
+                           "均值正好是 Adwaita #fafafa（≈250）⇒ 就是这次那个整屏白（写反过一次，注意）")
+
+    def test_content_and_dimming_survive_the_window_background(self):
+        """帧的内容必须**在窗口这一层**看得见，而且选区外还是被压暗的（不是被白底换掉）。"""
+        monitors = [(0, 0, 400, 200)]
+        frames = [SFR.Frame((0, 0, 400, 200), self._frame(400, 200))]
+        out = self._render_through_a_real_window(monitors, frames, rect=(200, 0, 200, 200))
+        inside = out["sample"](350, 100)          # 右半 = 帧的绿，选区内 → 原色
+        outside = out["sample"](50, 100)          # 左半 = 帧的蓝，选区外 → 压暗
+        self.assertGreater(inside[1], inside[2], f"选区内该是帧的绿：{inside}")
+        self.assertGreater(outside[2], outside[1], f"选区外该是帧的蓝：{outside}")
+        self.assertAlmostEqual(outside[2], BLUE[2] * (1 - OV.DIM_ALPHA), delta=0.05,
+                               msg=f"选区外该是 帧色×0.65（真机修后就是这个数）：{outside}")
+        self.assertAlmostEqual(inside[1], GREEN[1], delta=0.05,
+                               msg=f"选区内该是帧的原色（不压暗）：{inside}")
+
+    def test_the_dimmed_mean_matches_the_real_machine_reading(self):
+        """整块均值应当是"帧的平均色 × 0.65"量级 —— 真机修后量到 163.3/255 ≈ 0.64。"""
+        monitors = [(0, 0, 400, 200)]
+        frame_surface = self._frame(400, 200)
+        frames = [SFR.Frame((0, 0, 400, 200), frame_surface)]
+        out = self._render_through_a_real_window(monitors, frames)
+        self.assertGreater(out["mean"], 0.2, f"不该是纯白/纯黑：{out['mean']:.3f}")
+        self.assertLess(out["mean"], 0.9, f"不该是主题白：{out['mean']:.3f}")
+
+    def test_draw_handler_returns_true(self):
+        """静态那半：源码里 `_on_draw` 必须以 `return True` 收尾（停掉默认背景绘制）。"""
+        import inspect
+        source = inspect.getsource(OV.Overlay._on_draw)
+        body = [line.strip() for line in source.splitlines() if line.strip()
+                and not line.strip().startswith("#")]
+        self.assertEqual(body[-1], "return True",
+                         "`_on_draw` 必须以 return True 收尾：默认处理器会在之后刷主题背景（整屏白）")
+
+    def test_judgment_uses_a_real_window_not_a_drawing_area(self):
+        """这条判据自己也要钉住"渲染路径用的是真 Gtk.Window" —— 用 DrawingArea 测会假绿。
+
+        只扫**渲染那段的代码**（类文档里正好写着"不许用 DrawingArea"的告示，扫全文会自伤 —— 第一版就撞了）。
         """
+        import inspect
+        code = inspect.getsource(self._render_through_a_real_window)
+        code = "\n".join(l for l in code.splitlines() if not l.strip().startswith("#"))
+        self.assertIn("Gtk.OffscreenWindow", code)
+        self.assertNotIn("Gtk.DrawingArea", code,
+                         "窗口背景那一层必须用真 Gtk.Window：DrawingArea 没有背景，测不出来")
+
+
+@unittest.skipUnless(not GUI_SKIP, "跳过界面用例")
+class TestRealWidgetDrawPath(unittest.TestCase):
+    """**真控件路径**：`DrawingArea` 走真实 draw 处理器，读回像素。
+
+    为什么非要这条（lead 2026-10-19 点出的盲区）：我原来的像素判据都是**直接调 `paint()`** 渲染到
+    ImageSurface —— 完全绕开 GTK 窗口那一层，所以「窗口 200×200」「draw 没接上」这类 bug 一条都拦不住。
+
+    ⚠ **这条是必要的，但不充分**（2026-10-19 整屏白事故的教训）：`Gtk.DrawingArea` **本来就没有
+    自己的背景** ⇒ 它证明不了"窗口的主题背景有没有盖上来"。真机上 Adwaita 把 `#fafafa ≈ 250`
+    刷在遮罩上、整屏纯白，而这一整类判据**全绿**。窗口背景那一层必须用**真 `Gtk.Window`** 测，
+    见 `TestWindowsBackgroundNotOverpaint`（geok 结论：`draw` 里自定义绘制必须 `return True`）。
+    """
+
+    def _render_through_gtk(self, monitors, frames, rect=None):
+        import gi
+        gi.require_version("Gtk", "3.0")
+        gi.require_version("Gdk", "3.0")
+        from gi.repository import Gdk, Gtk
+        ov = OV.Overlay(monitors=monitors)
+        ov.frames = frames
+        ov.rect = rect
+        area_w, area_h = monitors[0][2], monitors[0][3]
+        offscreen = Gtk.OffscreenWindow()
+        offscreen.set_default_size(area_w, area_h)
+        area = Gtk.DrawingArea()
+        area.set_size_request(area_w, area_h)
+        area.connect("draw", lambda widget, cr: ov._on_draw(widget, cr, 0))
+        offscreen.add(area)
+        offscreen.show_all()
+        for _ in range(50):                     # 让 GTK 真把这一帧画出来
+            while Gtk.events_pending():
+                Gtk.main_iteration_do(False)
+        window = offscreen.get_window()
+        pixbuf = Gdk.pixbuf_get_from_window(window, 0, 0, area_w, area_h)
+        data = pixbuf.get_pixels()
+        stride = pixbuf.get_rowstride()
+        channels = pixbuf.get_n_channels()
+        out = {"size": (pixbuf.get_width(), pixbuf.get_height()),
+               "sample": lambda x, y: tuple(data[y * stride + x * channels + i] / 255
+                                            for i in range(3))}
+        offscreen.destroy()
+        return out
+
+    def test_real_draw_shows_the_frozen_frame(self):
+        monitors = [(0, 0, 400, 200)]
+        frames = [SFR.Frame((0, 0, 400, 200), pattern_surface(400, 200))]
+        out = self._render_through_gtk(monitors, frames)
+        self.assertEqual(out["size"], (400, 200), "读回来的就是这块屏那么大")
+        left = out["sample"](60, 100)           # 左半 = 帧的蓝
+        right = out["sample"](340, 100)         # 右半 = 帧的绿
+        self.assertGreater(left[2], left[1], f"真控件路径下该看到帧的蓝色：{left}")
+        self.assertGreater(right[1], right[2], f"真控件路径下该看到帧的绿色：{right}")
+        dark = out["sample"](10, 190)
+        self.assertGreater(sum(left) + sum(right), 0.3,
+                           f"整块不该是纯黑/主题底色（真机黑屏就是这条要拦的）：{left} {right} {dark}")
+
+    def test_real_draw_with_an_oversized_frame_still_fills_the_area(self):
+        monitors = [(0, 0, 300, 150)]
+        frames = [SFR.Frame((0, 0, 300, 150), pattern_surface(400, 200))]     # 帧比窗口大
+        out = self._render_through_gtk(monitors, frames)
+        left = out["sample"](45, 75)
+        right = out["sample"](255, 75)
+        self.assertGreater(left[2], left[1], f"1.3333× 的帧也要铺满：{left}")
+        self.assertGreater(right[1], right[2], f"1.3333× 的帧也要铺满：{right}")
+
+    def test_real_draw_shows_the_dimmed_outside_and_the_bright_inside(self):
+        monitors = [(0, 0, 400, 200)]
+        frames = [SFR.Frame((0, 0, 400, 200), pattern_surface(400, 200))]
+        out = self._render_through_gtk(monitors, frames, rect=(100, 50, 200, 100))
+        inside = out["sample"](200, 100)
+        outside = out["sample"](10, 190)
+        self.assertGreater(sum(inside), sum(outside), "选区内不压暗、外压暗（真控件路径）")
+
+
+@unittest.skipUnless(not GUI_SKIP, "跳过界面用例")
+class TestRealWindow(unittest.TestCase):
+    """真建窗（xvfb）：窗口真的把冻结图画出来了吗 —— 只有真 realize 一次才看得出。"""
+
+    def _run(self, monitors, frames, then):
         import gi
         gi.require_version("Gtk", "3.0")
         gi.require_version("Gdk", "3.0")
         gi.require_version("GLib", "2.0")
         from gi.repository import Gdk, GLib
-        got = []
-        monitors, display = OV.monitor_rects()
-        self.assertTrue(monitors, "xvfb 下应当有至少一块显示器")
-        ov = OV.Overlay(settle_ms=60, on_confirm=got.append, monitors=monitors)
         state = {}
 
-        def drive():
-            send = self._sender(ov.windows[0].get_window())
-            send(Gdk.EventType.BUTTON_PRESS, x=10.0, y=10.0, x_root=10.0, y_root=10.0, button=1)
-            send(Gdk.EventType.MOTION_NOTIFY, x=110.0, y=60.0, x_root=110.0, y_root=60.0)
-            send(Gdk.EventType.BUTTON_RELEASE, x=110.0, y=60.0, x_root=110.0, y_root=60.0, button=1)
-            state["after_release"] = ov.rect
-            state["callback_before_settle"] = list(got)
-            send(Gdk.EventType.KEY_PRESS, keyval=Gdk.KEY_Return, state=0)
-            state["callback_right_after_key"] = list(got)
+        def main():
+            loop = GLib.MainLoop()
+            ov = OV.Overlay(monitors=monitors)
+            ov.frames = frames
+            ov.build(Gdk.Display.get_default(), loop.quit)
+            then(ov, state)
+            for win in ov.windows:
+                win.destroy()
             return False
 
+        GLib.timeout_add(0, lambda: (main(), False)[1])
         loop = GLib.MainLoop()
-        GLib.timeout_add(200, drive)
-        GLib.timeout_add(4000, lambda: (loop.quit(), False)[1])
-        ov.build(display, loop.quit)
+        GLib.timeout_add(3000, lambda: (loop.quit(), False)[1])
         loop.run()
-        self.assertEqual(state.get("after_release"), (10, 10, 100, 50),
-                         "拖动应当在**全局坐标**下给出 100×50 的选区（松手不确认）")
-        self.assertEqual(state.get("callback_right_after_key"), [],
-                         "确认那一下**不能**立刻回调：要先藏窗、等 settle 一帧（否则抓帧会拍到遮罩）")
-        self.assertEqual(got, [(10, 10, 100, 50)], "settle 过了才把选区交给调用方")
-        self.assertFalse(any(w.get_visible() for w in ov.windows), "遮罩必须已经藏起来")
+        return state
 
-    def test_escape_path_returns_none_and_quits(self):
-        import gi
-        gi.require_version("Gtk", "3.0")
-        gi.require_version("Gdk", "3.0")
-        gi.require_version("GLib", "2.0")
-        from gi.repository import Gdk, GLib
-        got = []
-        monitors, display = OV.monitor_rects()
-        ov = OV.Overlay(settle_ms=1000, on_confirm=got.append, monitors=monitors)
+    def test_window_draws_the_frozen_frame(self):
+        if not HAVE_CAIRO:
+            self.skipTest("没有 pycairo")
+        monitors = [(0, 0, 400, 300)]
+        frames = [SFR.Frame((0, 0, 400, 300), pattern_surface(400, 300))]
 
-        def drive():
-            send = self._sender(ov.windows[0].get_window())
-            send(Gdk.EventType.KEY_PRESS, keyval=Gdk.KEY_Escape, state=0)
-            return False
+        def then(ov, state):
+            ov.rect = (50, 50, 100, 100)
 
-        loop = GLib.MainLoop()
-        GLib.timeout_add(200, drive)
-        GLib.timeout_add(4000, lambda: (loop.quit(), False)[1])
-        ov.build(display, loop.quit)
-        loop.run()
-        self.assertEqual(got, [None], "Esc 要回调 None，且**不等** settle（取消没什么可等的）")
+            class _StubWidget:               # `_on_draw` 只用到"分配尺寸"与显示器几何
+                def __init__(self, w, h):
+                    self._w, self._h = w, h
 
-    def test_fullscreen_is_requested_on_the_right_monitor(self):
-        self.assertIn("fullscreen_on_monitor", OV.SRC_SENTINEL if hasattr(OV, "SRC_SENTINEL") else
-                      (REPO / "capsplus" / "shot_overlay.py").read_text(encoding="utf-8"),
-                      "Wayland 下只能用 fullscreen_on_monitor 指定屏幕（move() 会被忽略）")
+                def get_allocated_width(self):
+                    return self._w
+
+                def get_allocated_height(self):
+                    return self._h
+
+            surface = cairo.ImageSurface(cairo.FORMAT_ARGB32, 400, 300)
+            cr = cairo.Context(surface)
+            ov._on_draw(_StubWidget(400, 300), cr, 0)
+            state["inside"] = px(surface, 120, 100)
+            state["outside_alpha"] = px(surface, 20, 280)[3]
+
+        state = self._run(monitors, frames, then)
+        self.assertGreater(state["inside"][2], 0.7, f"选区里该看到冻结图的图案：{state}")
+        self.assertEqual(state["outside_alpha"], 255, "窗口内容必须不透明")
+
+    def test_windows_are_fullscreen_per_monitor(self):
+        monitors = [(0, 0, 320, 240), (320, 0, 320, 240)]
+        frames = [SFR.Frame(m, pattern_surface(m[2], m[3])) for m in monitors]
+        state = {}
+        self._run(monitors, frames, lambda ov, st: st.update(windows=len(ov.windows)))
+        state = self._run(monitors, frames, lambda ov, st: st.update(windows=len(ov.windows)))
+        self.assertEqual(state.get("windows"), 2, "一屏一窗（跨屏选区靠多窗各自裁剪拼出来）")
+
+    def test_select_region_requires_frames(self):
+        """没有冻结帧就不该开窗（契约）：宁可报错，也不给全黑盲选。"""
+        sig = inspect.signature(OV.select_region)
+        self.assertEqual(list(sig.parameters)[0], "frames", "冻结帧是选区的必需参数")
 
 
 if __name__ == "__main__":

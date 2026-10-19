@@ -29,8 +29,13 @@ BUS_PATH = "/io/github/capsplus/RaiseBrowser"
 BUS_IFACE = "io.github.capsplus.RaiseBrowser"
 M_CAPTURE = "CaptureArea"
 M_PIN = "PinImage"
+M_CLEAR = "ClearPins"
 CAPTURE_SIG = "(iiiis)"          # x, y, w, h, outPath
-PIN_SIG = "(siiiis)"             # rawPath, w, h, x, y, ackPath
+# pngPath, rawPath, w, h, x, y, ackPath —— 2026-10-19 加了开头那个 pngPath：
+# 贴图工具条上的"复制/存盘"要的是**PNG 字节**（`St.Clipboard.set_content(…, 'image/png', bytes)`，
+# 用法抄自 shell 自己的 screenshot.js），而 shell 侧拿到的原本只有裸 RGBA。
+PIN_SIG = "(ssiiiis)"
+CLEAR_SIG = "(s)"                # ackPath（可以为空）—— `Caps+Esc` 全局清空贴图
 EXT_UUID = "raise-browser@capsplus.example"
 LOG_MARK = "[raise-browser]"
 
@@ -52,10 +57,18 @@ def capture_signal_args(x: int, y: int, w: int, h: int, out_path) -> tuple:
             (int(x), int(y), int(w), int(h), str(out_path)))
 
 
-def pin_signal_args(raw_path, w: int, h: int, x: int, y: int, ack_path) -> tuple:
-    """贴图信号：给扩展一张**已经是 RGBA 原图**的文件（PNG 解码留给 capsplus，见 shot_pin.py）。"""
+def pin_signal_args(png_path, raw_path, w: int, h: int, x: int, y: int, ack_path) -> tuple:
+    """贴图信号：给扩展一张**已经是 RGBA 原图**的文件（PNG 解码留给 capsplus，见 shot_pin.py）。
+
+    `png_path` 是同一张图的 PNG 版，只给工具条/菜单里的"复制""存盘"用（见 `PIN_SIG` 的注释）。
+    """
     return (None, BUS_PATH, BUS_IFACE, M_PIN,
-            (str(raw_path), int(w), int(h), int(x), int(y), str(ack_path)))
+            (str(png_path), str(raw_path), int(w), int(h), int(x), int(y), str(ack_path)))
+
+
+def clear_signal_args(ack_path: str = "") -> tuple:
+    """清空所有贴图的信号（`Caps+Esc`）。没有贴图时调用也安全 —— 扩展侧只是清 0 张 + 写 ack。"""
+    return (None, BUS_PATH, BUS_IFACE, M_CLEAR, (str(ack_path or ""),))
 
 
 def wait_for_file(path, timeout_ms: int = CAPTURE_TIMEOUT_MS, *, poll_ms: int = POLL_MS,
