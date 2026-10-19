@@ -625,6 +625,138 @@ class TestGeometrySelfCheck(unittest.TestCase):
         self.assertIn("200×200", err.getvalue(), "要把期望/实得说给他听")
         self.assertFalse(out.exists(), "几何失败时什么都不许写")
 
+@unittest.skipUnless(HAVE_CAIRO, "没有 pycairo：放大镜判据要造帧")
+class TestMagnifier(unittest.TestCase):
+    """放大镜（明江要的"光标旁 80×80 + 坐标，从冻结帧取样"）。
+
+    取样位置错一点，放大镜里看到的就是**旁边**的像素 —— 拿它对准会直接对歪，
+    所以这条判据不测"画出来没有"，而是测"**中心那个像素就是光标下的那个像素**"。
+    """
+
+    def _frame_with_a_marker(self, size=400, at=(137, 211), colour=(1.0, 0.1, 0.1)):
+        surface = cairo.ImageSurface(cairo.FORMAT_ARGB32, size, size)
+        cr = cairo.Context(surface)
+        cr.set_source_rgb(0, 0, 0)
+        cr.paint()
+        cr.set_source_rgb(*colour)
+        cr.rectangle(at[0], at[1], 1, 1)
+        cr.fill()
+        return surface
+
+    def test_sampling_is_centred_on_the_pointer(self):
+        info = OV.magnifier_source((1920, 1080), (960, 540))
+        sx, sy, sw, sh = info["src"]
+        self.assertEqual((sw, sh), (OV.MAG_SIZE // OV.MAG_ZOOM,) * 2, "取样块 = 80/4")
+        self.assertLessEqual(abs((sx + sw / 2) - 960), 1, f"横向没对准：{info}")
+        self.assertLessEqual(abs((sy + sh / 2) - 540), 1, f"纵向没对准：{info}")
+
+    def test_sampling_never_leaves_the_frame(self):
+        for xy in ((0, 0), (1, 1), (1919, 1079), (500, 1080), (1920, 300)):
+            with self.subTest(xy=xy):
+                sx, sy, sw, sh = OV.magnifier_source((1920, 1080), xy)["src"]
+                self.assertGreaterEqual(sx, 0)
+                self.assertGreaterEqual(sy, 0)
+                self.assertLessEqual(sx + sw, 1920)
+                self.assertLessEqual(sy + sh, 1080)
+
+    def test_the_magnified_centre_is_the_pixel_under_the_cursor(self):
+        """**关键判据**：投一个单像素红点在 (137,211)，光标停那儿 ⇒ 放大镜正中必须是红的。
+
+        （把取样点在横向上偏移 7px 的反例具型 BD 就是被这条抓住的。）
+        """
+        frame = self._frame_with_a_marker(at=(137, 211))
+        area = (0, 0, 600, 600)
+        surface = cairo.ImageSurface(cairo.FORMAT_ARGB32, area[2], area[3])
+        cr = cairo.Context(surface)
+        self.assertTrue(OV.draw_magnifier(cr, frame, (137, 211), area))
+        surface.flush()
+        data = bytes(surface.get_data())
+        stride = surface.get_stride()
+        dx, dy = OV.magnifier_position((137, 211), area)
+
+        def px(x, y):
+            off = y * stride + x * 4
+            return (data[off + 2], data[off + 1], data[off])
+
+        centre = px(int(dx + OV.MAG_SIZE / 2), int(dy + OV.MAG_SIZE / 2))
+        self.assertGreater(centre[0], 180, f"放大镜正中没有红点，看到的是旁边的像素：{centre}")
+        self.assertLess(centre[2], 90, f"应该是那个红点：{centre}")
+        edge = px(int(dx + 3), int(dy + 3))
+        self.assertLess(edge[0], 90, f"放大镜角落该是黑底（取样区域就只有中心那一个亮点）：{edge}")
+
+    def test_single_pixel_becomes_zoom_pixels_wide(self):
+        """1 个像素在放大镜里应当变成约 zoom×zoom 个像素（这才能对准）。
+
+        数**整块**里的红像素，不数中线那一行：中心方格的白描边正好压在中线上（第一版数中线，
+        被自己的装饰线搞红了）。
+        """
+        frame = self._frame_with_a_marker(at=(200, 200))
+        area = (0, 0, 600, 600)
+        surface = cairo.ImageSurface(cairo.FORMAT_ARGB32, area[2], area[3])
+        cr = cairo.Context(surface)
+        OV.draw_magnifier(cr, frame, (200, 200), area)
+        surface.flush()
+        data = bytes(surface.get_data())
+        stride = surface.get_stride()
+        dx, dy = OV.magnifier_position((200, 200), area)
+        reds = 0
+        for y in range(int(dy) + 2, int(dy + OV.MAG_SIZE) - 2):
+            for x in range(int(dx) + 2, int(dx + OV.MAG_SIZE) - 2):
+                off = y * stride + x * 4
+                if data[off + 2] > 180 and data[off] < 90:
+                    reds += 1
+        area_px = OV.MAG_ZOOM ** 2
+        self.assertGreaterEqual(reds, area_px * 0.5, f"放大后该有约 {area_px} 个红像素：{reds}")
+        self.assertLessEqual(reds, area_px * 2, f"放太大了？{reds}")
+
+    def test_position_stays_inside_the_area_and_flips_at_the_edges(self):
+        area = (0, 0, 400, 300)
+        x, y = OV.magnifier_position((10, 10), area)
+        self.assertEqual((x, y), (26, 26), "正常位置在光标右下")
+        x2, _y2 = OV.magnifier_position((395, 20), area)
+        self.assertLess(x2 + OV.MAG_SIZE, 400, "右边缘要翻到左边")
+        _x3, y3 = OV.magnifier_position((20, 295), area)
+        self.assertLess(y3 + OV.MAG_SIZE, 300, "下边缘要翻到上边")
+
+    def test_no_frame_means_no_magnifier(self):
+        cr = cairo.Context(cairo.ImageSurface(cairo.FORMAT_ARGB32, 100, 100))
+        self.assertFalse(OV.draw_magnifier(cr, None, (50, 50), (0, 0, 100, 100)))
+
+    def test_magnifier_can_be_turned_off(self):
+        import os
+        from unittest import mock
+        with mock.patch.dict(os.environ, {"CAPSPLUS_MAGNIFIER": "0"}):
+            self.assertFalse(OV.magnifier_enabled())
+        with mock.patch.dict(os.environ, {"CAPSPLUS_MAGNIFIER": "1"}):
+            self.assertTrue(OV.magnifier_enabled())
+
+
+class TestSelectionNudge(unittest.TestCase):
+    """方向键微调选区（Snipaste 手感）：1px；Shift=10px；不许挪出屏幕。"""
+
+    def test_arrow_keys_are_handled(self):
+        for key in ("Left", "Right", "Up", "Down"):
+            self.assertEqual(OV.key_action(key), OV.ACTION_NUDGE)
+        self.assertEqual(OV.key_action("Escape"), OV.ACTION_CANCEL, "Esc 语义没变")
+        self.assertEqual(OV.key_action("Return"), OV.ACTION_CONFIRM, "回车语义没变")
+
+    def test_nudge_moves_and_clamps(self):
+        union = (0, 0, 1920, 1080)
+        self.assertEqual(OV.nudge_rect((100, 100, 50, 50), 1, 0, union), (101, 100, 50, 50))
+        self.assertEqual(OV.nudge_rect((100, 100, 50, 50), -500, -500, union), (0, 0, 50, 50),
+                         "不许挪出屏幕")
+        self.assertEqual(OV.nudge_rect((1800, 1000, 50, 50), 500, 500, union),
+                         (1870, 1030, 50, 50), "右下也要夹住")
+
+    def test_overlay_nudge_uses_the_selection(self):
+        ov = OV.Overlay(monitors=[(0, 0, 1920, 1080)])
+        self.assertFalse(ov.nudge(1, 0), "没有选区时不该动")
+        ov.rect = (100, 100, 50, 50)
+        self.assertTrue(ov.nudge(*__import__("capsplus.shot_annotate", fromlist=["x"])
+                                 .nudge_delta("Right", True)))
+        self.assertEqual(ov.rect[0], 110, "Shift+方向键 = 10px")
+
+
 @unittest.skipUnless(not GUI_SKIP, "跳过界面用例")
 class TestWindowsBackgroundNotOverpaint(unittest.TestCase):
     """**真 `Gtk.Window`** 的背景覆盖：自定义绘制必须 `return True`。
@@ -830,8 +962,14 @@ class TestRealWindow(unittest.TestCase):
 
         GLib.timeout_add(0, lambda: (main(), False)[1])
         loop = GLib.MainLoop()
-        GLib.timeout_add(3000, lambda: (loop.quit(), False)[1])
+        fired = []
+        fallback = GLib.timeout_add(3000, lambda: (fired.append(1), loop.quit(), False)[2])
         loop.run()
+        if not fired:
+            try:
+                GLib.source_remove(fallback)
+            except Exception:
+                pass
         return state
 
     def test_window_draws_the_frozen_frame(self):

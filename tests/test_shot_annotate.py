@@ -45,6 +45,19 @@ RUN_GUI = __import__("os").environ.get("CAPSPLUS_GUI") == "1"
 ALLOW_WAYLAND_DESKTOP = __import__("os").environ.get("CAPSPLUS_WAYLAND") == "1"
 
 
+def pattern_surface(width, height):
+    """有花纹的底图：马赛克是把内容块状化，纯色底上它本来就什么都不改。"""
+    surface = cairo.ImageSurface(cairo.FORMAT_ARGB32, width, height)
+    cr = cairo.Context(surface)
+    for i in range(0, width, 8):
+        for j in range(0, height, 8):
+            shade = 0.25 + 0.5 * (((i // 8) + (j // 8)) % 3) / 2.0
+            cr.set_source_rgb(shade, 0.35, 1.0 - shade)
+            cr.rectangle(i, j, 8, 8)
+            cr.fill()
+    return surface
+
+
 def white_surface(w=120, h=100):
     s = cairo.ImageSurface(cairo.FORMAT_ARGB32, w, h)
     cr = cairo.Context(s)
@@ -303,16 +316,27 @@ class TestAnnotatorStateMachine(unittest.TestCase):
             self.x, self.y = x, y
 
     def test_window_coords_are_converted_to_image_coords(self):
-        """缩放 0.5 时，窗口 (20,10) 就是图像 (40,20) —— 这条错了标注位置会整体偏。"""
-        self.assertEqual(self.an._image_xy(self._Ev(20, 10)), (40, 20))
-        self.assertEqual(self.an._image_xy(self._Ev(120, 60)), (240, 120))
+        """窗口坐标 → 图像坐标：**先减掉画布留白，再除以缩放**。
+
+        （第三批之前画布没有留白，那时是"直接除以缩放"；现在截图居中、四周留白 14px，
+         所以映射必须带上这个偏移 —— 否则整张图的标注会整体偏 28px。）
+        """
+        ix, iy, _w, _h = AN.canvas_layout(self.an.size, self.an.scale)["image"]
+        self.assertEqual(self.an._image_xy(self._Ev(ix + 20, iy + 10)), (40, 20))
+        self.assertEqual(self.an._image_xy(self._Ev(ix, iy)), (0, 0), "图像左上角就是原点")
+        # **留白区不许落笔**：映射出来超出截图的坐标一律夹回边界（lead 第五刀）
+        self.assertEqual(self.an._image_xy(self._Ev(ix - 30, iy - 30)), (0, 0), "左上留白夹到原点")
+        self.assertEqual(self.an._image_xy(self._Ev(ix + 10_000, iy + 10_000)),
+                         (self.an.size[0] - 1, self.an.size[1] - 1), "右下留白夹到右下角")
 
     def test_drag_commits_a_shape_in_image_coordinates(self):
         self.an.set_tool("rect")
-        self.an.press(self.an._image_xy(self._Ev(20, 10)))       # 图像 (40,20)
-        self.an.drag(self.an._image_xy(self._Ev(120, 60)))       # 图像 (240,120)
+        ix, iy, _w, _h = AN.canvas_layout(self.an.size, self.an.scale)["image"]
+        self.an.press(self.an._image_xy(self._Ev(ix + 20, iy + 10)))     # 图像 (40,20)
+        self.an.drag(self.an._image_xy(self._Ev(ix + 60, iy + 40)))      # 图像 (120,80)
         self.assertTrue(self.an.release())
-        self.assertEqual(self.an.stack.shapes[0].rect, (40, 20, 200, 100))
+        self.assertEqual(self.an.stack.shapes[0].rect, (40, 20, 80, 60),
+                         "图形坐标是图像坐标，且被裁在截图内")
 
     def test_tiny_drag_is_dropped(self):
         self.an.press((10, 10))
@@ -417,17 +441,25 @@ class TestSecondBatchTools(unittest.TestCase):
             self.assertIn(tool, AN.TOOLS)
             self.assertIn(tool, AN.TOOL_LABELS)
 
-    def test_highlight_forces_a_translucent_colour(self):
-        shape = AN.Shape("highlight", (0, 0, 10, 10), color=(1, 0, 0, 1))     # 故意传不透明的
-        self.assertAlmostEqual(shape.color[3], AN.HIGHLIGHT_ALPHA,
-                               msg="荧光笔必须半透明，否则等于拿色块把内容盖住")
+    def test_highlight_defaults_to_translucent_yellow(self):
+        """荧光笔默认是**半透明黄**这一支（不跟随颜色选择）。
+
+        口径变更（lead 看图）：跟随颜色会调出"深色底 + 深色笔"的橄榄色，压在上面的字读不出来。
+        显式传色仍然尊重调用方（判据见下一条），但**不透明**永远不允许 —— 那就成了矩形填充。
+        """
+        shape = AN.Shape("highlight", (0, 0, 10, 10))
+        self.assertEqual(shape.color, AN.HIGHLIGHT_COLOR)
+        self.assertLess(shape.color[3], 1.0, "荧光笔必须半透明，否则等于拿色块把内容盖住")
+        self.assertGreater(shape.color[0], shape.color[2], "黄 = 红绿高、蓝低")
+        explicit = AN.Shape("highlight", (0, 0, 10, 10), color=(1, 0, 0, 1))
+        self.assertEqual(explicit.color, (1, 0, 0, 1), "显式传色时尊重调用方")
 
     def test_highlight_blends_instead_of_covering(self):
         base = white_surface()
         out = AN.render_to_surface(base, [AN.Shape("highlight", (20, 20, 60, 40))])
         r, g, b, _a = px(out, 50, 40)
-        self.assertLess(r, 0.99, "高亮区必须与原图不同")
-        self.assertGreater(g, 0.5, "半透明：底下的白还在，不该变成纯红（那就成了矩形填充）")
+        self.assertLess(b, 0.9, "高亮区必须与原图不同（黄色会把蓝压下去）")
+        self.assertGreater(g, 0.5, "半透明：底下的白还在，不该变成纯色块")
 
     def test_badge_numbers_increment_and_redo_reuses_the_number(self):
         an = AN.Annotator(white_surface(200, 100), clip=lambda _d: (True, "stub"))
@@ -485,10 +517,18 @@ class TestKeyRoster(unittest.TestCase):
         self.assertEqual(AN.key_command("z", ctrl=True, shift=True), AN.ACTION_REDO)
         self.assertEqual(AN.key_command("y", ctrl=True), AN.ACTION_REDO)
 
-    def test_enter_is_left_to_the_first_batch(self):
-        self.assertIsNone(AN.key_command("Return"),
-                          "回车在第一批是『确认选区』；标注窗不许抢它")
-        self.assertIsNone(AN.key_command("KP_Enter"))
+    def test_enter_means_copy_and_close_here(self):
+        """回车 = 复制并关（明江要的 Snipaste 手感）。
+
+        ⚠ 口径变更（第三批）：第一批"回车留给选区确认"说的是**遮罩**那条链路
+        （`shot_overlay.key_action("Return")` 仍然是 `confirm`）；标注窗里回车改成"复制并关"，
+        两条链路各自独立，判据分别钉，别互相带跑。小键盘回车同义。
+        """
+        self.assertEqual(AN.key_command("Return"), AN.ACTION_ENTER)
+        self.assertEqual(AN.key_command("KP_Enter"), AN.ACTION_ENTER)
+        from capsplus import shot_overlay
+        self.assertEqual(shot_overlay.key_action("Return"), "confirm",
+                         "遮罩那边的回车仍然是「确认选区」")
 
     def test_unknown_keys_are_not_swallowed(self):
         for name in ("a", "F5", "F1", "space", ""):
@@ -617,42 +657,27 @@ class TestTextActionsDoNotFreezeTheWindow(unittest.TestCase):
         self.assertEqual(an.panel.ocr_text, "识别到")
 
     def test_threaded_path_when_a_loop_exists(self):
+        """有主循环时必须**异步**：起线程、面板先显示在忙、结果回主线程再回填。
+
+        ⚠ 这里**不用嵌套的 `loop.run()` + 定时器**：那套写法依赖"当前默认主上下文里没有别的
+        source"，别的用例先跑过之后会偶发失败（实测踩到过）。改成自己泵主上下文到条件满足，
+        进程内没有任何遗留状态。
+        """
         import gi
         gi.require_version("GLib", "2.0")
         from gi.repository import GLib
         an = self._annotator()
-        loop = GLib.MainLoop()
-        an._loop = loop                          # 有主循环 ⇒ 必须异步
-        state = {}
-
-        def kick():
-            # ⚠ GLib 回调里抛 AssertionError **不会让用例失败**（只在 journal 留一行）——
-            # 2026-10-19 反例具型 AM（把异步改回同步）就因此漏过。所以这里只记状态，断言放在
-            # loop.run() 之后。
-            an.action(AN.ACTION_OCR)
-            state["threads"] = len(an.threads)
-            state["busy"] = an.panel.busy
-            state["panel_done_at_kick"] = bool(an.panel.ocr_text)
-            return False
-
-        def check():
-            if an.panel.ocr_text:
-                self.done.append("ui-updated")
-                loop.quit()
-                return False
-            return True
-
-        GLib.timeout_add(0, kick)
-        GLib.timeout_add(50, check)
-        GLib.timeout_add(3000, lambda: (self.done.append("timeout"), loop.quit(), False)[2])
-        loop.run()
+        an._loop = GLib.MainLoop()               # 有主循环实例（**不 run**）⇒ 走异步分支
+        self.assertTrue(an.action(AN.ACTION_OCR), "动作本身该立刻返回 True")
+        self.assertTrue(an.threads, "应当起了后台线程（否则界面被冻住）")
+        self.assertTrue(an.panel.busy, "跑起来时面板要显示在忙")
+        self.assertFalse(an.panel.ocr_text, "按下那一刻还没算完 —— 说明真的异步")
+        deadline = time.monotonic() + 3.0
+        while time.monotonic() < deadline and not an.panel.ocr_text:
+            GLib.MainContext.default().iteration(False)     # 泵主上下文：跑信箱轮询
+            time.sleep(0.01)
         self.assertEqual(an.panel.ocr_text, "识别到", "后台线程的结果要回填到面板")
-        self.assertIn("ui-updated", self.done, "结果没回到主线程")
         self.assertFalse(an.panel.busy)
-        self.assertEqual(state.get("threads"), 1, "有主循环时必须起后台线程（否则界面被冻住）")
-        self.assertTrue(state.get("busy"), "跑起来时面板要显示在忙")
-        self.assertFalse(state.get("panel_done_at_kick"),
-                         "按下那一刻还没算完 —— 说明真的异步（同步会当场就有结果）")
 
     def test_failure_from_the_worker_also_lands(self):
         import gi
@@ -661,19 +686,12 @@ class TestTextActionsDoNotFreezeTheWindow(unittest.TestCase):
         an = AN.Annotator(white_surface(80, 40), screen=(80, 40), directory=self.dir,
                           clip=lambda _d: (True, "s"),
                           on_ocr=lambda _s: {"ok": False, "hint": "✗ 本机模型没起：看 12087"})
-        loop = GLib.MainLoop()
-        an._loop = loop
-        GLib.timeout_add(0, lambda: (an.action(AN.ACTION_OCR), False)[1])
-
-        def wait_message():
-            if an.panel.message:
-                loop.quit()
-                return False
-            return True          # 没到就继续等（返回 True = 保留这个定时器）
-
-        GLib.timeout_add(50, wait_message)
-        GLib.timeout_add(3000, lambda: (loop.quit(), False)[1])
-        loop.run()
+        an._loop = GLib.MainLoop()
+        an.action(AN.ACTION_OCR)
+        deadline = time.monotonic() + 3.0
+        while time.monotonic() < deadline and not an.panel.message:
+            GLib.MainContext.default().iteration(False)
+            time.sleep(0.01)
         self.assertIn("12087", an.panel.message, "后台失败也要把话术送到界面上")
 
     def test_cloud_can_skip_ocr_and_read_the_image(self):
@@ -742,6 +760,525 @@ class TestTextActionsDoNotFreezeTheWindow(unittest.TestCase):
         self.assertEqual(seen, ["cloud"], "面板切后端要通知接线层翻偏好")
 
 
+@unittest.skipUnless(HAVE_CAIRO, "没有 pycairo：这条要真把每种工具画一遍")
+class TestEveryToolActuallyDraws(unittest.TestCase):
+    """**每种工具都要真的画得出东西**（这条是补漏：椭圆渲染里少 import math，运行期直接崩，
+    而当时的判据只画过矩形/箭头/序号 —— 直到渲染窗口图时才炸出来）。"""
+
+    def _ink(self, surface, base):
+        surface.flush()
+        data = bytes(surface.get_data())
+        base_data = bytes(base.get_data())
+        stride = surface.get_stride()
+        changed = 0
+        for y in range(surface.get_height()):
+            for x in range(surface.get_width()):
+                off = y * stride + x * 4
+                if (data[off], data[off + 1], data[off + 2]) != (base_data[off], base_data[off + 1],
+                                                                 base_data[off + 2]):
+                    changed += 1
+        return changed
+
+    def test_every_tool_changes_pixels(self):
+        # 底图要**有花纹**：马赛克是把内容"块状化"，纯白底上它本来就什么都不改（那不是 bug）
+        base = pattern_surface(160, 120)
+        for tool in ("rect", "ellipse", "arrow", "line", "highlight", "mosaic", "badge", "text"):
+            with self.subTest(tool=tool):
+                shape = AN.Shape(tool, (30, 25, 80, 60), text="7", color=(0.9, 0.1, 0.1, 1.0),
+                                 width=3)
+                out = AN.render_to_surface(base, [shape])
+                self.assertGreater(self._ink(out, base), 30, f"{tool} 什么都没画出来")
+
+    def test_freehand_renders_its_points(self):
+        base = white_surface(160, 120)
+        shape = AN.Shape("pen", (20, 20, 100, 60), color=(0.1, 0.2, 0.9, 1.0), width=3,
+                         points=[(20, 80), (60, 30), (100, 70), (140, 40)])
+        out = AN.render_to_surface(base, [shape])
+        self.assertGreater(self._ink(out, base), 100, "自由笔没画线")
+
+    def test_text_and_badge_are_readable_shapes(self):
+        """文字与序号是"看得见"的：画出来的像素量不该只有一点点（防止字体没设置好画成空白）。"""
+        base = white_surface(200, 120)
+        text = AN.Shape("text", (20, 20, 1, 1), text="capSplus 中文", color=(0, 0, 0, 1.0))
+        badge = AN.Shape("badge", (20, 60, 28, 28), text="3", color=(0.9, 0.1, 0.1, 1.0))
+        out = AN.render_to_surface(base, [text, badge])
+        self.assertGreater(self._ink(out, base), 200)
+
+
+@unittest.skipUnless(HAVE_CAIRO, "这次的口径判据要造一张图")
+class TestNewToolbarAndEditing(unittest.TestCase):
+    """第三批（UI 重做）的口径判据：工具条分组、放大镜、选中/手柄、画布、工具条不压图。"""
+
+    def setUp(self):
+        self.dir = temp_dir("capsplus-ui-test-")
+
+    def _annotator(self):
+        return AN.Annotator(white_surface(200, 120), screen=(400, 300), directory=self.dir,
+                            clip=lambda _d: (True, "s"))
+
+    # ---- 工具条的形状（纯逻辑）----
+    def test_every_tool_is_in_exactly_one_group(self):
+        flat = [tool for group in AN.TOOL_GROUPS for tool in group]
+        self.assertEqual(sorted(flat), sorted(AN.TOOLS), "分组要覆盖全部工具")
+        self.assertEqual(len(flat), len(set(flat)), "同一个工具出现在两个组里了")
+
+    def test_action_groups_are_split_left_and_right(self):
+        """撤销重做在最左、复制/存盘/贴图/关闭在最右，且**没有重复**（明江："别再顶栏底栏各一套"）。"""
+        self.assertEqual(tuple(AN.EDIT_ACTIONS), (AN.ACTION_UNDO, AN.ACTION_REDO))
+        self.assertEqual(tuple(AN.ACTION_GROUP),
+                         (AN.ACTION_COPY, AN.ACTION_SAVE, AN.ACTION_PIN, AN.ACTION_CLOSE))
+        all_actions = list(AN.EDIT_ACTIONS) + list(AN.ACTION_GROUP)
+        self.assertEqual(len(all_actions), len(set(all_actions)), "动作有重复")
+        self.assertEqual(AN.ACTION_GROUP[0], AN.ACTION_COPY, "复制要在动作区首位（主按钮）")
+
+    def test_context_menu_has_the_four_actions(self):
+        actions = [action for _label, action in AN.context_menu_items()]
+        labels = [label for label, _action in AN.context_menu_items()]
+        self.assertEqual(actions, [AN.ACTION_COPY, AN.ACTION_SAVE, AN.ACTION_PIN, AN.ACTION_CLOSE])
+        self.assertEqual(len(set(actions)), len(actions), "右键菜单里有重复动作")
+        self.assertTrue(all(labels))
+
+    def test_bar_never_covers_the_image_when_there_is_room(self):
+        """有留白可用时工具条**必须**在图像外（明江："贴近选区但不遮挡"）。"""
+        screen = (1920, 1080)
+        for image in ((400, 200), (1920, 1080), (4800, 1080), (120, 90)):
+            with self.subTest(image=image):
+                plan = AN.window_plan(image, screen, bar_h=40)
+                bar = AN.bar_layout(plan["canvas"], (760, 40), plan["window"])
+                bar["w"], bar["h"] = 760, 40
+                self.assertFalse(AN.bar_overlaps_image(bar, plan["canvas"]),
+                                 f"{image}：工具条压到图上了 {bar}")
+
+    def test_bar_flips_above_when_the_bottom_has_no_room(self):
+        roomy = AN.canvas_layout((400, 200), 1.0, reserve_top=60)
+        above = AN.bar_layout(roomy, (760, 40), roomy["size"])
+        self.assertTrue(above["flipped"], f"上方有地方就该翻上去：{above}")
+        self.assertFalse(above["overlaps"])
+        tight = AN.canvas_layout((400, 200), 1.0)          # 上下都没预留
+        no_room = AN.bar_layout(tight, (760, 40), tight["size"])
+        self.assertTrue(no_room["overlaps"],
+                        "实在没地方时就老实承认会压到（判据据此盯住「只在没办法时」）")
+
+    def test_toolbar_buttons_are_images_with_tooltips(self):
+        import inspect
+        source = inspect.getsource(AN.Annotator._build_bar)
+        self.assertIn("set_image", source, "工具按钮要画成图标")
+        self.assertIn("set_tooltip_text", source, "图标要靠悬浮提示才认得出")
+
+    # ---- 选中 / 手柄 / 拖动（纯逻辑）----
+    def test_eight_handles_around_the_bounds(self):
+        bounds = (100, 200, 60, 40)
+        handles = AN.handles_for(bounds)
+        self.assertEqual(sorted(handles), sorted(AN.HANDLES), "必须有 8 个手柄")
+        self.assertEqual(handles["nw"], (100, 200))
+        self.assertEqual(handles["se"], (160, 240))
+        self.assertEqual(handles["n"], (130, 200))
+
+    def test_handle_hit_testing(self):
+        bounds = (100, 200, 60, 40)
+        self.assertEqual(AN.handle_at(bounds, (100, 200)), "nw")
+        self.assertEqual(AN.handle_at(bounds, (161, 241)), "se")
+        self.assertEqual(AN.handle_at(bounds, (130, 220)), "", "图形中间不是手柄")
+
+    def test_selection_prefers_the_topmost_object(self):
+        an = self._annotator()
+        an.stack.add(AN.Shape("rect", (10, 10, 60, 60)))
+        an.stack.add(AN.Shape("highlight", (20, 20, 60, 60)))
+        self.assertEqual(an.select_at((20, 30)), 1, "重叠时选中最后画的那个")
+        self.assertIs(an.selected, an.stack.shapes[1])
+        self.assertEqual(an.select_at((500, 500)), -1, "点空白要取消选中")
+        self.assertIsNone(an.selected)
+
+    def test_dragging_an_object_moves_it_and_is_undoable(self):
+        an = self._annotator()
+        an.stack.add(AN.Shape("rect", (10, 10, 60, 60)))
+        # 点在**边线上但不是手柄**（手柄是四角+四边中点，都留给缩放）
+        an.press((30, 10))
+        self.assertEqual(an._drag_mode, "move")
+        an.drag((60, 40))
+        self.assertTrue(an.release())
+        self.assertEqual(an.stack.shapes[0].rect, (40, 40, 60, 60), "拖动要真的挪了它")
+        self.assertTrue(an.undo_edit(), "拖动要可撤销")
+        self.assertEqual(an.stack.shapes[0].rect, (10, 10, 60, 60))
+
+    def test_resizing_from_a_handle_changes_only_that_edge(self):
+        an = self._annotator()
+        an.stack.add(AN.Shape("rect", (10, 10, 60, 60)))
+        an.select_at((10, 40))                       # 先选中（选中之后手柄才生效）
+        an.press((70, 70))                           # (70,70) 正是右下角手柄
+        self.assertEqual(an._drag_mode, "resize:se")
+        an.drag((100, 100))
+        an.release()
+        self.assertEqual(an.stack.shapes[0].rect, (10, 10, 90, 90), "只有右下角动")
+
+    def test_arrow_nudge_is_one_pixel_and_ten_with_shift(self):
+        an = self._annotator()
+        an.stack.add(AN.Shape("rect", (10, 10, 60, 60)))
+        an.select_at((10, 40))
+        an.nudge_selected(*AN.nudge_delta("Right"))
+        self.assertEqual(an.stack.shapes[0].rect[0], 11, "方向键 = 1px")
+        an.nudge_selected(*AN.nudge_delta("Down", True))
+        self.assertEqual(an.stack.shapes[0].rect[1], 20, "Shift = 10px")
+
+    def test_nudge_without_a_selection_says_what_to_do(self):
+        an = self._annotator()
+        self.assertFalse(an.nudge_selected(1, 0))
+        self.assertIn("先点一下", an.message, "没选中要提示怎么做，不是默默不动")
+
+    def test_eraser_deletes_what_it_clicks(self):
+        an = self._annotator()
+        an.stack.add(AN.Shape("rect", (10, 10, 60, 60)))
+        an.set_tool("eraser")
+        self.assertEqual(an.click((40, 40)), "erased", "橡皮点盒内就该删（够好点）")
+        self.assertEqual(len(an.stack.shapes), 0)
+        self.assertTrue(an.undo_edit(), "删除可撤销")
+
+    def test_freehand_stores_points(self):
+        an = self._annotator()
+        an.set_tool("pen")
+        an.press((10, 10))
+        for pt in ((20, 20), (30, 25), (40, 40)):
+            an.drag(pt)
+        self.assertTrue(an.release())
+        shape = an.stack.shapes[0]
+        self.assertEqual(shape.kind, "pen")
+        self.assertGreaterEqual(len(shape.points), 4, "自由笔要把点都留着")
+        self.assertEqual(shape.rect[:2], (10, 10), "外接矩形跟着点集走")
+
+    def test_selection_is_drawn_with_handles_and_hover_outline(self):
+        """选中/悬停必须在**画出来的像素**上看得见（明江："没有描边和手柄，看不出可编辑"）。"""
+        base = white_surface(200, 120)
+        shape = AN.Shape("rect", (40, 30, 60, 40), color=(0.9, 0.1, 0.1, 1.0))
+        plain = AN.render_to_surface(base, [shape])
+        selected = AN.render_to_surface(base, [shape], selected=shape)
+        hovered = AN.render_to_surface(base, [shape], hover=shape)
+
+        def pixels(surface):
+            surface.flush()
+            data = bytes(surface.get_data())
+            stride = surface.get_stride()
+            return {(x, y): (data[y * stride + x * 4 + 2], data[y * stride + x * 4 + 1],
+                             data[y * stride + x * 4])
+                    for y in range(surface.get_height()) for x in range(surface.get_width())}
+
+        def diff(a, b):
+            """两张图差了多少像素 —— 比「数非白像素」稳：白底上画白虚线，数非白是数不出来的。"""
+            pa, pb = pixels(a), pixels(b)
+            return sum(1 for key in pa if pa[key] != pb[key])
+
+        self.assertGreater(diff(selected, plain), 200, "选中态没画出手柄/描边")
+        # hover 是**双色虚线**（深底 + 白线）：白底截图上也不能"等于没画"（判据抓到过一次）
+        self.assertGreater(diff(hovered, plain), 50, "hover 没有虚线反馈")
+        self.assertGreater(diff(selected, hovered), 50, "hover 与选中的画法该不一样")
+
+    def test_canvas_centres_the_image_with_a_margin(self):
+        base = white_surface(100, 50)
+        canvas = AN.canvas_layout((100, 50), 1.0)
+        surface = cairo.ImageSurface(cairo.FORMAT_ARGB32, *canvas["size"])
+        cr = cairo.Context(surface)
+        AN.draw_canvas(cr, canvas, base, [])
+        surface.flush()
+        data = bytes(surface.get_data())
+        stride = surface.get_stride()
+
+        def px(x, y):
+            off = y * stride + x * 4
+            return (data[off + 2], data[off + 1], data[off])   # ARGB32 是预乘 BGRA
+
+        ix, iy, iw, ih = canvas["image"]
+        bg = tuple(int(c * 255) for c in AN.CANVAS_BG)
+        self.assertGreater(ix, 0, "左边要有留白")
+        self.assertEqual(px(2, 2), bg, "留白是中性底色")
+        self.assertEqual(px(ix + 5, iy + 5), (255, 255, 255), "截图要画在中间")
+        self.assertEqual(px(ix + iw + 6, iy + ih + 6), bg, "右下也是底色")
+
+
+@unittest.skipUnless(HAVE_CAIRO, "没有 pycairo：这条要真渲染/真造图")
+class TestClippingToTheScreenshotRect(unittest.TestCase):
+    """**落笔裁到截图范围内**（lead 第五刀）：留白区不许落笔，导出只导出截图矩形。
+
+    明江看图时说"1 号圆圈与黄箭头跑到白色截图框外了" —— 一半是渲染脚本的 demo 画得不对，
+    一半是产品行为没定死：画布留白区当时真的能落笔。
+    """
+
+    def setUp(self):
+        self.dir = temp_dir("capsplus-clip-test-")
+
+    def _annotator(self):
+        return AN.Annotator(white_surface(200, 100), screen=(400, 300), directory=self.dir,
+                            clip=lambda _d: (True, "s"))
+
+    def test_coords_are_clamped_into_the_image(self):
+        self.assertEqual(AN.clamp_to_image((-40, -40), (200, 100)), (0, 0))
+        self.assertEqual(AN.clamp_to_image((9_999, 9_999), (200, 100)), (199, 99))
+        self.assertEqual(AN.clamp_to_image((50, 50), (200, 100)), (50, 50))
+
+    def test_rect_is_clipped_preserving_size(self):
+        self.assertEqual(AN.clamp_rect_to_image((190, 95, 60, 60), (200, 100)), (140, 40, 60, 60),
+                         "整块往回收，别把宽高改掉")
+
+    def test_a_stroke_started_outside_lands_inside(self):
+        """从留白区往外拖：落地的图形必须**整块在截图内**（不是部分画到框外）。"""
+        an = self._annotator()
+        an.set_tool("rect")
+        an.press((-100, -100))
+        an.drag((500, 400))
+        self.assertTrue(an.release())
+        x, y, w, h = an.stack.shapes[0].rect
+        self.assertGreaterEqual(x, 0)
+        self.assertGreaterEqual(y, 0)
+        self.assertLessEqual(x + w, 200)
+        self.assertLessEqual(y + h, 100)
+
+    def test_dragging_and_nudging_stay_inside(self):
+        an = self._annotator()
+        an.stack.add(AN.Shape("rect", (10, 10, 60, 40)))
+        an.select_at((10, 30))
+        an.move_selected(1000, 1000)
+        rect = an.stack.shapes[0].rect
+        self.assertLessEqual(rect[0] + rect[2], 200, "拖出截图要夹住")
+        self.assertLessEqual(rect[1] + rect[3], 100)
+
+    def test_freehand_points_are_clipped_too(self):
+        an = self._annotator()
+        an.set_tool("pen")
+        an.press((10, 10))
+        for pt in ((180, 90), (400, 300), (50, 50)):
+            an.drag(pt)
+        an.release()
+        for (px_, py_) in an.stack.shapes[0].points:
+            self.assertTrue(0 <= px_ < 200 and 0 <= py_ < 100, f"点跑到图外了：{(px_, py_)}")
+
+    def test_export_is_exactly_the_screenshot_rect(self):
+        """导出/复制**只导出截图矩形**：尺寸等于底图，留白区不会被带进去。"""
+        base = white_surface(200, 100)
+        shapes = [AN.Shape("rect", (190, 90, 60, 60)), AN.Shape("text", (195, 95, 1, 1), text="x")]
+        out = AN.render_to_surface(base, shapes)
+        self.assertEqual((out.get_width(), out.get_height()), (200, 100))
+        canvas = AN.canvas_layout((200, 100), 1.0)
+        surface = cairo.ImageSurface(cairo.FORMAT_ARGB32, *canvas["size"])
+        cr = cairo.Context(surface)
+        AN.draw_canvas(cr, canvas, base, shapes)
+        surface.flush()
+        data = bytes(surface.get_data())
+        stride = surface.get_stride()
+        ix, iy, iw, ih = canvas["image"]
+        off = (iy + ih + 4) * stride + (ix + iw + 4) * 4          # 右下留白区
+        self.assertEqual(tuple(data[off + i] for i in (2, 1, 0)),
+                         tuple(int(c * 255) for c in AN.CANVAS_BG),
+                         "画到图外的标注把留白区也污染了 ⇒ 说明绘制没有裁到截图矩形")
+
+    def test_highlight_is_readable_on_light_and_dark_bases(self):
+        """荧光笔要**在浅底与深底上都读得出**（lead 第三刀）。
+
+        反例（本判据抓住过）：深底 + 深色笔 ⇒ 橄榄色，压在上面的字读不出来。
+        """
+        from capsplus import shot_style as S
+
+        def measure(base_colour):
+            surface = cairo.ImageSurface(cairo.FORMAT_ARGB32, 60, 40)
+            cr = cairo.Context(surface)
+            cr.set_source_rgb(*base_colour)
+            cr.paint()
+            base = cairo.ImageSurface.create_from_png(_png_of(surface))
+            out = AN.render_to_surface(base, [AN.Shape("highlight", (5, 5, 50, 30))])
+            out.flush()
+            data = bytes(out.get_data())
+            stride = out.get_stride()
+            off = 20 * stride + 30 * 4
+            bar = (data[off + 2] / 255, data[off + 1] / 255, data[off] / 255)
+            distance = sum((bar[i] - base_colour[i]) ** 2 for i in range(3)) ** 0.5
+            return S.luminance(bar), distance
+
+        # 口径：高亮条**自己永远是亮的**（≥0.55，像真荧光笔那样）+ 与底色有明显色差（≥0.25）。
+        # 只比"亮度差"是不够的：半透明黄压在白底上亮度几乎不变（黄本来就亮），但它明显是黄的。
+        for name, base_colour in (("浅底", (1.0, 1.0, 1.0)), ("深底", (0.13, 0.14, 0.17))):
+            with self.subTest(base=name):
+                lum, distance = measure(base_colour)
+                self.assertGreaterEqual(lum, 0.55, f"{name}上的高亮条太暗（{lum:.2f}）—— 压在上面的字读不出来")
+                self.assertGreaterEqual(distance, 0.25, f"{name}上看不出高亮（色差 {distance:.2f}）")
+
+    def _annotator_class(self):
+        return AN.Annotator
+
+
+def _png_of(surface):
+    import tempfile
+    path = tempfile.mktemp(suffix=".png", prefix="capsplus-lum-")
+    surface.write_to_png(path)
+    return path
+
+
+@unittest.skipUnless(not GUI_SKIP, f"跳过界面用例：{GUI_SKIP}")
+class TestDrawerAndStatusPresentation(unittest.TestCase):
+    """抽屉高度跟内容走（lead 第二刀）+ 状态栏分两档（lead 第四刀）。"""
+
+    def _build(self):
+        import gi
+        gi.require_version("Gtk", "3.0")
+        gi.require_version("GLib", "2.0")
+        from gi.repository import GLib
+        an = AN.Annotator(white_surface(300, 200), screen=(800, 600),
+                          directory=temp_dir("capsplus-drawer-test-"), clip=lambda _d: (True, "s"))
+        state = {}
+
+        def build():
+            an._loop = GLib.MainLoop()
+            an._win = an._build()
+            an._win.show_all()
+            an.panel.set_ocr("两行文字\n就这样", "local", 500, "rapidocr")
+            an._refresh_panel()
+            an._win.show_all()
+            _min_h, natural_small = an._panel_view.widget.get_preferred_height()
+            state["small_h"] = natural_small
+            state["window_h"] = an._win.get_preferred_height()[1]
+            an.panel.set_ocr("\n".join(f"第 {i} 行" for i in range(40)), "local", 900, "rapidocr")
+            an._refresh_panel()
+            an._win.show_all()
+            _min_h2, natural_big = an._panel_view.widget.get_preferred_height()
+            state["big_h"] = natural_big
+            state["status_main"] = an._status.get_text()
+            state["status_more"] = an._status_more.get_text()
+            state["main_class"] = an._status.get_style_context().has_class("cp-status-main")
+            state["more_class"] = an._status_more.get_style_context().has_class("cp-status-more")
+            an._win.destroy()
+            loop.quit()                      # 别等兜底定时器（不然每条用例白等 3 秒）
+            return False
+
+        loop = GLib.MainLoop()
+        GLib.timeout_add(0, lambda: (build(), False)[1])
+        fired = []
+        fallback = GLib.timeout_add(3000, lambda: (fired.append(1), loop.quit(), False)[2])
+        loop.run()
+        GLib.source_remove(fallback)
+        return state
+
+    def test_drawer_height_follows_the_content(self):
+        """两行文字时抽屉**不许留一大片空白**（不超过窗口高度的 35%）；内容多了给上限 + 滚动。"""
+        state = self._build()
+        window_h = state.get("window_h") or 1
+        self.assertLess(state["small_h"], window_h * 0.35,
+                        f"两行文字的抽屉高 {state['small_h']}px / 窗口 {window_h}px —— 太空了")
+        self.assertLessEqual(state["big_h"], 260, "内容多了要有上限（超出滚动），不能无限长")
+
+    def test_status_bar_has_two_tiers(self):
+        """常用键一档、其余收成次要那档（lead："太密、层次没出来"）。"""
+        state = self._build()
+        main, more = state["status_main"], state["status_more"]
+        for key in ("Enter", "Esc", "Ctrl+C", "Ctrl+S", "Ctrl+Z"):
+            self.assertIn(key, main, f"常用键 {key} 该在主行")
+        for key in ("F2", "F3", "F4", "Del", "方向键"):
+            self.assertIn(key, more, f"次要键 {key} 该在次要行")
+            self.assertNotIn(key, main, f"{key} 不该同时挤在主行")
+        self.assertTrue(state["main_class"] and state["more_class"], "两档要用各自的样式类")
+
+
+@unittest.skipUnless(not GUI_SKIP, f"跳过界面用例：{GUI_SKIP}")
+class TestActiveStateIsAppliedInARealWindow(unittest.TestCase):
+    """选中态在**真窗口里真的生效**：工具/颜色/线宽三者都必须同时有**底色 + 描边**。
+
+    为什么非要在真窗口里量：源码层面的"取了同一个类"不等于"样式画上去了"。实测踩过的坑是
+    **CSS 顺序** —— `.cp-swatch`/`.cp-dot` 里写了 `background-color: transparent`，同权重时后写的赢，
+    `.cp-active` 排在前面就会被盖掉（渲染图上看着像"只有描边没有底色"）。所以这里量**解析后的样式**：
+    `get_background_color().alpha > 0` 且 `get_border_color().alpha > 0`。
+    """
+
+    def test_all_three_kinds_get_a_tint_and_an_outline(self):
+        import gi
+        gi.require_version("Gtk", "3.0")
+        gi.require_version("GLib", "2.0")
+        from gi.repository import GLib, Gtk
+        an = AN.Annotator(white_surface(200, 100), screen=(400, 300),
+                          directory=temp_dir(), clip=lambda _d: (True, "s"))
+        state = {}
+
+        def build():
+            an._loop = GLib.MainLoop()
+            an._win = an._build()
+            an._win.show_all()
+            for label, widget in (("tool", an._buttons["rect"]), ("swatch", an._swatches["红"]),
+                                  ("dot", an._widths[3])):
+                ctx = widget.get_style_context()
+                state[label] = (ctx.get_background_color(Gtk.StateFlags.NORMAL).alpha,
+                                ctx.get_border_color(Gtk.StateFlags.NORMAL).alpha)
+            an._win.destroy()
+            loop.quit()
+            return False
+
+        loop = GLib.MainLoop()
+        GLib.timeout_add(0, lambda: (build(), False)[1])
+        fired = []
+        fallback = GLib.timeout_add(2000, lambda: (fired.append(1), loop.quit(), False)[2])
+        loop.run()
+        if not fired:
+            try:
+                GLib.source_remove(fallback)
+            except Exception:
+                pass
+        self.assertEqual(sorted(state), ["dot", "swatch", "tool"])
+        for label, (bg_alpha, border_alpha) in state.items():
+            self.assertGreater(bg_alpha, 0.1, f"{label} 的选中态没有底色（CSS 顺序被盖掉了？）")
+            self.assertGreater(border_alpha, 0.1, f"{label} 的选中态没有描边")
+
+
+@unittest.skipUnless(not GUI_SKIP, f"跳过界面用例：{GUI_SKIP}")
+class TestIconColourIsReadable(unittest.TestCase):
+    """图标颜色必须与**它自己的底色**拉得开 —— 否则就是个"看不出来的按钮"。
+
+    2026-10-19 真事：抽屉右上角的复制按钮在主按钮底色上画白图标，渲染出来是个**空方块**
+    （窗口图上一眼看到）。当时赌的是 `@theme_fg_color` / `get_color(SELECTED)` 两个主题变量，
+    某些主题下前景色与底色同亮 ⇒ 白压白。现在改成"量背景亮度再反着挑"，这条判据盯住结果。
+    """
+
+    def test_primary_and_drawer_icons_contrast_with_their_background(self):
+        import gi
+        gi.require_version("Gtk", "3.0")
+        gi.require_version("GLib", "2.0")
+        from gi.repository import GLib
+        from capsplus import shot_style
+        from capsplus.shot_panel import PanelView
+        an = AN.Annotator(white_surface(200, 100), screen=(400, 300),
+                          directory=temp_dir(), clip=lambda _d: (True, "s"))
+        state = {}
+
+        def build():
+            an._loop = GLib.MainLoop()
+            an._win = an._build()
+            an._win.show_all()
+            view = PanelView()
+            drawer = view.build()
+            an._win.add(drawer)          # 让抽屉也拿到主题上下文
+            drawer.show_all()
+            pairs = {}
+            for name, btn in [("toolbar-copy", an._actions["copy"]),
+                              ("toolbar-close", an._actions["close"]),
+                              ("tool-save", an._actions["save"]),
+                              ("drawer-copy", view._copy)]:
+                colour = shot_style.readable_colour(btn)
+                pairs[name] = (shot_style.luminance(colour),
+                               shot_style.background_luminance(btn))
+            state["pairs"] = pairs
+            an._win.destroy()
+            return False
+
+        loop = GLib.MainLoop()
+        GLib.timeout_add(0, lambda: (build(), False)[1])
+        fired = []
+        fallback = GLib.timeout_add(2000, lambda: (fired.append(1), loop.quit(), False)[2])
+        loop.run()
+        if not fired:                         # 只在兜底**没**触发时移除
+            try:
+                GLib.source_remove(fallback)
+            except Exception:
+                pass
+        pairs = state.get("pairs") or {}
+        self.assertTrue(pairs)
+        for name, (icon_lum, bg_lum) in pairs.items():
+            self.assertGreater(abs(icon_lum - bg_lum), 0.25,
+                               f"{name} 的图标颜色与底色差太小（{icon_lum:.2f} vs {bg_lum:.2f}）"
+                               f" —— 那就是「看不见的按钮」")
+
+
 @unittest.skipUnless(not GUI_SKIP, f"跳过界面用例：{GUI_SKIP}")
 @unittest.skipUnless(HAVE_CAIRO, "没有 pycairo")
 class TestRealWindow(unittest.TestCase):
@@ -790,70 +1327,143 @@ class TestRealWindow(unittest.TestCase):
         loop = GLib.MainLoop()
         GLib.timeout_add(0, lambda: (build(), False)[1])
         GLib.timeout_add(30, read_result)
-        GLib.timeout_add(3000, lambda: (loop.quit(), False)[1])
+        fired = []
+        fallback = GLib.timeout_add(3000, lambda: (fired.append(1), loop.quit(), False)[2])
         loop.run()
+        if not fired:                         # 只在兜底**没**触发时移除
+            try:
+                GLib.source_remove(fallback)
+            except Exception:
+                pass
         self.assertTrue(state["hidden_before"], "没结果时面板要先藏着")
         self.assertTrue(state["visible_after"], "有结果了面板还不显示 = 人看不到识别结果")
         self.assertIn("本地", state["headline"])
         self.assertEqual(state["text"], "识别到的文字")
 
-    def test_window_builds_with_all_tools_and_actions(self):
+    def test_window_has_the_new_toolbar_layout(self):
+        """真窗口里核对新布局（明江："太丑、易用性有待提高" 那一批的**结构**判据）。
+
+        ⚠ 两条踩过的坑，别再犯：
+          1. **所有碰控件的检查必须在 `destroy()` 之前做完** —— 控件销毁后再 `get_image()` /
+             `get_style_context()` 是**段错误**（不是抛异常），判据整轮崩掉过；
+          2. 别读按钮里那个 surface 的像素（GTK 持有的内存，`get_data()` 同样会崩）——
+             用**同样的画法现画一个**来数墨，等价且安全。
+        """
         import gi
         gi.require_version("Gtk", "3.0")
         gi.require_version("GLib", "2.0")
         from gi.repository import GLib
-        errors = []
-        an = AN.Annotator(white_surface(200, 100), screen=(200, 100),
+        from capsplus import shot_style
+        from capsplus.shot_icons import render_icon
+        an = AN.Annotator(white_surface(200, 100), screen=(400, 300),
                           directory=temp_dir(), clip=lambda _d: (True, "s"))
         state = {}
 
+        def ink_of(name):
+            surface = render_icon(name, AN.TOOL_BTN - 8,
+                                  shot_style.readable_colour(an._actions[name]))
+            if surface is None:
+                return 0
+            surface.flush()
+            data = bytes(surface.get_data())
+            stride = surface.get_stride()
+            return sum(1 for y in range(surface.get_height()) for x in range(surface.get_width())
+                       if data[y * stride + x * 4 + 3] > 40)
+
         def build():
-            try:
-                an._loop = GLib.MainLoop()
-                an._win = an._build()
-                an._win.show_all()
-                state["mapped"] = an._win.get_visible() and an.area.get_visible()
-                state["buttons"] = sorted(an._buttons)
-                state["colors"] = sorted(an._color_buttons)
-                state["widths"] = sorted(an._width_buttons)
-                state["hint"] = an._hint.get_text()
-                state["panel_hidden"] = not an._panel_view.widget.get_visible()
-                state["actions"] = sorted(an._action_buttons)
-                an._buttons["arrow"].set_active(True)
-                state["tool"] = an.tool
-                an._buttons["highlight"].set_active(True)
-                state["tool_hl"] = an.tool
-                an._color_buttons["蓝"].set_active(True)
-                state["color_blue"] = an.color
-                an._on_focus(an._win, None, False)
-                state["hint_unfocused"] = an._hint.get_text()
-                an._win.destroy()
-            except Exception as exc:                  # pragma: no cover
-                errors.append(repr(exc))
+            an._loop = GLib.MainLoop()
+            an._win = an._build()
+            an._win.show_all()
+
+            def ctx(widget):
+                return widget.get_style_context()
+
+            state["mapped"] = an._win.get_visible() and an.area.get_visible()
+            state["tools"] = sorted(an._buttons)
+            state["tool_images"] = all(b.get_image() for b in an._buttons.values())
+            state["tool_tips"] = all(b.get_tooltip_text() for b in an._buttons.values())
+            state["active_tool_class"] = ctx(an._buttons["rect"]).has_class(shot_style.ACTIVE_CLASS)
+            state["swatches"] = sorted(an._swatches)
+            state["swatch_class"] = ctx(an._swatches["红"]).has_class("cp-swatch")
+            state["swatch_active"] = ctx(an._swatches["红"]).has_class(shot_style.ACTIVE_CLASS)
+            state["widths"] = sorted(an._widths)
+            state["dot_class"] = ctx(an._widths[3]).has_class("cp-dot")
+            state["width_active"] = ctx(an._widths[3]).has_class(shot_style.ACTIVE_CLASS)
+            state["actions"] = sorted(an._actions)
+            state["primary_class"] = ctx(an._actions["copy"]).has_class("cp-btn-primary")
+            state["status"] = an._status.get_text()
+            state["status_more"] = an._status_more.get_text()
+            state["bar_classes"] = ctx(an._bar).has_class("cp-bar")
+            state["drawer_hidden"] = not an._panel_view.widget.get_visible()
+            state["drawer_not_in_bar"] = an._panel_view.widget.get_parent() is not an._bar
+            state["overlaps"] = AN.bar_overlaps_image(
+                {"x": an._bar_layout["x"], "y": an._bar_layout["y"],
+                 "w": an._bar_width(), "h": 40}, an.plan["canvas"])
+            # 与"橙色方框是不是空方块"两头对上：按钮有图标 + 图标像素上有墨
+            state["missing_icons"] = [n for n, b in an._actions.items() if not b.get_image()]
+            state["blank_icons"] = {n: ink_of(n) for n in ("copy", "save", "pin", "close",
+                                                          "undo", "redo")}
+            an._buttons["arrow"].set_active(True)
+            state["tool"] = an.tool
+            state["arrow_active"] = ctx(an._buttons["arrow"]).has_class(shot_style.ACTIVE_CLASS)
+            state["rect_active"] = ctx(an._buttons["rect"]).has_class(shot_style.ACTIVE_CLASS)
+            an._buttons["highlight"].set_active(True)
+            state["tool_hl"] = an.tool
+            an._swatches["蓝"].set_active(True)
+            state["color"] = an.color
+            an._widths[6].set_active(True)
+            state["width"] = an.width
+            an.stack.add(AN.Shape("rect", (10, 10, 60, 40)))
+            an.select_at((10, 30))
+            an.refresh_status()
+            state["status_selected"] = an._status.get_text()
+            an._win.destroy()
+            loop.quit()
             return False
 
         loop = GLib.MainLoop()
         GLib.timeout_add(0, lambda: (build(), False)[1])
-        GLib.timeout_add(1200, lambda: (loop.quit(), False)[1])
+        fired = []
+        fallback = GLib.timeout_add(2000, lambda: (fired.append(1), loop.quit(), False)[2])
         loop.run()
-        self.assertEqual(errors, [], f"建窗抛异常：{errors}")
+        if not fired:                          # 只在兜底**没**触发时移除（已触发过再移除会报警告）
+            try:
+                GLib.source_remove(fallback)
+            except Exception:
+                pass
+
         self.assertTrue(state.get("mapped"), "窗口/画布没显示出来")
-        self.assertEqual(state.get("buttons"),
-                         ["arrow", "badge", "highlight", "mosaic", "rect", "text"],
-                         "第二批的六件工具都要在工具栏上")
-        self.assertEqual(state.get("colors"), ["red" if False else c[0] for c in AN.COLORS] and
-                         sorted([c[0] for c in AN.COLORS]))
-        self.assertEqual(state.get("widths"), sorted(AN.WIDTHS))
-        for action in ("OCR", "翻译", "钉到屏幕上", "复制", "存盘", "关闭"):
-            self.assertIn(action, state.get("actions"), f"工具栏缺 {action}")
-        self.assertEqual(state.get("tool"), "arrow", "点工具按钮要切换当前工具")
-        self.assertEqual(state.get("tool_hl"), "highlight", "荧光笔也要能选中")
-        self.assertIn("蓝", state.get("color_blue") and [c[0] for c in AN.COLORS
-                                                        if c[1] == state["color_blue"]] or [])
-        self.assertIn("F2", state.get("hint"), "提示条要写明窗内键位")
-        self.assertTrue(state.get("panel_hidden"), "没结果时面板整块藏着，不干扰标注")
-        self.assertIn("没有焦点", state.get("hint_unfocused"),
-                      "失焦时提示条要换成『按了不会生效』那句话")
+        self.assertEqual(state["tools"], sorted(AN.TOOLS), "工具条上的工具必须齐全且**无重复**")
+        self.assertTrue(state["tool_images"], "每个工具都该是**图标**（不是文字按钮）")
+        self.assertTrue(state["tool_tips"], "每个工具都该有悬浮提示")
+        self.assertTrue(state["active_tool_class"], "当前工具没有高亮（cairo 里那点灰不算高亮）")
+        self.assertEqual(len(state["swatches"]), len(AN.COLORS))
+        self.assertGreaterEqual(len(state["swatches"]), 6, "颜色至少 6 个")
+        self.assertTrue(state["swatch_class"] and state["swatch_active"], "颜色圆点缺样式/选中描边")
+        self.assertEqual(state["widths"], sorted(AN.WIDTHS), "线宽三档")
+        self.assertTrue(state["dot_class"] and state["width_active"],
+                        "线宽圆点缺样式，或选中态没走同一个 cp-active")
+        self.assertEqual(state["actions"], sorted(AN.ACTION_GROUP + AN.EDIT_ACTIONS),
+                         "动作区必须含撤销重做 + 复制/存盘/贴图/关闭，且各一次")
+        self.assertTrue(state["primary_class"], "复制要是主按钮（明江要的「主次分明」）")
+        self.assertEqual(state["missing_icons"], [], "这些动作按钮没有图标")
+        blank = {n: ink for n, ink in state["blank_icons"].items() if ink < 20}
+        self.assertEqual(blank, {}, f"这些动作按钮的图标是空的（渲染出来是个空方块）：{blank}")
+        self.assertIn("Enter", state["status"], "快捷键提示要在状态栏里")
+        self.assertIn("未选中", state["status"], "没选中时状态栏要说明白")
+        self.assertIn("已选", state["status_selected"])
+        self.assertIn("矩形", state["status_selected"], "状态栏要写清选中了什么")
+        self.assertIn("F2", state["status_more"], "次要那档要收着其余的键")
+        self.assertTrue(state["bar_classes"], "工具条没上样式类")
+        self.assertTrue(state["drawer_hidden"], "没结果时抽屉先藏着")
+        self.assertTrue(state["drawer_not_in_bar"], "结果抽屉**不许**和工具条挤在同一行")
+        self.assertFalse(state["overlaps"], f"工具条压到截图上了：{an._bar_layout}")
+        self.assertEqual(state["tool"], "arrow")
+        self.assertTrue(state["arrow_active"] and not state["rect_active"],
+                        "换工具后高亮要跟着走（旧的要摘掉）")
+        self.assertEqual(state["tool_hl"], "highlight")
+        self.assertEqual(state["color"], AN.COLORS[3][1], "颜色选择没生效")
+        self.assertEqual(state["width"], 6, "线宽选择没生效")
 
 
 if __name__ == "__main__":

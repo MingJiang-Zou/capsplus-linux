@@ -51,7 +51,8 @@ ACTION_START = "start"
 ACTION_UPDATE = "update"
 ACTION_CONFIRM = "confirm"
 ACTION_CANCEL = "cancel"
-ACTION_FULL = "full"            # Ctrl+A / 双击：直接给出整个联合矩形（或某块屏）
+ACTION_FULL = "full"
+ACTION_NUDGE = "nudge"                    # 方向键微调选区（1px；Shift=10px）            # Ctrl+A / 双击：直接给出整个联合矩形（或某块屏）
 ACTION_SNAP = "snap"            # 松手时吸附到了屏幕边缘
 
 
@@ -69,7 +70,128 @@ def key_action(keyval_name: str, ctrl: bool = False):
         return ACTION_CONFIRM
     if ctrl and keyval_name.lower() == "a":
         return ACTION_FULL
+    if keyval_name in ("Up", "Down", "Left", "Right"):
+        return ACTION_NUDGE                  # 方向键微调选区（1px；Shift=10px）
     return None
+
+
+# 放大镜（明江："从冻结帧取样，光标旁 80×80 + 坐标；我们已经有冻结帧，这个很便宜"）
+MAG_SIZE = 80
+MAG_ZOOM = 4
+MAG_GAP = 16
+
+
+def magnifier_enabled() -> bool:
+    """放大镜开关（默认开；`CAPSPLUS_MAGNIFIER=0` 关掉 —— 嫌它挡视线时用）。"""
+    import os
+    return os.environ.get("CAPSPLUS_MAGNIFIER", "1").strip().lower() not in ("0", "false", "no", "off")
+
+
+def nudge_rect(rect, dx: int, dy: int, union) -> tuple:
+    """把选区按 (dx, dy) 挪一点，**夹在联合矩形里**（不许挪出屏幕）。"""
+    x, y, w, h = rect
+    max_x = union[0] + union[2] - w
+    max_y = union[1] + union[3] - h
+    return (int(min(max(x + dx, union[0]), max(max_x, union[0]))),
+            int(min(max(y + dy, union[1]), max(max_y, union[1]))), w, h)
+
+
+def magnifier_source(frame_size, xy, size=MAG_SIZE, zoom=MAG_ZOOM):
+    """放大镜该取**哪一块**、放大多少倍（纯函数，判据直接断言取样位置对不对）。
+
+    取以光标为中心的一小块（边长 = size/zoom），边界贴住画面时夹住，保证不越界。
+    """
+    frame_w, frame_h = frame_size
+    span = max(int(round(size / float(zoom))), 4)
+    half = span / 2.0
+    left = int(round(min(max(xy[0] - half, 0), max(frame_w - span, 0))))
+    top = int(round(min(max(xy[1] - half, 0), max(frame_h - span, 0))))
+    return {"src": (left, top, span, span), "zoom": zoom, "size": size}
+
+
+def magnifier_position(xy, area, size=MAG_SIZE, gap=MAG_GAP) -> tuple:
+    """放大镜放光标旁边：右/下放不下就翻到左/上（别把放大镜怼到屏幕外）。"""
+    width, height = area[2], area[3]
+    x = xy[0] + gap
+    if x + size > width - 4:
+        x = xy[0] - gap - size
+    y = xy[1] + gap
+    if y + size > height - 4:
+        y = xy[1] - gap - size
+    return (int(min(max(x, 4), max(width - size - 4, 4))),
+            int(min(max(y, 4), max(height - size - 4, 4))))
+
+
+def draw_magnifier(cr, frame, xy, area, size=MAG_SIZE, zoom=MAG_ZOOM) -> bool:
+    """画放大镜：**从冻结帧取样**（不是重新抓屏，所以零成本、零延迟）+ 坐标读数。
+
+    返回是否画了（拿不到帧就返回 False —— 调用方据此决定要不要画坐标）。
+    """
+    cairo = _cairo()                       # 本模块顶层不 import cairo（无头 CI 也要能 import）
+    if frame is None:
+        return False
+    frame_w, frame_h = frame.get_width(), frame.get_height()
+    if frame_w < 2 or frame_h < 2:
+        return False
+    info = magnifier_source((frame_w, frame_h), xy, size, zoom)
+    zoom = info["zoom"]
+    sx, sy, sw, sh = info["src"]
+    dx, dy = magnifier_position(xy, area, size)
+    cr.save()
+    cr.rectangle(dx, dy, size, size)
+    cr.clip()
+    cr.translate(dx, dy)
+    cr.scale(size / float(sw), size / float(sh))
+    # **最近邻**：放大镜是用来对准像素的，双线性会把单像素糊成一片（判据："1 个像素该放大成
+    # 约 zoom 个像素宽"就是被这条抓的）。
+    cr.set_source_surface(frame, -sx, -sy)      # 取样偏移交给"源表面偏移"这一条，别自己拼矩阵
+    cr.get_source().set_filter(cairo.FILTER_NEAREST)
+    cr.paint()
+    cr.restore()
+    # 边框 + 中心十字（对准：光标的那个像素在放大镜正中间）
+    cr.save()
+    cr.set_source_rgba(1, 1, 1, 0.85)
+    cr.set_line_width(2)
+    cr.rectangle(dx, dy, size, size)
+    cr.stroke()
+    # 中心**方格**而不是十字线：十字线正好盖住你要对准的那个像素（第一版就是这样，判据抓到
+    # "正中读不到那个红点"）。方格把中心那个像素框出来，看得见又不挡。
+    half = size / 2.0
+    box = max(zoom, 2)
+    cr.set_source_rgba(1, 1, 1, 0.75)
+    cr.set_line_width(1)
+    cr.rectangle(dx + half - box / 2.0, dy + half - box / 2.0, box, box)
+    cr.stroke()
+    gap = box / 2.0 + 3
+    cr.set_source_rgba(1, 1, 1, 0.45)
+    cr.move_to(dx + half, dy + 5)
+    cr.line_to(dx + half, dy + half - gap)
+    cr.move_to(dx + half, dy + half + gap)
+    cr.line_to(dx + half, dy + size - 5)
+    cr.move_to(dx + 5, dy + half)
+    cr.line_to(dx + half - gap, dy + half)
+    cr.move_to(dx + half + gap, dy + half)
+    cr.line_to(dx + size - 5, dy + half)
+    cr.stroke()
+    # 坐标读数（挂在放大镜下面）
+    text = f"{int(xy[0])}, {int(xy[1])}"
+    cr.select_font_face("Sans")
+    cr.set_font_size(13)
+    extents = cr.text_extents(text)
+    box_w = extents.width + 12
+    box_h = extents.height + 8
+    box_x = min(max(dx + size / 2.0 - box_w / 2.0, 2), max(area[2] - box_w - 2, 2))
+    box_y = dy + size + 4
+    if box_y + box_h > area[3] - 2:
+        box_y = dy - box_h - 4        # 下面放不下就挂上面
+    cr.set_source_rgba(0, 0, 0, 0.72)
+    cr.rectangle(box_x, box_y, box_w, box_h)
+    cr.fill()
+    cr.set_source_rgba(1, 1, 1, 0.95)
+    cr.move_to(box_x + 6, box_y + box_h - 5)
+    cr.show_text(text)
+    cr.restore()
+    return True
 
 
 def button_action(button: int, has_selection: bool, double: bool = False) -> str:
@@ -177,7 +299,8 @@ def text_box(text: str, font_size: int = FONT_SIZE) -> tuple:
     return (12 + int(font_size * 0.65) * len(text), font_size + 2 * READOUT_PAD)
 
 
-def paint(cr, area, rect, frame=None, hint: bool = True, crosshair=None, handles: bool = True):
+def paint(cr, area, rect, frame=None, hint: bool = True, crosshair=None, handles: bool = True,
+          magnifier=None):
     """把遮罩画到 cairo 上下文上（**不碰 gi**，判据直接渲染到 ImageSurface 上断言像素）。
 
     像素口径（判据照这个算）：
@@ -188,6 +311,7 @@ def paint(cr, area, rect, frame=None, hint: bool = True, crosshair=None, handles
       3. 选区内：1px 亮青描边 + 四角角标 + 八个白色手柄。
       4. 读数（宽 × 高 + 起点坐标）在选区上方外侧；`crosshair` 给定时画十字准线。
       5. `hint` 为真时底部居中画一行操作提示。
+      6. `magnifier` 给定时（本地坐标 `(x, y)`）画**从冻结帧取样**的放大镜 + 坐标（最后画，压最上面）。
     """
     cairo = _cairo()
     ax, ay, aw, ah = area
@@ -273,6 +397,9 @@ def paint(cr, area, rect, frame=None, hint: bool = True, crosshair=None, handles
     cr.move_to(rx + READOUT_PAD, ry + 2 * FONT_SIZE + READOUT_PAD + 1)
     cr.set_source_rgba(0.75, 0.85, 0.95, 1.0)
     cr.show_text(coord_text(rect))
+
+    if magnifier is not None:              # 放大镜最后画：压在所有东西上面
+        draw_magnifier(cr, frame, magnifier, area)
 
 
 # ------------------------------------------------------------------------------ GTK 部分
@@ -366,6 +493,8 @@ class Overlay:
         self.on_confirm = on_confirm
         self.monitors = monitors
         self.rect = None            # 全局逻辑坐标下的选区（允许跨屏）
+        from capsplus.shot_frames import union_rect
+        self.union = union_rect(self.monitors or [(0, 0, 1920, 1080)])   # 方向键微调时的边界
         self.active = None          # 选区"主屏"索引（画交互提示用）
         self.pointer = None         # 最后一次指针位置（本地坐标 + 屏索引）
         self.dragging = False
@@ -374,6 +503,7 @@ class Overlay:
         self.result = None
         self.outcome = None         # "confirm" / "cancel" / "geometry-fail"
         self.geometry_ok = None     # map 后自检结果（None = 还没量）
+        self.magnifier = magnifier_enabled()   # 光标旁的放大镜（从冻结帧取样）
         self.failure = ""           # 自检失败时给调用方的话
         self.snap = snap
 
@@ -571,9 +701,13 @@ class Overlay:
         area = (0, 0, max(widget.get_allocated_width(), self.monitors[idx][2]),
                 max(widget.get_allocated_height(), self.monitors[idx][3]))
         crosshair = None
+        magnifier = None
         if self.pointer and self.pointer[0] == idx:
             crosshair = self.pointer[1]
-        paint(cr, area, self._local_rect(idx), frame=self._frame_for(idx), crosshair=crosshair)
+            if self.magnifier:                 # 放大镜：从**冻结帧**取样（零成本、零延迟）
+                magnifier = self.pointer[1]
+        paint(cr, area, self._local_rect(idx), frame=self._frame_for(idx), crosshair=crosshair,
+              magnifier=magnifier)
         # ⚠ **必须 return True**（2026-10-19 真机事故）：`GtkWidget::draw` 的默认处理器跑在自定义
         # 处理器**之后**，会把控件自己的主题背景刷在我们的画上面 —— 表现就是"三个窗口尺寸都对，
         # 屏幕上却是整块纯白"（Adwaita 的 #fafafa ≈ 250；明江看到纯白、我抓屏读数也是均匀 250，
@@ -602,18 +736,31 @@ class Overlay:
         return True
 
     def _on_key_event(self, _widget, event, idx):
-        name, ctrl = "", False
+        name, ctrl, shift = "", False, False
         try:
             import gi
             gi.require_version("Gdk", "3.0")
             from gi.repository import Gdk
             name = Gdk.keyval_name(event.keyval) or ""
             ctrl = bool(event.state & Gdk.ModifierType.CONTROL_MASK)
+            shift = bool(event.state & Gdk.ModifierType.SHIFT_MASK)
         except Exception:
-            name, ctrl = "", False
-        self.on_key(name, ctrl=ctrl)
+            name, ctrl, shift = "", False, False
+        if key_action(name, ctrl=ctrl) == ACTION_NUDGE:
+            from capsplus.shot_annotate import nudge_delta      # 步长与标注窗同源
+            dx, dy = nudge_delta(name, shift)
+            self.nudge(dx, dy)
+        else:
+            self.on_key(name, ctrl=ctrl)
         if not self.outcome:
             self._redraw()
+        return True
+
+    def nudge(self, dx: int, dy: int) -> bool:
+        """方向键微调选区（1px；Shift=10px），夹在联合矩形里 —— 不许挪出屏幕。"""
+        if not self.rect:
+            return False
+        self.rect = nudge_rect(self.rect, dx, dy, self.union)
         return True
 
     def _redraw(self):

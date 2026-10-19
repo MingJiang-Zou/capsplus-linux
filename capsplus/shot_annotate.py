@@ -22,12 +22,15 @@
 
 from __future__ import annotations
 
+import math
 import os
 import subprocess
 import tempfile
 from pathlib import Path
 
 from capsplus.shot_panel import KIND_OCR, KIND_TRANSLATE, PanelModel
+# 布局常量与 CSS 同源（**不在这里再写一份**：间距/尺寸只在 shot_style 里定义）
+from capsplus.shot_style import BAR_GAP, STATUS_FONT, SWATCH, TOOL_BTN, WIDTH_DOT
 
 COLOR_ANNOT = (0.90, 0.15, 0.15, 1.0)     # 标注默认红（Snipaste 也是这个习惯）
 COLOR_SHADOW = (0.0, 0.0, 0.0, 0.55)
@@ -37,19 +40,46 @@ FONT_SIZE = 22
 MOSAIC_BLOCK = 12
 TEXT_LIMIT = 500
 POLL_MS = 50                        # 后台结果回主循环的轮询间隔（见 _drain_mailbox：不用 idle_add）
-HIGHLIGHT_ALPHA = 0.35                    # 荧光笔：半透明，压得住文字又能看见底下的内容
+CANVAS_MARGIN = 14                        # 截图四周的留白（中性底色衬托）
+CANVAS_BG = (0.106, 0.106, 0.118)         # 画布中性底色（与 CSS `.cp-canvas` 同色）
+HIGHLIGHT_ALPHA = 0.35                    # （旧口径，保留给显式传参的场景）
+# 荧光笔就是**半透明黄**这一支：不跟随颜色选择 —— 之所以定死，是因为"深色底 + 深色笔"会调出
+# 一条橄榄色，压在上面的字几乎读不出来（lead 看图抓到的）。黄 + α=0.6 在浅底与深底上都能读出字。
+HIGHLIGHT_COLOR = (1.00, 0.85, 0.15, 0.70)
 BADGE_RADIUS = 14
 BADGE_FONT_SIZE = 16
 
-TOOLS = ("rect", "arrow", "highlight", "badge", "text", "mosaic")
-TOOL_LABELS = {"rect": "矩形", "arrow": "箭头", "highlight": "荧光笔", "badge": "序号",
-               "text": "文字", "mosaic": "马赛克"}
+TOOLS = ("rect", "ellipse", "arrow", "line", "highlight", "pen",
+         "badge", "text", "mosaic", "eraser")
+TOOL_LABELS = {"rect": "矩形", "ellipse": "椭圆", "arrow": "箭头", "line": "直线",
+               "highlight": "荧光笔", "pen": "自由笔", "badge": "序号",
+               "text": "文字", "mosaic": "马赛克", "eraser": "橡皮"}
+
+# 工具条分组（**组间细分隔线**，绘制类在左、标记类居中、编辑类靠右；判据断言"分组齐全且无重复"）
+TOOL_GROUPS = (
+    ("rect", "ellipse", "arrow", "line", "highlight", "pen"),
+    ("badge", "text", "mosaic"),
+    ("eraser",),
+)
+
+# 选中态手柄（8 个）与命中容差
+HANDLES = ("nw", "n", "ne", "e", "se", "s", "sw", "w")
+HANDLE_SIZE = 7            # 手柄方块边长（图像坐标；显示时会被 scale 放大）
+SELECT_TOL = 5             # 点中某个标注的容差（图像坐标）
+NUDGE_STEP = 1             # 方向键微调步长（Shift = ×10）
+NUDGE_BIG = 10
+
+ACTION_NUDGE = "nudge"
+ACTION_DELETE = "delete"
+ACTION_ENTER = "copy-close"
 # 颜色与线宽可选（第二批"和一般截图工具一样"那条）。默认第一项 —— 与第一批的行为一致。
 COLORS = (("红", (0.90, 0.15, 0.15, 1.0)),
           ("黄", (1.00, 0.82, 0.10, 1.0)),
           ("绿", (0.20, 0.75, 0.35, 1.0)),
           ("蓝", (0.20, 0.55, 0.95, 1.0)),
-          ("黑", (0.05, 0.05, 0.05, 1.0)))
+          ("黑", (0.05, 0.05, 0.05, 1.0)),
+          ("紫", (0.62, 0.32, 0.88, 1.0)),
+          ("橙", (1.00, 0.55, 0.10, 1.0)))     # 明江要求"颜色至少 6 个"（原 5 个不够）
 WIDTHS = (2, 3, 6)
 
 ACTION_UNDO = "undo"
@@ -61,10 +91,19 @@ ACTION_OCR = "ocr"
 ACTION_TRANSLATE = "translate"
 ACTION_CLOSE = "close"
 
+# 工具条上的动作分组（判据断言"齐全且无重复"）：撤销重做在最左、复制/存盘/贴图/关闭在最右
+EDIT_ACTIONS = (ACTION_UNDO, ACTION_REDO)
+ACTION_GROUP = (ACTION_COPY, ACTION_SAVE, ACTION_PIN, ACTION_CLOSE)
+
+# 右键快捷菜单（Snipaste 的手感：复制 / 存盘 / 贴图 / 关闭）
+CONTEXT_MENU = (("复制到剪贴板", ACTION_COPY), ("存盘", ACTION_SAVE),
+                ("贴到屏幕上", ACTION_PIN), ("关闭", ACTION_CLOSE))
+
 # 窗内键位（**只在这一份里定义**，提示条与事件处理都读它 —— 免得两头对不上）
 KEY_ACTIONS = {"F2": ACTION_TRANSLATE, "F3": ACTION_PIN, "F4": ACTION_OCR}
-HINT_FOCUSED = ("F2 翻译 · F3 贴图 · F4 OCR · Ctrl+C 复制 · Ctrl+S 存盘 · "
-                "Ctrl+Z 撤销 · Esc 关")
+HINT_FOCUSED = ("Enter 复制并关 · F2 翻译 · F3 贴图 · F4 OCR · Ctrl+C 复制 · Ctrl+S 存盘 · "
+                "Ctrl+Z 撤销 · Ctrl+Y 重做 · 方向键微调标注（Shift=10px）· Del 删掉选中 · "
+                "右键菜单 · Esc 关")
 HINT_UNFOCUSED = ("窗口没有焦点：F2/F3/F4 现在**不会**生效（这是提示，不是按了没反应）"
                   "—— 点一下窗口再按")
 
@@ -74,15 +113,19 @@ CLIPBOARD_CMD = ("wl-copy", "--type", "image/png")
 class Shape:
     """一个标注图形。`kind` ∈ TOOLS；`rect` 是**图像坐标**下的 `(x, y, w, h)`；`text` 只有文字用。"""
 
-    def __init__(self, kind: str, rect, text: str = "", color=COLOR_ANNOT, width: int = LINE_WIDTH):
+    points = None                  # 自由笔的点集（其余图元为 None）
+
+    def __init__(self, kind: str, rect, text: str = "", color=COLOR_ANNOT, width: int = LINE_WIDTH,
+                 points=None):
         assert kind in TOOLS, f"未知图形 {kind}"
-        if kind == "highlight":                     # 荧光笔自带半透明，别指望调用方记得传 alpha
-            color = (color[0], color[1], color[2], HIGHLIGHT_ALPHA)
+        if kind == "highlight" and color == COLOR_ANNOT:
+            color = HIGHLIGHT_COLOR                 # 默认（没显式指定颜色）就是半透明黄
         self.kind = kind
         self.rect = (int(rect[0]), int(rect[1]), max(1, int(rect[2])), max(1, int(rect[3])))
         self.text = text
         self.color = color
         self.width = width
+        self.points = list(points) if points else None     # ⚠ 忘了这行 ⇒ 自由笔的点全丢（判据抓到）
 
     def __eq__(self, other):
         return (isinstance(other, Shape) and self.kind == other.kind and self.rect == other.rect
@@ -119,6 +162,35 @@ class ShapeStack:
     def clear(self) -> None:
         self._items = []
         self._index = 0
+
+    # ---- 下面三条给"可编辑的标注"用（拖动/缩放/橡皮）：按**身份**找，不按 __eq__ ──
+    def index_of(self, shape) -> int:
+        for idx, item in enumerate(self._items):
+            if item is shape:
+                return idx
+        return -1
+
+    def trim_redo(self) -> None:
+        """任何**新**编辑都要清掉"重做"那一段（与画图软件一致）。"""
+        del self._items[self._index:]
+
+    def remove_at(self, idx: int):
+        if not (0 <= idx < len(self._items)):
+            return None
+        shape = self._items.pop(idx)
+        if idx < self._index:
+            self._index -= 1
+        return shape
+
+    def insert_at(self, idx: int, shape) -> None:
+        idx = max(0, min(idx, len(self._items)))
+        self._items.insert(idx, shape)
+        if idx <= self._index:
+            self._index += 1
+
+    def replace_at(self, idx: int, shape) -> None:
+        if 0 <= idx < len(self._items):
+            self._items[idx] = shape
 
     @property
     def shapes(self) -> list:
@@ -182,7 +254,28 @@ def key_command(name: str, ctrl: bool = False, shift: bool = False):
         return KEY_ACTIONS[name]
     if name == "Escape":
         return ACTION_CLOSE
+    if name in ("Return", "KP_Enter"):
+        return ACTION_ENTER                      # Snipaste 的手感：回车 = 复制并关
+    if name in ARROW_KEYS:
+        return ACTION_NUDGE                      # 微调选的标注（步长看 nudge_delta）
+    if name in ("Delete", "BackSpace"):
+        return ACTION_DELETE
     return None
+
+
+ARROW_KEYS = ("Up", "Down", "Left", "Right")
+
+
+def nudge_delta(name: str, shift: bool = False) -> tuple:
+    """方向键 → `(dx, dy)`：1px；按住 Shift 是 10px（Snipaste 的手感）。"""
+    step = NUDGE_BIG if shift else NUDGE_STEP
+    return {"Left": (-step, 0), "Right": (step, 0),
+            "Up": (0, -step), "Down": (0, step)}.get(name, (0, 0))
+
+
+def context_menu_items() -> tuple:
+    """右键快捷菜单的条目（判据据此断言"四个动作都在、且没有重复"）。"""
+    return CONTEXT_MENU
 
 
 def hint_text(focused: bool = True) -> str:
@@ -218,8 +311,12 @@ def _cairo():
     return cairo
 
 
-def render(cr, base_surface, shapes, size=None) -> None:
-    """把底图 + 全部图形画到 cairo 上下文上（**不碰 gi**，判据渲染到 ImageSurface 上断言像素）。"""
+def render(cr, base_surface, shapes, size=None, selected=None, hover=None) -> None:
+    """把底图 + 全部图形画到 cairo 上下文上（**不碰 gi**，判据渲染到 ImageSurface 上断言像素）。
+
+    `selected` / `hover` 传**图形对象**（`Shape`）：选中的画描边 + 8 个手柄，hover 的画虚线框
+    —— 这样"这东西能拖"一眼看得出来（明江说"没有描边和手柄，看不出可编辑"）。
+    """
     cairo = _cairo()
     if size is None:
         size = (base_surface.get_width(), base_surface.get_height())
@@ -253,10 +350,305 @@ def render(cr, base_surface, shapes, size=None) -> None:
             cr.set_source_rgba(*shape.color)
             cr.rectangle(x, y, w, h)
             cr.fill()
+        elif shape.kind == "ellipse":
+            x, y, w, h = shape.rect
+            cr.save()
+            cr.translate(x + w / 2.0, y + h / 2.0)
+            cr.scale(max(w / 2.0, 0.5), max(h / 2.0, 0.5))
+            cr.arc(0, 0, 1.0, 0, 2 * math.pi)
+            cr.restore()
+            cr.stroke()
+        elif shape.kind == "line":
+            cr.move_to(x, y + h)
+            cr.line_to(x + w, y)
+            cr.stroke()
+        elif shape.kind == "pen":
+            _draw_polyline(cr, shape)
         elif shape.kind == "badge":
             _draw_badge(cr, shape)
         elif shape.kind == "mosaic":
             _draw_mosaic(cr, base_surface, shape.rect, size)
+
+    _draw_selection(cr, selected, hover)
+
+
+def _shape_state(shape) -> tuple:
+    """图形状态快照（撤销用）：矩形 + 点集。"""
+    return (tuple(shape.rect), tuple(shape.points) if shape.points else None)
+
+
+def _apply_shape_state(shape, state) -> None:
+    rect, points = state
+    shape.rect = tuple(rect)
+    if points:
+        shape.points = list(points)
+
+
+def _points_rect(points) -> tuple:
+    xs = [p[0] for p in points]
+    ys = [p[1] for p in points]
+    return (min(xs), min(ys), max(max(xs) - min(xs), 1), max(max(ys) - min(ys), 1))
+
+
+def _delta(xy, origin) -> tuple:
+    """拖动位移 = 当前点 − 按下点。**每帧都从按下点算**（不然会累积误差、越拖越飘）。"""
+    return (int(round(xy[0] - origin[0])), int(round(xy[1] - origin[1])))
+
+
+def draw_canvas(cr, canvas, base_surface, shapes, selected=None, hover=None) -> None:
+    """画布：中性底色 + **居中的截图** + 标注（含选中描边/手柄、hover 虚线）。
+
+    纯函数（不碰 gi）⇒ 判据能把它渲染到 ImageSurface 上逐像素断言：
+    "截图居中、四周有留白、底色是中性的、选中手柄画出来了"。
+    """
+    cairo = _cairo()
+    width, height = canvas["size"]
+    cr.save()
+    cr.set_source_rgb(*CANVAS_BG)
+    cr.rectangle(0, 0, width, height)
+    cr.fill()
+    cr.restore()
+    ix, iy, iw, ih = canvas["image"]
+    base_w, base_h = base_surface.get_width(), base_surface.get_height()
+    cr.save()
+    cr.translate(ix, iy)
+    cr.scale(iw / float(base_w), ih / float(base_h))
+    cr.rectangle(0, 0, base_w, base_h)         # **裁到截图矩形**：标注不许画到留白区（导出也不带）
+    cr.clip()
+    render(cr, base_surface, shapes, size=(base_w, base_h), selected=selected, hover=hover)
+    cr.restore()
+    cr.save()
+    cr.set_source_rgba(1, 1, 1, 0.28)          # 图像细边框：一眼看出截图边界
+    cr.set_line_width(1)
+    cr.rectangle(ix - 0.5, iy - 0.5, iw + 1, ih + 1)
+    cr.stroke()
+    cr.restore()
+
+
+def window_plan(image_size, screen, bar_h=40, margin=CANVAS_MARGIN, gap=BAR_GAP) -> dict:
+    """窗口规划：**先给工具条留一条带**（图像下方），再把截图缩放到剩下的空间里。
+
+    这样"工具条不遮挡截图"在几何上就成立（不是靠运气）；只有连最小缩放都放不下时，
+    `bar_layout` 才会退回"贴着图内下沿"，并被判据标成 `overlaps=True`。
+    """
+    strip = int(bar_h) + int(gap) * 2
+    avail = (max(screen[0] - margin * 2, 64), max(screen[1] - strip - margin * 2, 64))
+    scale = fit_scale(image_size, avail)
+    canvas = canvas_layout(image_size, scale, margin, reserve_bottom=strip)
+    return {"scale": scale, "canvas": canvas, "window": canvas["size"], "strip": strip}
+
+
+def _draw_polyline(cr, shape) -> None:
+    """自由笔：把拖出来的点连成折线（点多的时候顺滑靠 round cap/join）。"""
+    pts = list(shape.points or [])
+    if len(pts) < 2:
+        return
+    cr.move_to(*pts[0])
+    for pt in pts[1:]:
+        cr.line_to(*pt)
+    cr.stroke()
+
+
+def shape_bounds(shape) -> tuple:
+    """图形的最小外接矩形 `(x, y, w, h)`（自由笔用点集算，其余用 rect）。"""
+    if shape.kind == "pen" and shape.points:
+        xs = [p[0] for p in shape.points]
+        ys = [p[1] for p in shape.points]
+        return (min(xs), min(ys), max(xs) - min(xs), max(ys) - min(ys))
+    if shape.kind == "text":
+        return (shape.rect[0], shape.rect[1],
+                max(shape.rect[2], len(shape.text or "") * FONT_SIZE * 0.6),
+                max(shape.rect[3], FONT_SIZE))
+    return tuple(shape.rect)
+
+
+def handles_for(bounds, size=HANDLE_SIZE) -> dict:
+    """8 个手柄：四角 + 四边中点（**中心点坐标**）。"""
+    x, y, w, h = bounds
+    cx, cy = x + w / 2.0, y + h / 2.0
+    return {"nw": (x, y), "n": (cx, y), "ne": (x + w, y), "e": (x + w, cy),
+            "se": (x + w, y + h), "s": (cx, y + h), "sw": (x, y + h), "w": (x, cy)}
+
+
+def handle_at(bounds, xy, size=HANDLE_SIZE) -> str:
+    """点在哪个手柄上（没点中返回 ""）。容差按手柄边长的一半 + 2。"""
+    tol = size / 2.0 + 2
+    for name, (hx, hy) in handles_for(bounds, size).items():
+        if abs(xy[0] - hx) <= tol and abs(xy[1] - hy) <= tol:
+            return name
+    return ""
+
+
+def clamp_to_image(xy, image_size) -> tuple:
+    """把坐标夹进截图矩形内 —— **留白区不许落笔**（明江看到的"能画到框外"就是这条没做）。"""
+    width, height = image_size
+    return (int(min(max(xy[0], 0), max(width - 1, 0))),
+            int(min(max(xy[1], 0), max(height - 1, 0))))
+
+
+def clamp_rect_to_image(rect, image_size) -> tuple:
+    """把矩形裁进截图矩形内（保留宽高，往回收）—— 导出时自然只导出截图那一块。"""
+    x, y, w, h = rect
+    width, height = image_size
+    w = int(min(max(w, 1), width))
+    h = int(min(max(h, 1), height))
+    x = int(min(max(x, 0), width - w))
+    y = int(min(max(y, 0), height - h))
+    return (x, y, w, h)
+
+
+def clip_shape_to_image(shape, image_size) -> bool:
+    """把某个图形的几何裁进截图矩形；返回是否被裁过。"""
+    before = (tuple(shape.rect), tuple(shape.points) if shape.points else None)
+    shape.rect = clamp_rect_to_image(shape.rect, image_size)
+    if shape.points:
+        shape.points = [clamp_to_image(pt, image_size) for pt in shape.points]
+        shape.rect = _points_rect(shape.points)
+    return (tuple(shape.rect), tuple(shape.points) if shape.points else None) != before
+
+
+def hit_test(shape, xy, tol=SELECT_TOL, inside=False) -> bool:
+    """点是否落在某个标注上。
+
+    `inside=False`（默认，用于**选中/拖动**）：空心图元只有靠近**边线**才算命中 —— 这样在已有的
+    框里还能接着画新东西（画图软件的老规矩）。
+    `inside=True`（用于**橡皮**）：只要在它的包围盒里就算命中（"点一下删掉那个标注"要够好点）。
+    """
+    if inside and shape.kind != "pen":
+        x, y, w, h = shape_bounds(shape)
+        return (x - tol <= xy[0] <= x + w + tol) and (y - tol <= xy[1] <= y + h + tol)
+    if inside and shape.kind == "pen":
+        pass
+    if shape.kind == "pen" and shape.points:
+        for pt in shape.points:
+            if abs(pt[0] - xy[0]) <= tol + shape.width and abs(pt[1] - xy[1]) <= tol + shape.width:
+                return True
+        return False
+    if shape.kind == "badge":
+        x, y, w, h = shape.rect
+        return (x - tol <= xy[0] <= x + w + tol) and (y - tol <= xy[1] <= y + h + tol)
+    x, y, w, h = shape_bounds(shape)
+    if shape.kind == "highlight":
+        return (x - tol <= xy[0] <= x + w + tol) and (y - tol <= xy[1] <= y + h + tol)
+    # 线状/框状图元：按边线的距离判定（点空心处不算命中）
+    near_x = min(abs(xy[0] - x), abs(xy[0] - (x + w))) <= tol + shape.width
+    near_y = min(abs(xy[1] - y), abs(xy[1] - (y + h))) <= tol + shape.width
+    inside_x = x - tol <= xy[0] <= x + w + tol
+    inside_y = y - tol <= xy[1] <= y + h + tol
+    if shape.kind == "ellipse":
+        return inside_x and inside_y
+    return (near_x and inside_y) or (near_y and inside_x)
+
+
+def object_at(shapes, xy, tol=SELECT_TOL, inside=False) -> int:
+    """最上面（最后画的）被点中的图形下标；没有返回 -1。"""
+    for idx in range(len(shapes) - 1, -1, -1):
+        if hit_test(shapes[idx], xy, tol, inside=inside):
+            return idx
+    return -1
+
+
+def translate_rect(rect, dx, dy) -> tuple:
+    return (rect[0] + dx, rect[1] + dy, rect[2], rect[3])
+
+
+def resize_rect(rect, handle, xy) -> tuple:
+    """拖手柄改大小：只有被拖的那条边/角会动，其余不变（最小 4px，别让它翻转成负的）。"""
+    x, y, w, h = rect
+    left, top, right, bottom = x, y, x + w, y + h
+    if "w" in handle:
+        left = min(xy[0], right - 4)
+    if "e" in handle:
+        right = max(xy[0], left + 4)
+    if "n" in handle:
+        top = min(xy[1], bottom - 4)
+    if "s" in handle:
+        bottom = max(xy[1], top + 4)
+    return (left, top, right - left, bottom - top)
+
+
+def shape_label(shape) -> str:
+    """状态栏上"选中了什么"：名字 + 尺寸（比"选中"两个字有用得多）。"""
+    x, y, w, h = shape_bounds(shape)
+    name = TOOL_LABELS.get(shape.kind, shape.kind)
+    if shape.kind == "text":
+        return f"{name}「{(shape.text or '')[:12]}」"
+    if shape.kind == "badge":
+        return f"{name} {shape.text}"
+    return f"{name} {int(round(w))}×{int(round(h))}"
+
+
+def _draw_selection(cr, selected=None, hover=None) -> None:
+    """选中的图形：明显描边 + 8 个手柄；hover 的图形：虚线框（"能拖"的反馈）。"""
+    if hover is not None and hover is not selected:
+        # **双色虚线**：浅色截图上白线看不见、深色截图上线看不见 —— 所以底下压一道深色、
+        # 上面再画一道白色（判据抓到过"白底上画白虚线等于没画"）。
+        bounds = shape_bounds(hover)
+        _outline(cr, bounds, (0.0, 0.0, 0.0, 0.60), 1.0, dashes=(3, 3))
+        _outline(cr, bounds, (1.0, 1.0, 1.0, 0.95), 1.0, dashes=(3, 3), offset=3)
+    if selected is None:
+        return
+    bounds = shape_bounds(selected)
+    _outline(cr, bounds, (0.15, 0.55, 1.0, 0.95), 1.5)
+    for (hx, hy) in handles_for(bounds).values():
+        cr.set_source_rgba(1, 1, 1, 1)
+        cr.rectangle(hx - HANDLE_SIZE / 2.0, hy - HANDLE_SIZE / 2.0, HANDLE_SIZE, HANDLE_SIZE)
+        cr.fill_preserve()
+        cr.set_source_rgba(0.15, 0.55, 1.0, 0.95)
+        cr.set_line_width(1.5)
+        cr.stroke()
+
+
+def _outline(cr, bounds, rgba, width, dashes=None, offset: int = 0) -> None:
+    cr.save()
+    cr.set_source_rgba(*rgba)
+    cr.set_line_width(width)
+    if dashes:
+        cr.set_dash(dashes, offset)
+    x, y, w, h = bounds
+    cr.rectangle(x - 2, y - 2, w + 4, h + 4)
+    cr.stroke()
+    cr.restore()
+
+
+def canvas_layout(image_size, scale=1.0, margin=CANVAS_MARGIN,
+                  reserve_bottom=0, reserve_top=0) -> dict:
+    """截图在画布里的位置：**居中 + 四周留白**（不是贴边画，那样看不出边界）。
+
+    `reserve_bottom` / `reserve_top` 是给工具条/抽屉预留的带（上下各算一条，图像本身仍居中于
+    剩余空间）。
+    """
+    img_w = max(int(round(image_size[0] * scale)), 1)
+    img_h = max(int(round(image_size[1] * scale)), 1)
+    top = int(margin) + int(reserve_top)
+    return {"image": (int(margin), top, img_w, img_h), "scale": scale, "margin": int(margin),
+            "size": (img_w + int(margin) * 2,
+                     img_h + int(margin) * 2 + int(reserve_top) + int(reserve_bottom))}
+
+
+def bar_layout(canvas, bar_size, window_size, gap=BAR_GAP) -> dict:
+    """工具条放哪：**优先图像下方**（不遮挡图像），下方放不下就翻到上方；
+    上下都放不下才贴着图像内下沿（这种情况会标记 `overlaps=True`，判据据此断言"只在没办法时才遮"）。
+    """
+    ix, iy, iw, ih = canvas["image"]
+    bw, bh = bar_size
+    wx, wy = window_size
+    x = ix + (iw - bw) / 2.0
+    x = max(min(x, wx - bw - 2), 2)
+    below = iy + ih + gap
+    if below + bh <= wy - 2:
+        return {"x": x, "y": below, "flipped": False, "overlaps": False}
+    above = iy - gap - bh
+    if above >= 2:
+        return {"x": x, "y": above, "flipped": True, "overlaps": False}
+    return {"x": x, "y": max(wy - bh - 2, 2), "flipped": False, "overlaps": True}
+
+
+def bar_overlaps_image(bar, canvas) -> bool:
+    """工具条有没有压到截图区域（判据：有留白可用时**必须**不压）。"""
+    ix, iy, iw, ih = canvas["image"]
+    bx, by, bw, bh = bar["x"], bar["y"], bar["w"], bar["h"]
+    return not (bx + bw <= ix or bx >= ix + iw or by + bh <= iy or by >= iy + ih)
 
 
 def _draw_badge(cr, shape) -> None:
@@ -304,12 +696,16 @@ def _draw_mosaic(cr, base_surface, rect, size) -> None:
     cr.restore()
 
 
-def render_to_surface(base_surface, shapes):
-    """渲染成一张新 surface（存盘与复制都走它，保证"存下来的 == 屏幕上看到的"）。"""
+def render_to_surface(base_surface, shapes, selected=None, hover=None):
+    """渲染成一张新 surface（存盘与复制都走它，保证"存下来的 == 屏幕上看到的"）。
+
+    ⚠ 存盘/复制**不传** `selected`/`hover`：手柄与虚线是**编辑期的提示**，不该被存进图里。
+    （判据用它们来断言"选中/hover 在像素上看得见"。）
+    """
     cairo = _cairo()
     out = cairo.ImageSurface(cairo.FORMAT_ARGB32, base_surface.get_width(),
                              base_surface.get_height())
-    render(cairo.Context(out), base_surface, shapes)
+    render(cairo.Context(out), base_surface, shapes, selected=selected, hover=hover)
     return out
 
 
@@ -413,8 +809,17 @@ class Annotator:
         self.threads = []                  # 后台线程（识别/翻译不该冻住界面）
         self.panel = PanelModel()
         self.directory = directory
+        self.screen = screen           # 用来算"给工具条留出的那条带"（见 window_plan）
         self.drag_from = None
         self.pending = None            # 正在拖的那个图形（未提交）
+        # ── 可编辑的标注（明江："没有描边和手柄，看不出可编辑"）──
+        self.selected = None           # 选中的 Shape（**对象引用**，不进栈副本）
+        self.hover = None              # 鼠标下的 Shape（虚线框反馈）
+        self.edits = []                # 拖动/缩放/删除的编辑历史（撤销先走它）
+        self.edit_index = 0
+        self._drag_mode = None         # None / "move" / "resize:nw" / "draw"
+        self._drag_shape = None
+        self._drag_before = None
         self.result = None             # "copy" / "save" / "pin" / "close"
         self.saved_path = None
         self.message = ""
@@ -427,26 +832,175 @@ class Annotator:
         return out
 
     def press(self, image_xy) -> None:
-        self.drag_from = image_xy
+        """按下：**先看是不是在动已有标注**（拖动/缩放手柄），否则起一笔新的。"""
+        mode = self.start_drag(image_xy)
+        self._drag_mode = mode
+        self.drag_from = None if mode != "draw" else image_xy
+        if mode == "draw" and self.tool == "pen":
+            self.pending = Shape("pen", (image_xy[0], image_xy[1], 1, 1), color=self.color,
+                                 width=self.width, points=[image_xy])
 
     def drag(self, image_xy) -> None:
-        if self.drag_from is None:
+        if self._drag_mode == "move":
+            self.move_selected(*_delta(image_xy, self._drag_origin))
+        elif self._drag_mode and self._drag_mode.startswith("resize:"):
+            self.resize_selected(self._drag_mode.split(":", 1)[1], image_xy)
+        elif self.drag_from is None:
             return
-        from capsplus.shot_frame import normalize_rect
-        rect = normalize_rect(self.drag_from[0], self.drag_from[1], image_xy[0], image_xy[1])
-        self.pending = Shape(self.tool, rect, color=self.color, width=self.width)
+        elif self.tool == "pen":
+            if self.pending is not None:
+                self.pending.points.append(image_xy)
+                self.pending.rect = _points_rect(self.pending.points)
+        else:
+            from capsplus.shot_frame import normalize_rect
+            rect = normalize_rect(self.drag_from[0], self.drag_from[1], image_xy[0], image_xy[1])
+            self.pending = Shape(self.tool, rect, color=self.color, width=self.width)
 
     def release(self) -> bool:
-        """松手落地：太小的一笔直接丢掉（手抖点一下不该留一个 1×1 的框）。"""
+        """松手：拖动/缩放落地（记一笔编辑），画的那笔画进栈（太小的丢掉）。"""
         from capsplus.shot_frame import accept_rect
+        mode, self._drag_mode = self._drag_mode, None
         self.drag_from = None
+        if mode in ("move",) or (mode and mode.startswith("resize:")):
+            shape = self._drag_shape
+            if shape is not None and self._drag_before is not None:
+                after = _shape_state(shape)
+                if after != self._drag_before:
+                    self._record_edit(shape, self._drag_before, after)
+            return True
         shape, self.pending = self.pending, None
-        if shape is None or (shape.kind != "text" and not accept_rect(shape.rect)):
+        if shape is None:
             return False
         if shape.kind == "text":
             return False            # 文字等输入框里敲完再落地（见 commit_text）
+        if shape.kind == "pen":
+            if len(shape.points or []) < 2 or not accept_rect(shape.rect):
+                return False
+        elif not accept_rect(shape.rect):
+            return False
+        clip_shape_to_image(shape, self.size)        # **落笔一律裁到截图范围内**
         self.stack.add(shape)
+        self.selected = None
         return True
+
+    # ---- 选中 / 拖动 / 缩放 / 删除（明江要的"看得出可编辑"）----
+    def selected_bounds(self):
+        return shape_bounds(self.selected) if self.selected is not None else None
+
+    def select_at(self, image_xy, tol=SELECT_TOL):
+        """点中某个标注 ⇒ 选中并返回下标；点空白 ⇒ 取消选中返回 -1。"""
+        idx = object_at(self.stack.shapes, image_xy, tol)
+        self.selected = self.stack.shapes[idx] if idx >= 0 else None
+        return idx
+
+    def hover_at(self, image_xy):
+        idx = object_at(self.stack.shapes, image_xy, SELECT_TOL)
+        self.hover = self.stack.shapes[idx] if idx >= 0 else None
+        return idx
+
+    def start_drag(self, image_xy) -> str:
+        """按下时决定这次是什么动作：缩放手柄 > 拖动已有标注 > 画新的。"""
+        if self.selected is not None:
+            handle = handle_at(shape_bounds(self.selected), image_xy)
+            if handle:
+                self._drag_shape, self._drag_before = self.selected, _shape_state(self.selected)
+                self._drag_origin = image_xy
+                return f"resize:{handle}"
+        idx = object_at(self.stack.shapes, image_xy, SELECT_TOL)
+        if idx >= 0 and self.tool != "eraser":        # 橡皮交给 click()（点一下删，不拖）
+            self.selected = self.stack.shapes[idx]
+            self._drag_shape, self._drag_before = self.selected, _shape_state(self.selected)
+            self._drag_origin = image_xy
+            return "move"
+        self._drag_shape, self._drag_before = None, None
+        return "draw"
+
+    def move_selected(self, dx, dy) -> bool:
+        shape = self.selected
+        if shape is None:
+            return False
+        shape.rect = translate_rect(shape.rect, dx, dy)
+        if shape.points:
+            shape.points = [(p[0] + dx, p[1] + dy) for p in shape.points]
+        clip_shape_to_image(shape, self.size)        # 拖也不许拖出截图
+        return True
+
+    def resize_selected(self, handle, image_xy) -> bool:
+        shape = self.selected
+        if shape is None:
+            return False
+        shape.rect = clamp_rect_to_image(resize_rect(shape.rect, handle, image_xy), self.size)
+        return True
+
+    def nudge_selected(self, dx, dy) -> bool:
+        """方向键微调：1px；Shift=10px。**没选中就先提示**（不是默默不动）。"""
+        if self.selected is None:
+            self.message = "先点一下要挪的标注（方向键微调 1px，Shift=10px）"
+            return False
+        before = _shape_state(self.selected)
+        if not self.move_selected(dx, dy):
+            return False
+        self._record_edit(self.selected, before, _shape_state(self.selected))
+        return True
+
+    def delete_selected(self) -> bool:
+        """删掉选中的标注（Del 键 / 橡皮点一下）。删除也进编辑历史 ⇒ 撤销得回来。"""
+        shape = self.selected
+        if shape is None:
+            return False
+        idx = self.stack.index_of(shape)
+        if idx < 0:
+            return False
+        self.stack.trim_redo()
+        self.stack.remove_at(idx)
+        self._record_edit(shape, _shape_state(shape), None, kind="delete", deleted_at=idx)
+        self.selected, self.hover = None, None
+        self.message = "✓ 已删掉那个标注（Ctrl+Z 撤销）"
+        return True
+
+    # ---- 编辑历史（撤销/重做先走它，再走画的那条栈）----
+    def _record_edit(self, shape, before, after, kind="edit", deleted_at=None) -> None:
+        del self.edits[self.edit_index:]
+        self.edits.append({"shape": shape, "before": before, "after": after,
+                           "kind": kind, "deleted_at": deleted_at})
+        self.edit_index = len(self.edits)
+
+    def undo_edit(self) -> bool:
+        if self.edit_index == 0:
+            return False
+        self.edit_index -= 1
+        self._apply_edit(self.edits[self.edit_index], forward=False)
+        return True
+
+    def redo_edit(self) -> bool:
+        if self.edit_index >= len(self.edits):
+            return False
+        self._apply_edit(self.edits[self.edit_index], forward=True)
+        self.edit_index += 1
+        return True
+
+    def _apply_edit(self, edit, forward: bool) -> None:
+        """撤销/重做一笔编辑。
+
+        ⚠ 两种编辑的形状不一样（第一版把"删除"和"改几何"混成一条分支，撤销删除时静默什么都没发生）：
+          * `kind="edit"`（拖动/缩放/微调）：图形一直在栈里，只是几何变了 ⇒ 换回 before/after 的几何；
+          * `kind="delete"`：图形已经从栈里**拿掉**了 ⇒ 撤销要按原下标 `insert_at` 插回去，
+            重做要再 `remove_at`。
+        """
+        shape = edit["shape"]
+        if edit.get("kind") == "delete":
+            if forward:
+                idx = self.stack.index_of(shape)
+                if idx >= 0:
+                    self.stack.remove_at(idx)
+                if self.selected is shape:
+                    self.selected = None
+            elif self.stack.index_of(shape) < 0:
+                self.stack.insert_at(edit.get("deleted_at") or 0, shape)
+            return
+        if self.stack.index_of(shape) < 0:
+            return
+        _apply_shape_state(shape, edit["after"] if forward else edit["before"])
 
     def commit_text(self, image_xy, text: str) -> bool:
         text = (text or "").strip()[:TEXT_LIMIT]
@@ -468,12 +1022,19 @@ class Annotator:
         return True
 
     def click(self, image_xy) -> str:
-        """单击：文字工具要弹输入框、序号工具当场落一个圆标，其余工具什么也不做。"""
+        """单击：文字弹输入框、序号当场落一个圆标、**橡皮删掉点中的标注**，其余什么也不做。"""
         if self.tool == "text":
             return "text-input"
         if self.tool == "badge":
             self.place_badge(image_xy)
             return "badge-placed"
+        if self.tool == "eraser":
+            idx = object_at(self.stack.shapes, image_xy, SELECT_TOL, inside=True)
+            if idx < 0:
+                return "erase-miss"
+            self.selected = self.stack.shapes[idx]
+            self.delete_selected()
+            return "erased"
         return "none"
 
     def set_tool(self, tool: str) -> None:
@@ -491,9 +1052,21 @@ class Annotator:
     def action(self, name: str) -> str:
         """工具栏/快捷键动作（判据直接调它，不需要窗口）。"""
         if name == ACTION_UNDO:
-            self.stack.undo()
+            if not self.undo_edit():          # 先撤销"拖动/缩放/删除"这类编辑
+                self.stack.undo()
         elif name == ACTION_REDO:
-            self.stack.redo()
+            if not self.redo_edit():
+                self.stack.redo()
+        elif name == ACTION_DELETE:
+            return ACTION_DELETE if self.delete_selected() else ACTION_DELETE
+        elif name == ACTION_ENTER:
+            # Snipaste 的手感：回车 = 复制并关（复制成功才关，失败就留着让人看见那句提示）
+            busy = render_to_surface(self.base, self.stack.shapes)
+            ok, msg = self._clip(png_bytes(busy))
+            self.message = msg
+            if ok:
+                self.result = "copy"
+            return ACTION_ENTER
         elif name == ACTION_COPY:
             ok, msg = self._clip(png_bytes(render_to_surface(self.base, self.stack.shapes)))
             self.message = msg
@@ -625,118 +1198,274 @@ class Annotator:
     # ---- GTK ----
     def _build(self):
         Gtk, Gdk, _GLib = _gtk()
+        from capsplus import shot_style
+        from capsplus.shot_icons import render_icon
+        from capsplus.shot_panel import PanelView
+
+        shot_style.install()                        # 设计语言（跟随 GNOME 深浅色）
+        bar_h = TOOL_BTN + shot_style.BAR_PAD * 2 + 6
+        plan = window_plan(self.size, self.screen, bar_h=bar_h)
+        self.plan = plan
+        self.scale = plan["scale"]                  # 给工具条留出那条带之后重新算的缩放
+
         win = Gtk.Window(title=f"capsplus 标注 — {self.size[0]}×{self.size[1]}")
-        win.set_default_size(max(int(self.size[0] * self.scale), 200),
-                             max(int(self.size[1] * self.scale), 150) + 48)
-        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
-        bar = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
-        bar.set_margin_top(4)
-        bar.set_margin_start(4)
-        bar.set_margin_end(4)
-
-        self._buttons = {}
-        first = None
-        for tool in TOOLS:
-            # GTK3 里"一组互斥的开关按钮"就是 RadioButton（`set_join_group` 是 GTK4 的 API，
-            # GTK3 上调它会 `AttributeError` —— xvfb 界面判据当场抓到过）。
-            # `set_mode(False)` 关掉圆点，看起来与普通开关按钮一样。
-            btn = Gtk.RadioButton.new_with_label_from_widget(first, TOOL_LABELS[tool])
-            btn.set_mode(False)
-            if first is None:
-                first = btn
-            btn.set_active(tool == self.tool)
-            btn.connect("toggled", self._on_tool_toggled, tool)
-            bar.pack_start(btn, False, False, 0)
-            self._buttons[tool] = btn
-        bar2 = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
-        bar2.set_margin_start(4)
-        bar2.set_margin_end(4)
-        bar2.set_margin_bottom(4)
-
-        # 颜色与线宽（第二批）：单选，默认第一项 = 第一批的红 3px
-        self._color_buttons = {}
-        color_first = None
-        for name, rgba in COLORS:
-            btn = Gtk.RadioButton.new_with_label_from_widget(color_first, name)
-            btn.set_mode(False)
-            if color_first is None:
-                color_first = btn
-            btn.set_active(rgba == self.color)
-            btn.connect("toggled", self._on_color_toggled, rgba)
-            bar2.pack_start(btn, False, False, 0)
-            self._color_buttons[name] = btn
-        self._width_buttons = {}
-        width_first = None
-        for width in WIDTHS:
-            btn = Gtk.RadioButton.new_with_label_from_widget(width_first, f"{width}px")
-            btn.set_mode(False)
-            if width_first is None:
-                width_first = btn
-            btn.set_active(width == self.width)
-            btn.connect("toggled", self._on_width_toggled, width)
-            bar2.pack_start(btn, False, False, 0)
-            self._width_buttons[width] = btn
-
-        for label, action in (("撤销", ACTION_UNDO), ("重做", ACTION_REDO),
-                              ("OCR", ACTION_OCR), ("翻译", ACTION_TRANSLATE),
-                              ("复制", ACTION_COPY), ("存盘", ACTION_SAVE),
-                              ("钉到屏幕上", ACTION_PIN), ("关闭", ACTION_CLOSE)):
-            btn = Gtk.Button(label=label)
-            btn.connect("clicked", self._on_action, action)
-            bar2.pack_end(btn, False, False, 0)
-        self._action_buttons = {}
-        for child in bar2.get_children():
-            if isinstance(child, Gtk.Button) and not isinstance(child, Gtk.RadioButton):
-                self._action_buttons[child.get_label()] = child
-        box.pack_start(bar, False, False, 0)
-        box.pack_start(bar2, False, False, 0)
+        win.get_style_context().add_class("cp-window")
+        win.set_default_size(*plan["window"])
 
         self.area = Gtk.DrawingArea()
-        self.area.set_size_request(int(self.size[0] * self.scale), int(self.size[1] * self.scale))
+        self.area.set_size_request(*plan["canvas"]["size"])
+        self.area.get_style_context().add_class(shot_style.class_names_for("canvas"))
         self.area.add_events(Gdk.EventMask.BUTTON_PRESS_MASK | Gdk.EventMask.BUTTON_RELEASE_MASK |
                              Gdk.EventMask.POINTER_MOTION_MASK)
         self.area.connect("draw", self._on_draw)
         self.area.connect("button-press-event", self._on_press)
         self.area.connect("motion-notify-event", self._on_motion)
         self.area.connect("button-release-event", self._on_release)
-        box.pack_start(self.area, True, True, 0)
 
-        # 结果面板（识别 / 翻译）：没结果时整块藏着，不占地方也不干扰标注
-        from capsplus.shot_panel import PanelView
+        self._build_bar(Gtk, self._theme_colour(win, Gtk))
+        # 工具条**贴近截图但不遮挡**：默认放在图像下方那条预留带里（几何见 bar_layout）
+        layout = bar_layout(plan["canvas"], (self._bar_width(), bar_h), plan["window"])
+        self._bar.set_halign(Gtk.Align.CENTER)
+        self._bar.set_valign(Gtk.Align.START)
+        self._bar.set_margin_top(int(layout["y"]))
+        self._bar_layout = layout
+
+        overlay = Gtk.Overlay()
+        overlay.add(self.area)
+        overlay.add_overlay(self._bar)
+
+        # 结果抽屉与状态栏是**独立的一层**（明江："不许和工具条挤在同一行"）
         self._panel_view = PanelView(on_copy=lambda _m: self.copy_panel_text(),
                                      on_retranslate=lambda _m: self._on_action(None, ACTION_TRANSLATE),
                                      on_switch=lambda m: self._switch_panel_backend(),
                                      on_toggle_view=lambda: self._toggle_panel_view())
-        box.pack_start(self._panel_view.build(), False, False, 0)
+        drawer = self._panel_view.build()
         # `set_no_show_all` 是 GTK3 里唯一能挡住 `show_all()` 的开关 —— 只 `set_visible(False)`
         # 会被随后的 `win.show_all()` 重新点亮（xvfb 判据抓到过）。
-        self._panel_view.widget.set_no_show_all(True)
-        self._panel_view.widget.set_visible(False)
+        drawer.set_no_show_all(True)
+        drawer.set_visible(False)
 
-        # 底部按键提示条：**失焦时换成可读提示**（不能让人以为"按了没反应"）
-        self._hint = Gtk.Label(xalign=0)
-        self._hint.set_line_wrap(True)
-        self._hint.set_margin_start(6)
-        self._hint.set_margin_end(6)
-        self._hint.set_margin_bottom(4)
-        box.pack_start(self._hint, False, False, 0)
-        self.refresh_hint()
+        # 状态栏**分两档**（lead："太密、信息层次没出来"）：主行给常用键，次要行收其余的键
+        self._status = Gtk.Label(xalign=0)
+        self._status.set_line_wrap(True)
+        self._status.get_style_context().add_class("cp-status-main")
+        self._status_more = Gtk.Label(xalign=0)
+        self._status_more.set_line_wrap(True)
+        self._status_more.get_style_context().add_class("cp-status-more")
+        status_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+        status_box.pack_start(self._status, False, False, 0)
+        status_box.pack_start(self._status_more, False, False, 0)
+
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+        box.pack_start(overlay, True, True, 0)
+        box.pack_start(drawer, False, False, 0)
+        box.pack_start(status_box, False, False, 0)
 
         win.add(box)
         win.connect("key-press-event", self._on_key)
         win.connect("focus-in-event", self._on_focus, True)
         win.connect("focus-out-event", self._on_focus, False)
         win.connect("destroy", lambda *_a: self._quit_if_needed())
+        self._build_menu(Gtk)
+        self._sync_bar_state()
+        self.refresh_status()
         return win
+
+    # ---- 工具条：一条、居中、图标 + 分组 + 高亮 ----
+    def _theme_colour(self, win, Gtk, selected: bool = False):
+        """主题前景色（图标用它画 ⇒ 深浅色主题都看得清）。统一走 `shot_style.theme_colour`。"""
+        from capsplus import shot_style
+        return shot_style.theme_colour(win, selected=selected)
+
+    def _bar_width(self) -> int:
+        try:
+            return int(self._bar.get_preferred_width()[1])
+        except Exception:
+            return 720
+
+    def _icon_button(self, Gtk, icon, tip, callback, kind="action"):
+        from capsplus import shot_style
+        from capsplus.shot_icons import render_icon
+        btn = Gtk.Button()
+        btn.set_relief(Gtk.ReliefStyle.NONE)
+        btn.set_tooltip_text(tip)
+        # 图标颜色按**这个按钮自己的底色**挑（浅底深图标/深底浅图标）—— 主按钮底色是选中色，
+        # 赌主题变量会得到"白图标 + 白底 = 空方块"（窗口图抓到过）。
+        # 主按钮上的图标画粗一档：底色是"选中色"，细线在浅底上容易被看成一个空方块
+        line = 2.4 if kind == "primary" else 1.8
+        surface = render_icon(icon, TOOL_BTN - 8, shot_style.readable_colour(btn, self._icon_rgba),
+                              line=line)
+        if surface is not None:
+            btn.set_image(Gtk.Image.new_from_surface(surface))
+        else:                                   # 图标画不出来也别空着（判据会红）
+            btn.set_label(tip[:2])
+        for cls in shot_style.class_names_for(kind).split():
+            btn.get_style_context().add_class(cls)
+        btn.connect("clicked", callback)
+        return btn
+
+    def _build_bar(self, Gtk, fg):
+        from capsplus import shot_style
+        from capsplus.shot_icons import TIPS, swatch_surface, width_dot_surface
+        self._icon_rgba = fg
+        bar = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=2)
+        for cls in shot_style.class_names_for("bar").split():
+            bar.get_style_context().add_class(cls)
+        self._buttons, self._swatches, self._widths, self._actions = {}, {}, {}, {}
+
+        def add_sep():
+            sep = Gtk.Separator(orientation=Gtk.Orientation.VERTICAL)
+            sep.get_style_context().add_class(shot_style.class_names_for("sep"))
+            bar.pack_start(sep, False, False, 0)
+
+        # ── 编辑类：撤销 / 重做（**最左**）──
+        for action, icon in ((ACTION_UNDO, "undo"), (ACTION_REDO, "redo")):
+            btn = self._icon_button(Gtk, icon, TIPS[icon], lambda _b, a=action: self._on_action(None, a))
+            bar.pack_start(btn, False, False, 0)
+            self._actions[action] = btn
+        add_sep()
+
+        # ── 绘制类 / 标记类 / 编辑类：按组排，组间细分隔线 ──
+        first = None
+        for group in TOOL_GROUPS:
+            for tool in group:
+                btn = Gtk.RadioButton.new_from_widget(first)
+                btn.set_mode(False)
+                if first is None:
+                    first = btn
+                btn.set_relief(Gtk.ReliefStyle.NONE)
+                btn.set_tooltip_text(TIPS.get(tool, tool))
+                surface = None
+                try:
+                    from capsplus.shot_icons import render_icon
+                    surface = render_icon(tool, TOOL_BTN - 8, shot_style.readable_colour(btn, fg))
+                except Exception:
+                    surface = None
+                if surface is not None:
+                    btn.set_image(Gtk.Image.new_from_surface(surface))
+                else:
+                    btn.set_label(TOOL_LABELS.get(tool, tool))
+                for cls in shot_style.class_names_for("tool").split():
+                    btn.get_style_context().add_class(cls)
+                btn.set_active(tool == self.tool)
+                btn.connect("toggled", self._on_tool_toggled, tool)
+                bar.pack_start(btn, False, False, 0)
+                self._buttons[tool] = btn
+            add_sep()
+
+        # ── 颜色：色块圆点（选中加描边）──
+        color_first = None
+        for name, rgba in COLORS:
+            btn = Gtk.RadioButton.new_from_widget(color_first)
+            btn.set_mode(False)
+            if color_first is None:
+                color_first = btn
+            btn.set_relief(Gtk.ReliefStyle.NONE)
+            btn.set_tooltip_text(f"颜色：{name}")
+            surface = swatch_surface(rgba, SWATCH - 8)
+            if surface is not None:
+                btn.set_image(Gtk.Image.new_from_surface(surface))
+            else:
+                btn.set_label(name)
+            for cls in shot_style.class_names_for("swatch").split():
+                btn.get_style_context().add_class(cls)
+            btn.set_active(rgba == self.color)
+            btn.connect("toggled", self._on_color_toggled, rgba)
+            bar.pack_start(btn, False, False, 0)
+            self._swatches[name] = btn
+        add_sep()
+
+        # ── 线宽：粗细圆点（不写"2px"）──
+        width_first = None
+        for width in WIDTHS:
+            btn = Gtk.RadioButton.new_from_widget(width_first)
+            btn.set_mode(False)
+            if width_first is None:
+                width_first = btn
+            btn.set_relief(Gtk.ReliefStyle.NONE)
+            btn.set_tooltip_text(f"线宽 {width}px")
+            surface = width_dot_surface(width, WIDTH_DOT - 8, shot_style.readable_colour(btn, fg))
+            if surface is not None:
+                btn.set_image(Gtk.Image.new_from_surface(surface))
+            else:
+                btn.set_label(str(width))
+            for cls in shot_style.class_names_for("dot").split():
+                btn.get_style_context().add_class(cls)
+            btn.set_active(width == self.width)
+            btn.connect("toggled", self._on_width_toggled, width)
+            bar.pack_start(btn, False, False, 0)
+            self._widths[width] = btn
+        add_sep()
+
+        # ── 动作类（**最右**）：复制是主按钮，关闭在最后 ──
+        kinds = {ACTION_COPY: "primary"}
+        for action, icon in ((ACTION_COPY, "copy"), (ACTION_SAVE, "save"),
+                             (ACTION_PIN, "pin"), (ACTION_CLOSE, "close")):
+            btn = self._icon_button(Gtk, icon, TIPS[icon],
+                                    lambda _b, a=action: self._on_action(None, a),
+                                    kind=kinds.get(action, "action"))
+            bar.pack_start(btn, False, False, 0)
+            self._actions[action] = btn
+        self._bar = bar
+        bar.show_all()
+        return bar
+
+    def _sync_bar_state(self) -> None:
+        """把"当前工具/颜色/线宽"的高亮同步到控件上（CSS 类，不是改颜色）。"""
+        for tool, btn in getattr(self, "_buttons", {}).items():
+            self._set_active_class(btn, "tool", tool == self.tool)
+        for (name, rgba), btn in zip(COLORS, getattr(self, "_swatches", {}).values()):
+            self._set_active_class(btn, "swatch", rgba == self.color)
+        for width, btn in getattr(self, "_widths", {}).items():
+            self._set_active_class(btn, "dot", width == self.width)
+
+    @staticmethod
+    def _set_active_class(btn, kind: str, active: bool) -> None:
+        """把"选中态"的 CSS 类加上或摘掉（基础类始终保持）。
+
+        第一版把"加/摘"写在一个条件里，结果旧工具的 `cp-btn-active` 摘不掉（真窗口判据当场红）。
+        """
+        from capsplus import shot_style
+        ctx = btn.get_style_context()
+        base = set(shot_style.class_names_for(kind).split())
+        active_cls = set(shot_style.class_names_for(kind, active=True).split()) - base
+        for cls in base:
+            if not ctx.has_class(cls):
+                ctx.add_class(cls)
+        for cls in active_cls:
+            if active and not ctx.has_class(cls):
+                ctx.add_class(cls)
+            elif not active and ctx.has_class(cls):
+                ctx.remove_class(cls)
+
+    def _build_menu(self, Gtk) -> None:
+        """右键快捷菜单（Snipaste 的手感：复制 / 存盘 / 贴图 / 关闭）。"""
+        menu = Gtk.Menu()
+        for label, action in context_menu_items():
+            item = Gtk.MenuItem(label=label)
+            item.connect("activate", lambda _w, a=action: self._on_action(None, a))
+            menu.append(item)
+        menu.show_all()
+        self._menu = menu
+
+    def refresh_status(self) -> None:
+        """状态栏：字号够大、对比度够，快捷键提示放这里（不再是微缩灰字）。"""
+        if getattr(self, "_status", None) is None:
+            return
+        from capsplus import shot_style
+        selected = shape_label(self.selected) if self.selected is not None else ""
+        self._status.set_text(shot_style.status_text(self.focused, selected, self.message))
+        if getattr(self, "_status_more", None) is not None:
+            self._status_more.set_text(shot_style.status_more(self.focused))
 
     # ---- 提示条 / 面板刷新（只在有窗口时才碰 gi）----
     def refresh_hint(self) -> None:
-        if getattr(self, "_hint", None) is not None:
-            self._hint.set_text(hint_text(self.focused))
+        """状态栏（**兼容旧名字**：第一批的判据调的是它）。"""
+        self.refresh_status()
 
     def _on_focus(self, _win, _event, focused: bool):
         self.focused = bool(focused)
-        self.refresh_hint()
+        self.refresh_status()
         return False
 
     def _refresh_panel(self) -> None:
@@ -776,19 +1505,37 @@ class Annotator:
     def _on_color_toggled(self, btn, rgba):
         if btn.get_active():
             self.set_color(rgba)
+            self._sync_bar_state()
 
     def _on_width_toggled(self, btn, width):
         if btn.get_active():
             self.set_width(width)
+            self._sync_bar_state()
+
+    def _on_tool_toggled(self, btn, tool):
+        if btn.get_active():
+            self.set_tool(tool)
+            self._sync_bar_state()
+            if getattr(self, "area", None) is not None:
+                self.area.queue_draw()
 
     def _image_xy(self, event):
-        return to_image_coords((event.x, event.y), self.scale)
+        canvas = (getattr(self, "plan", None) or {}).get("canvas") or canvas_layout(
+            self.size, self.scale)
+        ix, iy, _iw, _ih = canvas["image"]
+        # 夹进截图矩形：留白区按下去 = 按在边界上（**留白区不许落笔**）
+        return clamp_to_image(to_image_coords((event.x - ix, event.y - iy), self.scale), self.size)
 
     def _on_draw(self, _widget, cr):
-        cr.scale(self.scale, self.scale)
-        render(cr, self.base, self.shapes_to_draw())
+        canvas = (getattr(self, "plan", None) or {}).get("canvas") or canvas_layout(
+            self.size, self.scale)
+        draw_canvas(cr, canvas, self.base, self.shapes_to_draw(),
+                    selected=self.selected, hover=self.hover)
 
     def _on_press(self, _widget, event):
+        if event.button == 3:                       # 右键：快捷菜单（复制/存盘/贴图/关闭）
+            self._popup_menu(event)
+            return True
         if event.button != 1:
             return False
         xy = self._image_xy(event)
@@ -796,21 +1543,39 @@ class Annotator:
         if what == "text-input":
             self._open_text_entry(xy)
             return True
-        if what == "badge-placed":
-            self.area.queue_draw()          # 序号是点一下就走，不用拖
+        if what in ("badge-placed", "erased", "erase-miss"):
+            self.selected = None if what == "erased" else self.selected
+            self.refresh_status()
+            self.area.queue_draw()          # 序号/橡皮是点一下就走，不用拖
             return True
-        self.press(xy)
+        self.press(xy)                      # 里面会决定"拖动/缩放已有标注"还是"画新的"
+        self.refresh_status()
+        self.area.queue_draw()
         return True
 
     def _on_motion(self, _widget, event):
-        self.drag(self._image_xy(event))
+        xy = self._image_xy(event)
+        if self._drag_mode:
+            self.drag(xy)
+        else:                               # 没在拖：更新 hover（"这东西能拖"的反馈）
+            self.hover_at(xy)
         self.area.queue_draw()
         return True
 
     def _on_release(self, _widget, _event):
-        if self.release():
-            self.area.queue_draw()
+        self.release()
+        self.refresh_status()
+        self.area.queue_draw()
         return True
+
+    def _popup_menu(self, event) -> None:
+        menu = getattr(self, "_menu", None)
+        if menu is None:
+            return
+        try:
+            menu.popup_at_pointer(event)
+        except Exception:
+            menu.popup(None, None, None, None, event.button, getattr(event, "time", 0))
 
     def _open_text_entry(self, image_xy):
         Gtk, _Gdk, _GLib = _gtk()
@@ -825,13 +1590,10 @@ class Annotator:
         pop.show_all()
         pop.popup()
 
-    def _on_tool_toggled(self, btn, tool):
-        if btn.get_active():
-            self.set_tool(tool)
-
     def _on_action(self, _btn, action):
         self.action(action)
         self._refresh_panel()
+        self.refresh_status()
         if self.result in ("save", "close", "pin"):
             self._quit()
         else:
@@ -846,9 +1608,18 @@ class Annotator:
         action = key_command(name, ctrl=ctrl, shift=shift)
         if action is None:
             return False                    # 没接手的键让 GTK 照常处理（别吞掉）
-        self.action(action)
+        if action == ACTION_NUDGE:
+            dx, dy = nudge_delta(name, shift)      # 方向键微调选中的标注（1px；Shift=10px）
+            self.nudge_selected(dx, dy)
+        elif action == ACTION_DELETE:
+            self.delete_selected()
+        else:
+            self.action(action)
         self._refresh_panel()
-        if self.result in ("save", "close", "pin"):
+        self.refresh_status()
+        if self.result in ("save", "close", "pin", "copy") and action in (ACTION_ENTER, ACTION_COPY):
+            self._quit()                    # 回车=复制并关（Ctrl+C 仍然只复制、不关）
+        elif self.result in ("save", "close", "pin"):
             self._quit()
         else:
             self.area.queue_draw()

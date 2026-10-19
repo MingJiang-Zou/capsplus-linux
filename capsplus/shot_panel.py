@@ -162,47 +162,91 @@ class PanelView:
         self.on_toggle_view = on_toggle_view
         self.model = PanelModel()
         self.widget = None
+        self.collapsed = False
 
     def build(self):
+        """结果抽屉：**标题行（后端 + 耗时）+ 右上角复制 + 可折叠**，与工具条分层（不挤一行）。"""
         Gtk, _Gdk, _GLib = _gtk()
-        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
-        box.set_margin_top(4)
-        box.set_margin_start(6)
-        box.set_margin_end(6)
-        box.set_margin_bottom(4)
-        self._headline = Gtk.Label(xalign=0)
-        box.pack_start(self._headline, False, False, 0)
+        from capsplus.shot_icons import render_icon
+        from capsplus import shot_style
+
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=3)
+        for cls in shot_style.class_names_for("drawer").split():
+            box.get_style_context().add_class(cls)
+        box.set_margin_top(3)
+        box.set_margin_start(4)
+        box.set_margin_end(4)
+        box.set_margin_bottom(3)
+
+        header = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        self._headline = Gtk.Label(xalign=0)                    # 标题行：后端 + 耗时
+        self._headline.get_style_context().add_class("cp-drawer-title")
+        header.pack_start(self._headline, True, True, 0)
+        self._copy = Gtk.Button()                               # 右上角：复制（主按钮）
+        self._copy.set_tooltip_text("复制（Ctrl+C）")
+        # 图标颜色取**主题的选中态前景色**（写死白色在浅色主题下就是一块空方块 —— 判据/窗口图抓到过）
+        self._copy.set_image(Gtk.Image.new_from_surface(
+            render_icon("copy", 16, shot_style.readable_colour(self._copy))))
+        for cls in shot_style.class_names_for("primary").split():
+            self._copy.get_style_context().add_class(cls)
+        self._copy.connect("clicked", lambda *_a: self.on_copy and self.on_copy(self.model))
+        header.pack_end(self._copy, False, False, 0)
+        self._collapse = Gtk.Button(label="▾")                  # 折叠（标题行上，不占地方）
+        self._collapse.set_tooltip_text("收起 / 展开结果")
+        for cls in shot_style.class_names_for("action").split():
+            self._collapse.get_style_context().add_class(cls)
+        self._collapse.connect("clicked", lambda *_a: self.set_collapsed(not self.collapsed))
+        header.pack_end(self._collapse, False, False, 0)
+        box.pack_start(header, False, False, 0)
 
         # 正文用可选中、可滚动的 TextView：**不是为了好看**，是为了让人能手动框选复制
-        scroller = Gtk.ScrolledWindow()
-        scroller.set_min_content_height(120)
+        self._scroller = Gtk.ScrolledWindow()
+        # **高度跟着内容走**（lead：两行文字却留一大片空白，看着像坏了）：
+        # 最小给两行的高度、自然高度跟随内容、超过上限就滚动。
+        self._scroller.set_min_content_height(48)
+        try:
+            self._scroller.set_max_content_height(200)
+            self._scroller.set_propagate_natural_height(True)
+        except Exception:                     # 老 GTK 没有这两个 API 就算了（不抛）
+            pass
         self._text = Gtk.TextView()
         self._text.set_editable(False)
         self._text.set_cursor_visible(False)
         self._text.set_wrap_mode(Gtk.WrapMode.WORD_CHAR)
-        scroller.add(self._text)
-        box.pack_start(scroller, True, True, 0)
+        self._text.get_style_context().add_class("cp-drawer-text")
+        self._scroller.add(self._text)
+        box.pack_start(self._scroller, True, True, 0)
 
-        self._message = Gtk.Label(xalign=0)
+        self._footer = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        self._message = Gtk.Label(xalign=0)                     # 出错/说明：可操作的那句
         self._message.set_line_wrap(True)
-        box.pack_start(self._message, False, False, 0)
-
-        bar = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
-        self._copy = Gtk.Button(label=COPY_LABEL)
-        self._copy.connect("clicked", lambda *_a: self.on_copy and self.on_copy(self.model))
+        self._footer.pack_start(self._message, True, True, 0)
+        self._toggle = Gtk.Button()                             # 原文/译文可切
+        self._toggle.connect("clicked", lambda *_a: self.on_toggle_view and self.on_toggle_view())
         self._retranslate = Gtk.Button(label=RETRANSLATE_LABEL)
         self._retranslate.connect("clicked",
                                   lambda *_a: self.on_retranslate and self.on_retranslate(self.model))
         self._switch = Gtk.Button()
         self._switch.connect("clicked", lambda *_a: self.on_switch and self.on_switch(self.model))
-        self._toggle = Gtk.Button()
-        self._toggle.connect("clicked", lambda *_a: self.on_toggle_view and self.on_toggle_view())
-        for btn in (self._copy, self._retranslate, self._switch, self._toggle):
-            bar.pack_start(btn, False, False, 0)
-        box.pack_start(bar, False, False, 0)
+        for btn in (self._toggle, self._retranslate, self._switch):
+            self._footer.pack_end(btn, False, False, 0)
+        box.pack_start(self._footer, False, False, 0)
         self.widget = box
         self.update(self.model)
         return box
+
+    def set_collapsed(self, collapsed: bool) -> bool:
+        """折叠：只留标题行（标题行永远在 —— 后端与耗时必须随时看得见）。"""
+        self.collapsed = bool(collapsed)
+        if self.widget is None:
+            return self.collapsed
+        for part in ("_scroller", "_footer"):
+            widget = getattr(self, part, None)
+            if widget is not None:
+                widget.set_visible(not self.collapsed)
+        if getattr(self, "_collapse", None) is not None:
+            self._collapse.set_label("▸" if self.collapsed else "▾")
+        return self.collapsed
 
     def set_text(self, text: str) -> None:
         _Gtk, _Gdk, _GLib = _gtk()
