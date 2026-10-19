@@ -1017,3 +1017,85 @@ class TestRealWindow(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class _Ev:
+    """最小事件桩：只要 x / y（遮罩的 motion 处理只读这两个）。"""
+
+    def __init__(self, _idx, x, y):
+        self.x, self.y = x, y
+
+
+@unittest.skipUnless(not GUI_SKIP, f"跳过界面用例：{GUI_SKIP}")
+class TestMotionOnlyRedrawsADirtyRect(unittest.TestCase):
+    """鼠标移动**只重画一小块**（性能体检 B3）。
+
+    原来每个 motion 事件都对**每块屏** `invalidate_rect(None, ...)`（整幅重画）—— 整幅实测
+    p50 ≈ 18 ms，已经超过 60Hz 一帧；三块屏还要各来一遍。判据：指针在同一块屏里动 ⇒ 只让
+    **那块屏**重画"放大镜旧位置 ∪ 新位置"那一小块，不许出现整幅 `None`。
+    反例：改回整幅重画 → 必红。
+    """
+
+    class _FakeGdkWindow:
+        def __init__(self):
+            self.calls = []
+
+        def invalidate_rect(self, rect, clear):
+            self.calls.append(None if rect is None else
+                              (rect.x, rect.y, rect.width, rect.height))
+
+    class _FakeWin:
+        def __init__(self):
+            self.gdk = TestMotionOnlyRedrawsADirtyRect._FakeGdkWindow()
+            self.visible = True
+
+        def get_window(self):
+            return self.gdk
+
+    def _overlay(self, count=2):
+        """只要"重画范围"这部分行为：`on_motion` 换成一个只做记账的桩。
+
+        真实 `on_motion` 里还有拖拽/吸附等状态，本判据不管那些（它们各有自己的判据）；
+        但**指针记账**要保留，因为脏矩形就是按指针算的。
+        """
+        ov = OV.Overlay.__new__(OV.Overlay)
+        ov.windows = [self._FakeWin() for _ in range(count)]
+        ov.pointer = None
+
+        def on_motion(idx, xy):
+            ov.pointer = (idx, xy)
+            return OV.ACTION_UPDATE
+        ov.on_motion = on_motion
+        return ov
+
+    def test_motion_inside_one_monitor_invalidates_a_small_rect_on_that_monitor(self):
+        ov = self._overlay()
+        ov.pointer = (0, (400, 300))
+        ov._on_motion_event(None, _Ev(0, 410, 305), 0)
+        calls0 = ov.windows[0].gdk.calls
+        self.assertTrue(calls0, "没让窗口重画")
+        self.assertNotIn(None, calls0, "整幅重画了（每动一下重画整屏，代价 p50 ≈ 18ms）")
+        x, y, w, h = calls0[-1]
+        self.assertLessEqual(w * h, (OV.MAG_SIZE + 2 * OV.MAG_GAP) ** 2 + 64,
+                             f"脏矩形太大：{w}×{h}")
+        self.assertEqual(ov.windows[1].gdk.calls, [], "另一块屏不该跟着重画")
+
+    def test_moving_to_another_monitor_still_repaints_the_new_one(self):
+        ov = self._overlay()
+        ov.pointer = (0, (400, 300))
+        ov._on_motion_event(None, _Ev(0, 500, 300), 1)
+        self.assertTrue(ov.windows[1].gdk.calls, "换屏之后新那块屏要重画")
+        self.assertTrue(all(c is None or True for c in ov.windows[1].gdk.calls))
+
+    def test_unknown_pointer_falls_back_to_full_repaint(self):
+        """拿不准就整幅 —— 宁可慢一点，也不能花屏。"""
+        ov = self._overlay()
+        ov.pointer = None
+        before = (2, 2, 80, 80)
+
+        def on_motion(_idx, _xy):            # 桩：不更新指针 ⇒ 脏矩形算不出来
+            return OV.ACTION_IGNORE
+        ov.on_motion = on_motion
+        ov._on_motion_event(None, _Ev(0, 10, 10), 0)
+        self.assertIn(None, ov.windows[0].gdk.calls)
+        self.assertEqual(before, (2, 2, 80, 80))

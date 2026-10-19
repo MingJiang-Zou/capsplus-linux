@@ -16,6 +16,8 @@
 
 import json
 import os
+import tempfile
+import shutil
 import pathlib
 import sys
 import unittest
@@ -77,7 +79,10 @@ class TestCloudConfig(unittest.TestCase):
         self.assertEqual(cfg["model"], T.DEFAULT_CLOUD_MODEL)
 
     def test_missing_file_is_empty_not_an_exception(self):
-        cfg = T.cloud_config("/tmp/definitely-missing.json")
+        # 三级来源都要喂**不存在的路径**，否则会读到真凭据（判据不许碰他真实的
+        # `~/.dsh/.credentials.yaml` —— 用了注入路径才测得出"读不到就空"）。
+        cfg = T.cloud_config("/tmp/definitely-missing.json",
+                             credentials_path="/tmp/definitely-missing.yaml")
         self.assertEqual((cfg["api_key"], cfg["base_url"]), ("", ""))
 
     def test_local_model_default(self):
@@ -303,6 +308,185 @@ class TestTranslateEntrypoint(unittest.TestCase):
                              post=lambda *a, **k: reply("译"))
         self.assertTrue(result["ok"])
         self.assertIn(T.DEFAULT_LOCAL_MODEL, result["note"])
+
+
+if __name__ == "__main__":
+    unittest.main()
+
+
+class TestDefaultBackendIsLocal(unittest.TestCase):
+    """默认档必须是 `local`（2026-10-19 明江的口径："翻译最好用免费的"）。
+
+    为什么这条要有判据：`auto` 的含义是"本机没起就静默切云"，而云那条是**按 token 计费**的
+    LLM API（且那把 key 已 401）—— 默认档一旦回到 auto，用户就会在不知情的情况下花额度/报错。
+    """
+
+    def setUp(self):
+        self._saved = {k: os.environ.get(k) for k in
+                       (T.MODE_ENV, "CAPSPLUS_CLOUD_KEY", "CAPSPLUS_CLOUD_BASE_URL")}
+        self.addCleanup(self._restore)
+        for k in self._saved:
+            os.environ.pop(k, None)
+
+    def _restore(self):
+        for k, v in self._saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+    def test_default_mode_is_local(self):
+        self.assertEqual(T.mode(), "local", "默认档不是 local 了 —— 又会被静默切到计费云")
+        self.assertEqual(T.DEFAULT_MODE, "local")
+
+    def test_explicit_auto_and_cloud_still_available(self):
+        os.environ[T.MODE_ENV] = "auto"
+        self.assertEqual(T.mode(), "auto")
+        os.environ[T.MODE_ENV] = "cloud"
+        self.assertEqual(T.mode(), "cloud")
+
+    def test_broken_cloud_key_does_not_break_the_default(self):
+        """默认档下：**云 key 失效（401 那种）也照样走本机且成功**。"""
+        os.environ["CAPSPLUS_CLOUD_KEY"] = "fake-dead-key"
+        os.environ["CAPSPLUS_CLOUD_BASE_URL"] = "https://example.invalid/v1"
+        backend, why = T.resolve_backend(local_probe=lambda: True)
+        self.assertEqual(backend, "local", f"默认档被云影响了：{why}")
+        self.assertIn("本机", why)
+
+    def test_no_cloud_credential_is_needed_by_default(self):
+        """默认档**不读云凭据**也不该因为没凭据而失败。"""
+        cloud = T.cloud_config(config_path="/nonexistent/x.json",
+                               credentials_path="/nonexistent/creds.yaml")
+        self.assertEqual(cloud["api_key"], "")
+        backend, _why = T.resolve_backend(local_probe=lambda: True, cloud=cloud)
+        self.assertEqual(backend, "local")
+
+    def test_local_down_text_talks_about_starting_the_local_model(self):
+        """本机没起时的文案：说"怎么起本机模型"，**不是**"自动切云"。"""
+        _backend, why = T.resolve_backend(local_probe=lambda: False)
+        self.assertIn("本机模型没起", why)
+        self.assertIn("curl", why, "要给出判活命令")
+        self.assertNotIn("自动切", why)
+        self.assertNotIn("切到云", why.replace("想用云端就按面板上的『切到云』", ""),
+                         "默认档不该把『切云』当解决办法推给用户")
+
+    def test_cloud_mode_still_says_which_credential_source(self):
+        os.environ[T.MODE_ENV] = "cloud"
+        _backend, why = T.resolve_backend(
+            local_probe=lambda: False,
+            cloud={"base_url": "https://x.invalid/v1", "api_key": "", "model": "m",
+                   "config_file": "/tmp/none.json", "source": ""})
+        self.assertIn("云", why)
+
+
+if __name__ == "__main__":
+    unittest.main()
+
+
+class TestCredentialSources(unittest.TestCase):
+    """凭据来源**三级**：`CAPSPLUS_CLOUD_KEY` → `~/.bailian/config.json` → `~/.dsh/.credentials.yaml`。
+
+    纪律（都进判据）：只读、**绝不打印**、绝不改写任何一个凭据文件；判据一律用**注入的 fixture 路径**
+    （不碰明江真实的 `~/.dsh/.credentials.yaml`）；报错文案要可操作。
+    """
+
+    FAKE = "sk-FAKE-TEST-TOKEN-0123456789-DO-NOT-LEAK"
+
+    def setUp(self):
+        self.dir = pathlib.Path(tempfile.mkdtemp(prefix="capsplus-cred-"))
+        self.addCleanup(lambda: shutil.rmtree(self.dir, ignore_errors=True))
+        self.json_path = self.dir / "config.json"
+        self.cred_path = self.dir / "credentials.yaml"
+        self.json_path.write_text(json.dumps(
+            {"active_config": "token-plan",
+             "token-plan": {"base_url": "https://json.example.com", "api_key": "KEY-FROM-JSON"}}),
+            encoding="utf-8")
+        self.cred_path.write_text(
+            "version: 1\nrefs:\n  AL_TOKEN_PLAN_API_KEY: %s\n  OTHER_REF: nope\n"
+            % self.FAKE, encoding="utf-8")
+        self._saved = os.environ.get("CAPSPLUS_CLOUD_KEY")
+        self.addCleanup(self._restore)
+        os.environ.pop("CAPSPLUS_CLOUD_KEY", None)
+
+    def _restore(self):
+        if self._saved is None:
+            os.environ.pop("CAPSPLUS_CLOUD_KEY", None)
+        else:
+            os.environ["CAPSPLUS_CLOUD_KEY"] = self._saved
+
+    def test_env_beats_json_beats_yaml(self):
+        os.environ["CAPSPLUS_CLOUD_KEY"] = "KEY-FROM-ENV"
+        cfg = T.cloud_config(str(self.json_path), credentials_path=str(self.cred_path))
+        self.assertEqual(cfg["api_key"], "KEY-FROM-ENV")
+        self.assertIn("环境变量", cfg["source"])
+
+        os.environ.pop("CAPSPLUS_CLOUD_KEY", None)
+        cfg = T.cloud_config(str(self.json_path), credentials_path=str(self.cred_path))
+        self.assertEqual(cfg["api_key"], "KEY-FROM-JSON")
+        self.assertIn("bailian", cfg["source"])
+
+    def test_falls_back_to_the_dsh_credentials_file(self):
+        empty = self.dir / "empty.json"
+        empty.write_text("{}", encoding="utf-8")
+        cfg = T.cloud_config(str(empty), credentials_path=str(self.cred_path))
+        self.assertEqual(cfg["api_key"], self.FAKE)
+        self.assertIn("credentials.yaml", cfg["source"])
+        self.assertNotIn(self.FAKE, cfg["source"], "source 只能是标签，不能带值")
+
+    def test_only_the_named_ref_is_read(self):
+        self.assertEqual(T.read_dsh_credential(str(self.cred_path), ref="OTHER_REF"), "nope")
+        self.assertEqual(T.read_dsh_credential(str(self.cred_path), ref="NOPE"), "")
+
+    def test_missing_or_broken_file_is_empty(self):
+        broken = self.dir / "broken.yaml"
+        broken.write_text("这不是 yaml\n\t乱缩进:", encoding="utf-8")
+        self.assertEqual(T.read_dsh_credential(str(broken)), "")
+        self.assertEqual(T.read_dsh_credential(str(self.dir / "nope.yaml")), "")
+
+    def test_credential_value_never_leaks_into_any_message(self):
+        """**假凭据 fixture**：任何产出的文字里都不许出现它的值（含片段）。"""
+        os.environ["CAPSPLUS_CLOUD_KEY"] = self.FAKE
+        messages = []
+        messages.append(T.describe())
+        messages.append(T.cloud_config(str(self.json_path),
+                                       credentials_path=str(self.cred_path))["source"])
+        messages.append(str(T.resolve_backend(local_probe=lambda: False)))
+        messages.append(str(T.resolve_backend(local_probe=lambda: True)))
+        os.environ[T.MODE_ENV] = "cloud"
+        self.addCleanup(lambda: os.environ.pop(T.MODE_ENV, None))
+        messages.append(str(T.resolve_backend(local_probe=lambda: False)))
+        # 真发一次云请求（端点故意不可达）——失败文案也必须不含凭据值
+        leaked = T.translate_cloud("你好", cloud=T.cloud_config(
+            str(self.json_path), credentials_path=str(self.cred_path)))
+        messages.append(str(leaked))
+        messages.append(str(T.translate_image(str(self.json_path), cloud=T.cloud_config(
+            str(self.json_path), credentials_path=str(self.cred_path)))))
+        blob = "\n".join(messages)
+        self.assertNotIn(self.FAKE, blob, "凭据值漏到文案里了")
+        for piece in (self.FAKE[:12], self.FAKE[-12:]):
+            self.assertNotIn(piece, blob, f"凭据片段漏了：{piece}")
+        self.assertNotIn("KEY-FROM-JSON", blob)
+
+    def test_401_text_is_actionable(self):
+        """401 要明确说"凭据失效 → 按 F2 切本地，或换一把 key"。"""
+        cfg = {"base_url": "https://cloud.example.com/v1", "api_key": "k" * 20,
+               "model": "m", "config_file": "/tmp/x.json", "source": "s"}
+        ok, hint = T.cloud_hint_for_error(401, "Unauthorized", cfg)
+        self.assertFalse(ok)
+        self.assertIn("失效", hint)
+        self.assertIn("本地", hint)
+        self.assertIn("key", hint.lower())
+        self.assertNotIn("k" * 20, hint)
+
+    def test_cloud_config_is_read_only(self):
+        """静态：凭据相关的代码**没有写操作**（只读是硬纪律）。"""
+        src = (REPO / "capsplus" / "shot_translate.py").read_text(encoding="utf-8")
+        for fn in ("def read_dsh_credential", "def cloud_config"):
+            body = src[src.index(fn):]
+            body = body[:body.index("\ndef ", 1)]
+            for write_call in ("write_text", "open(", '"w"', "'w'", "mkdir", "unlink", "rename"):
+                self.assertNotIn(write_call, body,
+                                 f"{fn} 里出现了写操作 {write_call} —— 凭据文件只许读")
 
 
 if __name__ == "__main__":

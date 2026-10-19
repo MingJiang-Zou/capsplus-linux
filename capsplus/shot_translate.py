@@ -47,15 +47,31 @@ TIMEOUT_S = 60
 
 SYSTEM_PROMPT = ("你是翻译引擎。把用户给的文字翻译成目标语言，只输出译文本身，"
                  "不要解释、不要加引号、不要重复原文。")
+try:                                            # 云那条链路用 requests（有就认它的异常）
+    from requests.exceptions import HTTPError as HTTPStatusError
+except Exception:                               # pragma: no cover - 没装 requests 也能跑
+    class HTTPStatusError(Exception):
+        pass
+
+
 IMAGE_PROMPT = ("识别这张截图里的全部文字，然后把它翻译成目标语言。"
                 "输出格式：先一行「原文：」+识别到的原文，再一行「译文：」+译文。")
 
 
 # ------------------------------------------------------------------ 纯逻辑（判据直接调）
 
+DEFAULT_MODE = BACKEND_LOCAL
+
+
 def mode() -> str:
-    value = (os.environ.get(MODE_ENV) or "auto").strip().lower()
-    return value if value in BACKENDS + ("auto",) else "auto"
+    """当前后端档位；**默认 `local`**（2026-10-19 明江定的口径）。
+
+    他问"翻译用的是哪个云服务？最好用免费的" —— `cloud` 那条是**按 token 计费的 LLM API**，
+    不是免费翻译服务，而且那把 key 还 401 了。所以默认永远先走本机（离线、不限次、免费），
+    **绝不因为云 key 失效而失败**；`auto`/`cloud` 两档保留，但要他主动切才走。
+    """
+    value = (os.environ.get(MODE_ENV) or DEFAULT_MODE).strip().lower()
+    return value if value in BACKENDS + ("auto",) else DEFAULT_MODE
 
 
 def local_url() -> str:
@@ -70,10 +86,57 @@ def target_language() -> str:
     return (os.environ.get("CAPSPLUS_TRANSLATE_TO") or "中文").strip()
 
 
-def cloud_config(config_path=None) -> dict:
-    """阿里 token-plan 的 base_url / key / 默认模型（**不打印值**）。
+# 凭据来源（**三级**，从高到低）。第三级是 DSH 自己的凭据文件 —— 只读、绝不打印、绝不改写。
+CREDENTIALS_FILE = "~/.dsh/.credentials.yaml"
+CREDENTIALS_REF = "AL_TOKEN_PLAN_API_KEY"
+SOURCE_ENV = "环境变量 CAPSPLUS_CLOUD_KEY"
+SOURCE_BAILIAN = "~/.bailian/config.json"
+SOURCE_DSH = CREDENTIALS_FILE
 
-    顺序：`CAPSPLUS_CLOUD_*` 环境变量 → `~/.bailian/config.json` 的 `token-plan` 段。
+
+def read_dsh_credential(path=None, ref: str = CREDENTIALS_REF) -> str:
+    """从 `~/.dsh/.credentials.yaml` 的 `refs.<NAME>` 读一把 token（**只读、绝不打印**）。
+
+    为什么自己写这十几行而不引 YAML 库：仓里没有 pyyaml 依赖（本地 OCR 那是另一条独立 venv），
+    而这个文件的结构就是"`refs:` 下面一层缩进的键值" —— 用最小的解析器读，少一个依赖少一处风险。
+    解析不出来就返回空串（调用方据此报"凭据没找到"，不编造）。
+    """
+    file = Path(os.path.expanduser(path or os.environ.get("CAPSPLUS_CLOUD_CREDENTIALS")
+                                   or CREDENTIALS_FILE))
+    try:
+        text = file.read_text(encoding="utf-8")       # **只读**：这里没有任何写操作
+    except OSError:
+        return ""
+    in_refs = False
+    for line in text.splitlines():
+        if not line.strip() or line.lstrip().startswith("#"):
+            continue
+        indent = len(line) - len(line.lstrip())
+        if indent == 0:
+            in_refs = line.split(":", 1)[0].strip() == "refs"
+            continue
+        if in_refs:
+            key, _, value = line.strip().partition(":")
+            if key.strip() == ref:
+                return value.strip().strip('"').strip("'")
+    return ""
+
+
+def _safe_source(text: str) -> str:
+    """只保留"哪来的"这类标签，**绝不带值** —— 任何要往外说的话都过这道闸。"""
+    return "".join(ch for ch in text if ch not in "\n\r")[:120]
+
+
+def cloud_config(config_path=None, credentials_path=None) -> dict:
+    """阿里 token-plan 的 base_url / key / 默认模型（**一律不打印值**）。
+
+    凭据顺序（**三级**，从高到低）：
+      ① `CAPSPLUS_CLOUD_KEY` 环境变量（临时/CI 用）
+      ② `~/.bailian/config.json` 的 `token-plan` 段（`bl` CLI 的文件；**只读，绝不改写**）
+      ③ `~/.dsh/.credentials.yaml` 的 `refs.AL_TOKEN_PLAN_API_KEY`（DSH 自己那把，实测可用）
+
+    纪律：只读、绝不打印、绝不写回任何一个凭据文件；`source` 字段只记"哪来的"，不带值。
+    返回里带上 `source` 与 `config_file`，面板与报错据此说清"用的是哪一把"。
     """
     env_key = os.environ.get("CAPSPLUS_CLOUD_KEY", "")
     env_url = os.environ.get("CAPSPLUS_CLOUD_BASE_URL", "")
@@ -82,16 +145,28 @@ def cloud_config(config_path=None) -> dict:
                                    or DEFAULT_CLOUD_CONFIG))
     section = {}
     try:
-        data = json.loads(path.read_text(encoding="utf-8"))
+        data = json.loads(path.read_text(encoding="utf-8"))     # **只读**
         active = data.get("active_config")
         section = (data.get(active) if isinstance(active, str) and isinstance(data.get(active), dict)
                    else data.get("token-plan", {})) or {}
     except (OSError, ValueError):
         section = {}
+    key, source = "", ""
+    if env_key:
+        key, source = env_key, SOURCE_ENV
+    elif section.get("api_key"):
+        key, source = section["api_key"], SOURCE_BAILIAN
+    else:
+        key = read_dsh_credential(credentials_path)
+        if key:
+            source = SOURCE_DSH
     return {"base_url": normalize_base_url(env_url or section.get("base_url", "")),
-            "api_key": env_key or section.get("api_key", ""),
+            "api_key": key,
             "model": env_model or DEFAULT_CLOUD_MODEL,
-            "config_file": str(path)}
+            "config_file": str(path),
+            "credentials_file": str(Path(os.path.expanduser(credentials_path
+                                                            or CREDENTIALS_FILE))),
+            "source": _safe_source(source)}
 
 
 def normalize_base_url(raw: str) -> str:
@@ -130,8 +205,11 @@ def resolve_backend(local_probe=None, cloud=None) -> tuple:
     if mode_ == BACKEND_LOCAL:
         if local_ok:
             return BACKEND_LOCAL, f"本机模型（{local_model()}）"
-        return None, (f"✗ 你指定了本机翻译，但 {local_url()} 探不到 —— "
-                      f"看一眼：`curl {local_url()}/models`；或按面板上的『切到云』")
+        # 默认档就是本机：这时**不谈"自动切云"**，只如实说"本机没起、怎么起"
+        return None, (f"✗ 本机模型没起：{local_url()} 探不到 —— "
+                      f"起来：`ollama serve` 或 systemctl --user start 你那条服务"
+                      f"（判活：`curl {local_url()}/models`）"
+                      f"；想用云端就按面板上的『切到云』（那是计费 API，不是免费翻译）")
     if mode_ == BACKEND_CLOUD:
         if has_cloud:
             return BACKEND_CLOUD, f"云端（{cloud['model']}，可直读图）"
@@ -261,6 +339,29 @@ def translate_local(text, *, post=None, note="") -> dict:
                        note=note or f"{local_model()}（本机，只吃文本）")
 
 
+def cloud_hint_for_error(status, reason, cloud) -> tuple:
+    """把云端失败翻译成**可操作**的话；401 时明说"凭据失效 → 切本地 / 换一把 key"。
+
+    纪律：文案里**只出现来源标签**（哪一级、哪个文件），绝不出凭据片段。
+    """
+    source = _safe_source(cloud.get("source") or "")
+    where = f"（当前凭据来源：{source}）" if source else ""
+    text = str(reason or "")
+    if status == 401 or "401" in text or "Unauthorized" in text:
+        return False, ("✗ 云端凭据失效（401）→ **按面板上的『切到本地』**用本机模型（离线、免费），"
+                       f"或换一把 key（CAPSPLUS_CLOUD_KEY / ~/.bailian/config.json / "
+                       f"{CREDENTIALS_FILE} 三处任选）{where}")
+    if status in (403, 404):
+        return False, (f"✗ 云端不支持这个请求（{status}）{where}—— 换个模型或端点；"
+                       "本机那档不受影响，按『切到本地』即可")
+    if status == 429:
+        return False, f"✗ 云端限流（429）{where}—— 等一会儿或按『切到本地』（本机不限次）"
+    if status is None:
+        return False, (f"✗ 连不上云端（{text or '网络/证书问题'}）{where}"
+                       "—— 按『切到本地』用本机模型更稳")
+    return False, f"✗ 云端返回 {status}{where}：{text[:200]}"
+
+
 def translate_cloud(text, *, cloud=None, post=None, note="") -> dict:
     cloud = cloud if cloud is not None else cloud_config()
     t0 = time.perf_counter()
@@ -271,14 +372,19 @@ def translate_cloud(text, *, cloud=None, post=None, note="") -> dict:
     try:
         ok, payload = _post_chat(cloud["base_url"], cloud["api_key"], cloud["model"],
                                  build_messages(text), post=post)
+    except HTTPStatusError as exc:
+        code = getattr(getattr(exc, "response", None), "status_code", None)
+        _ok, hint = cloud_hint_for_error(code, exc, cloud)
+        return make_result(False, src=text, backend=BACKEND_CLOUD,
+                           ms=int((time.perf_counter() - t0) * 1000), hint=hint)
     except Exception as exc:
+        _ok, hint = cloud_hint_for_error(None, exc, cloud)
         return make_result(False, src=text, backend=BACKEND_CLOUD,
-                           ms=int((time.perf_counter() - t0) * 1000),
-                           hint=f"✗ 云翻译请求失败：{exc}（没网？key 过期？）")
+                           ms=int((time.perf_counter() - t0) * 1000), hint=hint)
     if not ok:
+        _ok, hint = cloud_hint_for_error(None, payload, cloud)
         return make_result(False, src=text, backend=BACKEND_CLOUD,
-                           ms=int((time.perf_counter() - t0) * 1000),
-                           hint=f"✗ 云端返回不可用：{payload}")
+                           ms=int((time.perf_counter() - t0) * 1000), hint=hint)
     return make_result(True, src=text, text=payload, backend=BACKEND_CLOUD,
                        ms=int((time.perf_counter() - t0) * 1000),
                        note=note or f"{cloud['model']}（云）")

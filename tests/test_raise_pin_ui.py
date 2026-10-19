@@ -22,6 +22,8 @@
 （2026-10-16 就这么白让明江注销重登过一次）。
 """
 
+
+import json
 import pathlib
 import re
 import shutil
@@ -310,3 +312,193 @@ class TestExtensionSyntax(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+# node 侧驱动：把抠出来的真代码跑一遍，走"进入贴图 → 离开贴图 → 进工具条 → 点按钮"的序列
+DRIVER = """
+__BODY__
+
+let state = {visible: false, deadline: 0};
+const step = (event, now) => {
+    const r = hoverPlan(state, event, now);
+    state = r.state;
+    return r.action;
+};
+const log = [];
+log.push(['pin-enter', step('pin-enter', 0), state.visible]);
+log.push(['pin-leave', step('pin-leave', 10), state.visible]);
+log.push(['tick-before-deadline', step('tick', 200), state.visible]);
+log.push(['bar-enter', step('bar-enter', 240), state.visible]);
+log.push(['tick-after-cancel', step('tick', 3000), state.visible]);
+log.push(['bar-leave', step('bar-leave', 3100), state.visible]);
+log.push(['tick-early', step('tick', 3200), state.visible]);
+log.push(['tick-expired', step('tick', 3400), state.visible]);
+const geo = toolbarGeometry(400, 300, 106, 34);
+const buttons = toolbarButtons(geo, 34, 3);
+const hit = hitButton(buttons, geo.x + 2, geo.y + 10);
+const hitClose = hitButton(buttons, geo.x + 2 * 34 + 2, geo.y + 10);
+const miss = hitButton(buttons, geo.x - 50, geo.y - 50);
+console.log('SUMMARY ' + JSON.stringify({log, geo, hit, hitClose, miss, grace: HOVER_GRACE_MS}));
+"""
+
+
+def strip_comments(js: str) -> str:
+    """去掉 JS 注释再做文本断言 —— 注释里常写着"为什么不用 xxx"，按文本扫会误伤（踩过两次）。"""
+    js = re.sub(r"/\*.*?\*/", "", js, flags=re.S)
+    return re.sub(r"//[^\n]*", "", js)
+
+
+def _extract_functions(source: str, names) -> str:
+    """从 extension.js 里抠出几个函数的**源码**（拿到 node 里去真跑）。
+
+    为什么抠源码跑而不是在 Python 里重写一遍：重写就是"第二份真相" —— extension.js 改了、
+    判据里的副本没改，判据会绿着骗人。抠出来跑 = 判的就是真代码。
+    """
+    out = []
+    for name in names:
+        m = re.search(r"^(?:const|function|let)\s+" + name + r"\b", source, re.M)
+        if not m:
+            raise AssertionError("extension.js 里找不到 " + name)
+        start = m.start()
+        if source[start:].startswith(("const", "let")):
+            out.append(source[start:source.index(";", source.index("=", start)) + 1])
+            continue
+        depth, i = 0, source.index("{", start)
+        for j in range(i, len(source)):
+            if source[j] == "{":
+                depth += 1
+            elif source[j] == "}":
+                depth -= 1
+                if depth == 0:
+                    out.append(source[start:j + 1])
+                    break
+    return "\n\n".join(out)
+
+
+def _run_node(script_body: str) -> subprocess.CompletedProcess:
+    import tempfile
+    path = pathlib.Path(tempfile.mkdtemp(prefix="capsplus-extjs-")) / "probe.mjs"
+    path.write_text(script_body, encoding="utf-8")
+    return subprocess.run(["node", str(path)], capture_output=True, text=True, timeout=60)
+
+
+HOVER_FNS = ["HOVER_GRACE_MS", "toolbarGeometry", "toolbarButtons", "hitButton", "hoverPlan"]
+
+
+class TestHoverToolbarIsReachable(unittest.TestCase):
+    """**hover 工具条点不到**（2026-10-19 真机）：鼠标移上去闪一下就消失、点不着。
+
+    真机序列：进入贴图 → 离开贴图 → 进入工具条 → 点复制。判据把 extension.js 里的
+    `hoverPlan` / `toolbarGeometry` / `hitButton` **抠出来在 node 里真跑**，断言：
+      ① 整条序列里工具条**一直是 visible**（离开贴图那一步不许立刻 hide）；
+      ② 点击**真的落到按钮上**（命中测试找到 copy / ×）；
+      ③ 工具条在贴图**内部**（否则鼠标必须离开 actor 才够得着 ⇒ 永远"闪现抓不住"）。
+    反例：① 去掉宽限（立即 hide）→ 必红；② 工具条挪回贴图外面 → 必红。
+    """
+
+    def setUp(self):
+        self.src = (REPO / "extensions" / "raise-browser@capsplus.example" /
+                    "extension.js").read_text(encoding="utf-8")
+
+    def _summary(self):
+        body = _extract_functions(self.src, HOVER_FNS)
+        proc = _run_node(DRIVER.replace("__BODY__", body))
+        self.assertEqual(proc.returncode, 0, proc.stderr[-400:])
+        line = [ln for ln in proc.stdout.splitlines() if ln.startswith("SUMMARY ")][0]
+        return json.loads(line[len("SUMMARY "):])
+
+    def test_sequence_keeps_the_toolbar_visible_and_clicks_land(self):
+        data = self._summary()
+        visible_throughout = {"pin-enter", "pin-leave", "tick-before-deadline", "bar-enter",
+                              "tick-after-cancel", "bar-leave", "tick-early"}
+        for name, _action, visible in data["log"]:
+            if name in visible_throughout:
+                self.assertTrue(visible, "「" + name + "」之后工具条被藏了 —— 鼠标到不了按钮")
+            if name == "tick-expired":
+                self.assertFalse(visible, "宽限到期之后该藏")
+        self.assertGreaterEqual(data["grace"], 200, "宽限期要 200–300ms")
+        self.assertLessEqual(data["grace"], 300)
+        self.assertEqual(data["hit"], 0, "点不到复制按钮")
+        self.assertEqual(data["hitClose"], 2, "× 要一击即中")
+        self.assertEqual(data["miss"], -1, "没点到就该返回 -1（别误触发）")
+
+    def test_toolbar_sits_inside_the_pin(self):
+        data = self._summary()
+        self.assertTrue(data["geo"]["inside"],
+                        "工具条跑到贴图外面了：" + str(data["geo"]) + "（鼠标得离开 actor 才够得着）")
+        # 光看纯函数不够：**接线也得用它的结果**（把 set_position 挪回贴图外面 = 反例 BQ）
+        bar = self.src[self.src.index("function buildPinToolbar"):]
+        bar = bar[:bar.index("\n}")]
+        code = strip_comments(bar)
+        self.assertIn("bar.set_position(geo.x, geo.y)", code,
+                      "工具条没按 toolbarGeometry 的结果摆 —— 又摆到贴图外面去了")
+        self.assertNotIn("pin.height +", code, "工具条被摆到贴图下沿外面了")
+
+    def test_leave_does_not_hide_immediately_in_the_source(self):
+        """源码层面再钉一次：贴图的 leave-event 里**不许**直接 `toolbar.hide()`。"""
+        block = self.src[self.src.index("actor.connect('leave-event'"):]
+        block = block[:block.index("});") + 3]
+        code = strip_comments(block)
+        self.assertIn("HOVER_GRACE_MS", code, "leave 时该起算宽限")
+        # `toolbar.hide()` 只允许出现在**宽限到期之后**（时间回调里），不许在 leave 当场就调
+        self.assertLess(code.index("HOVER_GRACE_MS"), code.index("toolbar.hide()"),
+                        "leave-event 里当场就 hide 了 —— 宽限被绕过")
+        head = code[:code.index("HOVER_GRACE_MS")]
+        self.assertNotIn("toolbar.hide()", head, "宽限之前就 hide 了")
+
+
+class TestPinsAreHiddenDuringCapture(unittest.TestCase):
+    """**遮罩压在贴图之上**（明江 2026-10-19 口径）：抓帧期间贴图必须真的藏起来。
+
+    为什么不做"开关"（他嫌复杂）：贴图在 shell 图层、遮罩是 GTK 窗口，物理上抬不过去；
+    等价做法只有"抓帧前隐藏 → 抓完恢复"。副作用：**新截图不会把旧贴图拍进去**（也是他最初的诉求）。
+    """
+
+    def setUp(self):
+        self.src = (REPO / "extensions" / "raise-browser@capsplus.example" /
+                    "extension.js").read_text(encoding="utf-8")
+
+    def _area(self):
+        area = self.src[self.src.index("function captureArea"):]
+        return area[:area.index("/* ------------------------------------------------------")]
+
+    def test_visibility_plan_moves_only_visible_pins(self):
+        body = _extract_functions(self.src, ["pinVisibilityPlan"])
+        proc = _run_node(body + "\nconsole.log('PLAN ' + JSON.stringify(pinVisibilityPlan([true, false, true])));\n")
+        self.assertEqual(proc.returncode, 0, proc.stderr[-300:])
+        plan = json.loads([ln for ln in proc.stdout.splitlines()
+                           if ln.startswith("PLAN ")][0][5:])
+        self.assertEqual(plan["hide"], [0, 2], "只动当时可见的那些")
+        self.assertEqual(plan["restore"], [0, 2], "恢复的集合与隐藏的集合一致")
+        self.assertNotIn(1, plan["restore"], "本来就不可见的贴图不许被 show 出来")
+
+    def test_hide_happens_before_the_capture_call(self):
+        """顺序是判据：**先 hide 再抓帧**（否则旧贴图会被拍进新截图）。"""
+        head = self.src[self.src.index("function captureArea"):]
+        head = head[:head.index("callArea(shooter()")]
+        self.assertIn("hidePinsForCapture()", head, "抓帧前没有隐藏贴图")
+        self.assertLess(head.index("hidePinsForCapture()"), head.index("part.replace"),
+                        "隐藏要在开流/抓帧之前")
+
+    def test_every_exit_path_restores(self):
+        """所有出口都要恢复：成功 / 抓帧失败 / 关流失败 / 改名失败 / 开流失败 + 超时兜底。"""
+        area = self._area()
+        exits = area.count("shot result=")
+        self.assertGreaterEqual(area.count("restore()"), exits,
+                                f"出口 {exits} 个、恢复只有 {area.count('restore()')} 次"
+                                " —— 有一条路会把贴图留在隐藏态")
+        self.assertRegex(area, r"timeout_add_seconds\(\s*(GLib\.PRIORITY_DEFAULT\s*,\s*)?30",
+                         "没有超时兜底：回调不来就永久隐身")
+
+    def test_hiding_is_real_not_transparent(self):
+        """**必须真 hide**：冻结是合成后抓的，`set_opacity(0)` 一样会被拍进去。"""
+        body = strip_comments(_extract_functions(
+            self.src, ["hidePinsForCapture", "restorePinsAfterCapture"]))
+        self.assertIn(".hide()", body)
+        self.assertIn(".show()", body)
+        self.assertNotIn("set_opacity", body, "用透明度冒充隐藏了 —— 抓帧照样拍得到")
+
+    def test_disable_clears_hover_timers(self):
+        self.assertIn("restoreAllPins()", self.src, "停用时没收拾 hover 定时器")
+        disable = self.src[self.src.index("    disable() {"):]
+        disable = disable[:disable.index("\n    }")]
+        self.assertIn("restoreAllPins()", disable, "disable() 里没调 restoreAllPins()")

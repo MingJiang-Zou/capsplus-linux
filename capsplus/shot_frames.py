@@ -38,6 +38,49 @@ def runtime_dir() -> Path:
     return Path(base) / "capsplus-shot"
 
 
+KEEP_FRAMES = 2                     # 留最近几个给排障（其余立刻清）
+
+
+def cleanup_runtime(keep: int = KEEP_FRAMES, out_dir=None) -> dict:
+    """清掉冻结帧，只留最近 `keep` 个。返回 `{"removed": n, "freed": bytes, "left": n}`。
+
+    ⚠ 2026-10-19 真机事故（lead 量的）：`~/.dsh/.../capsplus-shot/` **41 个文件、108MB** —— 而且
+    它在 `$XDG_RUNTIME_DIR`（`/run/user/<uid>/`）下，是 **tmpfs，吃的是内存**（每张 6400×1440 PNG ≈ 3.4MB）。截图流程
+    跑完不删，按一次攒一张，按几百次就把内存吃掉一块。所以：**流程结束即清**（成功/失败/异常/取消
+    四条路都清），只留最近 `keep` 个用于排障，另给 `--clean` 手动清。
+
+    为什么不按"删除一律 mv 进焚化炉"的老规矩走：焚化炉（`/tmp`）**也是 tmpfs** —— 把 108MB 挪过去
+    等于没释放（而且和这里的目的是矛盾的）。这些冻结帧是**一次性中间产物**（每次抓都有新的、
+    用户要留的图早就存到 `~/Pictures/Screenshots/` 了），所以直接 `unlink`，并在注释里写明这条例外。
+    """
+    out_dir = Path(out_dir) if out_dir else runtime_dir()
+    if not out_dir.is_dir():
+        return {"removed": 0, "freed": 0, "left": 0}
+    files = sorted((f for f in out_dir.iterdir() if f.is_file()),
+                   key=lambda f: f.stat().st_mtime, reverse=True)
+    removed = freed = 0
+    for old_file in files[max(0, int(keep)):]:
+        try:
+            size = old_file.stat().st_size
+            old_file.unlink()
+            removed += 1
+            freed += size
+        except OSError:
+            pass
+    return {"removed": removed, "freed": freed, "left": len(list(out_dir.iterdir()))}
+
+
+def runtime_usage(out_dir=None) -> dict:
+    """看一眼现状（`--clean`/体检脚本用）。"""
+    out_dir = Path(out_dir) if out_dir else runtime_dir()
+    if not out_dir.is_dir():
+        return {"files": 0, "bytes": 0, "oldest": None, "newest": None}
+    files = [f for f in out_dir.iterdir() if f.is_file()]
+    times = [f.stat().st_mtime for f in files] or [0]
+    return {"files": len(files), "bytes": sum(f.stat().st_size for f in files),
+            "oldest": min(times), "newest": max(times)}
+
+
 class Frame:
     """一块屏的冻结图：`rect` 是全局逻辑矩形，`surface` 是像素图。"""
 
@@ -139,7 +182,15 @@ def freeze(monitors, capture_fn, out_dir=None, retries: int = BUSY_RETRIES,
     cairo = __import__("cairo")
     surface = cairo.ImageSurface.create_from_png(str(path))
     scale = derive_scale(union, surface)
-    return slice_frames(surface, monitors, scale), union, f"✓ 冻结 {union[2]}×{union[3]} @{scale:g}x"
+    frames = slice_frames(surface, monitors, scale)
+    # **尽早放掉联合大图**（性能体检 B2）：切片是各自独立的 surface（`slice_frames` 里
+    # `set_source_surface` + `paint` 拷了一份），所以这里 `finish()` 是安全的 ——
+    # 6400×1440 那张解出来就 35 MB，早点还回去，别和切片一起占着（峰值能少一半）。
+    try:
+        surface.finish()
+    except Exception:
+        pass
+    return frames, union, f"✓ 冻结 {union[2]}×{union[3]} @{scale:g}x"
 
 
 def crop_from_frames(rect, frames):

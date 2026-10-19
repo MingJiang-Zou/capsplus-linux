@@ -221,6 +221,25 @@ function callArea(shot, x, y, w, h, stream, done) {
  * 先写 `<out>.part` 再 rename 成 outPath：**outPath 一出现就是完整 PNG**，
  * 调用方（capsplus 等文件出现）不会读到半张图 —— 这是本链路上唯一能防"静默半图"的办法。
  */
+/** 抓帧期间把手头所有贴图**真的藏起来**，抓完/失败/超时一律恢复（明江 2026-10-19 定的口径）。 */
+function hidePinsForCapture() {
+    const was = _pins.map(p => p.actor.visible);
+    const plan = pinVisibilityPlan(was);
+    for (const i of plan.hide)
+        _pins[i].actor.hide();                 // 真 hide，**不是** set_opacity(0)：冻结是合成后抓的
+    return {was};
+}
+
+function restorePinsAfterCapture(saved) {
+    if (!saved || !saved.was)
+        return;
+    const plan = pinVisibilityPlan(saved.was);
+    for (const i of plan.restore) {
+        if (_pins[i])
+            _pins[i].actor.show();
+    }
+}
+
 function captureArea(x, y, width, height, outPath) {
     const t0 = GLib.get_monotonic_time();
     const ms = () => Math.round((GLib.get_monotonic_time() - t0) / 1000);
@@ -235,11 +254,31 @@ function captureArea(x, y, width, height, outPath) {
     const out = Gio.File.new_for_path(outPath);
     console.log(`[raise-browser] shot result=started path=${outPath} ${rect}`);
 
+    // **遮罩压在贴图之上**（明江 2026-10-19 定的口径，见 docs/SHOT-TOOL.md §7.9）：
+    // 贴图在 shell 图层、GTK 遮罩在窗口层，物理上抬不过去；等价做法是抓帧前把贴图
+    // 真的藏起来、抓完恢复 —— 这样 ①压暗能盖住原贴图位置 ②新截图不会把旧贴图拍进去。
+    const hidden = hidePinsForCapture();
+    let restored = false;
+    const restore = () => {                       // 所有出口共用这一个漏斗
+        if (restored)
+            return;
+        restored = true;
+        restorePinsAfterCapture(hidden);
+    };
+    // 兜底：万一回调永远不来（进程被杀/超时），30 秒后也要把贴图放回来
+    const safety = GLib.timeout_add_seconds(GLib.PRIORITY_DEFAULT, 30, () => {
+        restore();
+        return GLib.SOURCE_REMOVE;
+    });
+
     let stream = null;
     try {
         stream = part.replace(null, false, Gio.FileCreateFlags.NONE, null);
     } catch (e) {
         console.log(`[raise-browser] shot result=fail path=${outPath} why=open:${e.message} ms=${ms()}`);
+        restore();
+        if (safety)
+            GLib.source_remove(safety);
         return;
     }
 
@@ -264,6 +303,9 @@ function captureArea(x, y, width, height, outPath) {
             }
             cleanup();
             console.log(`[raise-browser] shot result=fail path=${outPath} why=${why} ms=${ms()}`);
+            restore();
+            if (safety)
+                GLib.source_remove(safety);
             return;
         }
         try {
@@ -271,6 +313,9 @@ function captureArea(x, y, width, height, outPath) {
         } catch (e) {
             cleanup();
             console.log(`[raise-browser] shot result=fail path=${outPath} why=close:${e.message} ms=${ms()}`);
+            restore();
+            if (safety)
+                GLib.source_remove(safety);
             return;
         }
         try {
@@ -280,9 +325,15 @@ function captureArea(x, y, width, height, outPath) {
         } catch (e) {
             cleanup();
             console.log(`[raise-browser] shot result=fail path=${outPath} why=rename:${e.message} ms=${ms()}`);
+            restore();
+            if (safety)
+                GLib.source_remove(safety);
             return;
         }
         console.log(`[raise-browser] shot result=ok path=${outPath} ${rect} ms=${ms()}`);
+        restore();
+        if (safety)
+            GLib.source_remove(safety);
     });
 }
 
@@ -388,6 +439,16 @@ function destroyAllPins() {
         destroyPin(pin);
 }
 
+/** 扩展停用/热重载：没有贴图可恢复时要保证**没有任何东西**还等着被恢复。 */
+function restoreAllPins() {
+    for (const pin of _pins) {
+        if (pin.hoverTimer) {
+            GLib.source_remove(pin.hoverTimer);
+            pin.hoverTimer = 0;
+        }
+    }
+}
+
 /** 全局兜底（keyd 的 `Caps+Esc` 走这里）：清空所有贴图，**没有贴图时也安全**。 */
 function clearPins(ackPath) {
     const before = _pins.length;
@@ -442,6 +503,73 @@ function setPinOpacity(pin, op) {
     pinLog('opacity', `value=${pin.opacity.toFixed(2)}`);
 }
 
+// ── hover 工具条的**纯逻辑**（判据在 node 里真跑这两个函数）─────────────────────
+// 2026-10-19 真机事故：鼠标移上贴图工具条出现，再往工具条上移就消失、点不到。
+// 根因：工具条画在贴图**外面**（`pin.height + 6`），而贴图的 leave-event 立刻 hide ⇒
+// 鼠标离开贴图那一步就把工具条收了，永远到不了按钮。修法是双保险：
+//   ① 工具条放进贴图**内部**（右上角），鼠标不必离开 actor 就能到按钮；
+//   ② leave 不立刻 hide，给 HOVER_GRACE_MS 宽限，进工具条/按钮就取消。
+const HOVER_GRACE_MS = 250;             // 200–300ms 那段（lead 的要求）
+
+/** 工具条在贴图**内部**的位置：右上角内缩，保证"鼠标不离开贴图就能点"。 */
+function toolbarGeometry(pinWidth, pinHeight, barWidth, barHeight) {
+    const pad = 4;
+    const x = Math.max(pad, Math.round(pinWidth - barWidth - pad));
+    const y = pad;
+    return {x, y, inside: x >= 0 && y >= 0
+        && x + barWidth <= pinWidth && y + barHeight <= pinHeight};
+}
+
+/** 三个按钮的命中矩形（点击区要够大：工具条高 h、每个按钮宽 w）。 */
+function toolbarButtons(geo, barHeight, count) {
+    const width = 34;                   // 每个按钮 34×barHeight，比图标大一圈，好点
+    const out = [];
+    for (let i = 0; i < count; i++)
+        out.push({index: i, x: geo.x + i * width, y: geo.y,
+                  w: width, h: barHeight});
+    return out;
+}
+
+/** 命中哪个按钮（点不到就 -1）—— `×` 必须一击即中，所以判定要简单直接。 */
+function hitButton(buttons, px, py) {
+    for (const b of buttons) {
+        if (px >= b.x && px < b.x + b.w && py >= b.y && py < b.y + b.h)
+            return b.index;
+    }
+    return -1;
+}
+
+/**
+ * hover 状态机：`state = {visible, deadline}`，`event` 是
+ * `pin-enter | pin-leave | bar-enter | bar-leave | tick`，`now` 是毫秒。
+ * 返回 `{state, action}`，action ∈ `show | hide | none`。
+ */
+function hoverPlan(state, event, now) {
+    const visible = !!state.visible;
+    const deadline = state.deadline || 0;
+    switch (event) {
+    case 'pin-enter':
+    case 'bar-enter':
+        return {state: {visible: true, deadline: 0}, action: 'show'};
+    case 'pin-leave':
+    case 'bar-leave':
+        // **不立刻 hide**：起算宽限，鼠标在这段时间里进工具条就取消
+        return {state: {visible, deadline: now + HOVER_GRACE_MS}, action: 'none'};
+    case 'tick':
+        if (visible && deadline && now >= deadline)
+            return {state: {visible: false, deadline: 0}, action: 'hide'};
+        return {state: {visible, deadline}, action: 'none'};
+    default:
+        return {state: {visible, deadline}, action: 'none'};
+    }
+}
+
+/** 抓帧期间"藏哪些、还哪些"：只动**当时可见**的那些，其余不动（不扰乱贴图自身状态）。 */
+function pinVisibilityPlan(wasVisible) {
+    return {hide: wasVisible.map((v, i) => (v ? i : -1)).filter(i => i >= 0),
+            restore: wasVisible.map((v, i) => (v ? i : -1)).filter(i => i >= 0)};
+}
+
 function buildPinToolbar(pin) {
     const bar = new St.BoxLayout({style_class: 'capsplus-pin-toolbar', reactive: true,
                                   track_hover: true, visible: false});
@@ -452,16 +580,56 @@ function buildPinToolbar(pin) {
         btn.connect('clicked', cb);
         bar.add_child(btn);
     }
-    // 工具条是**贴图的子 actor**：拖贴图时它跟着走，不用单独跟着算位置
-    bar.set_position(0, pin.height + 6);
-    if (pin.y + pin.height + 6 + 34 > global.stage.height)
-        bar.set_position(0, -34);                    // 底下放不下就放上面
+    // 工具条是**贴图的子 actor**，而且画在贴图**内部右上角**（lead 的修法 ①）：
+    // 之前画在 `pin.height + 6`（贴图外面），鼠标离开贴图那一步就够不着按钮了。
+    const BAR_H = 34, BAR_W = 34 * 3 + 4;
+    const geo = toolbarGeometry(pin.width, pin.height, BAR_W, BAR_H);
+    bar.set_size(BAR_W, BAR_H);
+    bar.set_position(geo.x, geo.y);
+    pin.toolbarGeometry = geo;
+    pin.buttons = toolbarButtons(geo, BAR_H, 3);
+    // 按钮点击区够大 + hover 高亮（样式类在 stylesheet 里）
+    let i = 0;
+    for (const child of bar.get_children())
+        child.set_size(34, BAR_H);
+    pinLog('toolbar', `x=${geo.x} y=${geo.y} inside=${geo.inside}`);
+    // hover 宽限（lead 的修法 ②）：进工具条取消隐藏、离开重新起算
+    const arm = () => {
+        const r = hoverPlan(pin.hover || {visible: true, deadline: 0}, 'bar-leave',
+                            GLib.get_monotonic_time() / 1000);
+        pin.hover = r.state;
+        if (pin.hoverTimer) {
+            GLib.source_remove(pin.hoverTimer);
+            pin.hoverTimer = 0;
+        }
+        pin.hoverTimer = GLib.timeout_add(GLib.PRIORITY_DEFAULT, HOVER_GRACE_MS, () => {
+            pin.hoverTimer = 0;
+            const t2 = hoverPlan(pin.hover, 'tick', GLib.get_monotonic_time() / 1000);
+            pin.hover = t2.state;
+            if (t2.action === 'hide') {
+                bar.hide();
+                const owner = pin.actor;
+                owner.set_scale(pin.scale, pin.scale);   // 不动贴图状态，只收工具条
+            }
+            return GLib.SOURCE_REMOVE;
+        });
+    };
+    const disarm = () => {
+        if (pin.hoverTimer) {
+            GLib.source_remove(pin.hoverTimer);
+            pin.hoverTimer = 0;
+        }
+        const r = hoverPlan(pin.hover || {visible: true, deadline: 0}, 'bar-enter',
+                            GLib.get_monotonic_time() / 1000);
+        pin.hover = r.state;
+    };
     bar.connect('enter-event', () => {
+        disarm();
         bar.show();
         return Clutter.EVENT_PROPAGATE;
     });
     bar.connect('leave-event', () => {
-        bar.hide();
+        arm();
         return Clutter.EVENT_PROPAGATE;
     });
     return bar;
@@ -558,11 +726,33 @@ function pinImage(pngPath, rawPath, width, height, x, y, ackPath) {
         actor.add_child(toolbar);
         pin.toolbar = toolbar;
         actor.connect('enter-event', () => {
+            if (pin.hoverTimer) {
+                GLib.source_remove(pin.hoverTimer);
+                pin.hoverTimer = 0;
+            }
+            const r = hoverPlan(pin.hover || {visible: true, deadline: 0}, 'pin-enter',
+                                GLib.get_monotonic_time() / 1000);
+            pin.hover = r.state;
             toolbar.show();
             return Clutter.EVENT_PROPAGATE;
         });
         actor.connect('leave-event', () => {
-            toolbar.hide();
+            // **不立刻 hide**：给 250ms 宽限，鼠标能走到工具条上（2026-10-19 修的第二条）
+            const r = hoverPlan(pin.hover || {visible: true, deadline: 0}, 'pin-leave',
+                                GLib.get_monotonic_time() / 1000);
+            pin.hover = r.state;
+            if (pin.hoverTimer) {
+                GLib.source_remove(pin.hoverTimer);
+                pin.hoverTimer = 0;
+            }
+            pin.hoverTimer = GLib.timeout_add(GLib.PRIORITY_DEFAULT, HOVER_GRACE_MS, () => {
+                pin.hoverTimer = 0;
+                const t2 = hoverPlan(pin.hover, 'tick', GLib.get_monotonic_time() / 1000);
+                pin.hover = t2.state;
+                if (t2.action === 'hide')
+                    toolbar.hide();
+                return GLib.SOURCE_REMOVE;
+            });
             return Clutter.EVENT_PROPAGATE;
         });
 
@@ -742,6 +932,7 @@ export default class RaiseBrowserExtension {
 
     disable() {
         console.log('[raise-browser] 停用');
+        restoreAllPins();       // 先把 hover 定时器收拾掉：不留任何等着"恢复贴图"的悬挂回调
         destroyAllPins();       // 自己关掉自己的东西：不许把 actor 留在屏幕上（会泄漏）
         // signal_remove 在本机是否存在要运行时看（这版 GJS 摘过好几个便捷函数）：
         // 摘不到就留着，shell 重启时自然会清；不能因为它不存在就把 disable 抛断。

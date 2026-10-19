@@ -14,6 +14,7 @@
 """
 
 import ast
+import inspect
 import pathlib
 import re
 import subprocess
@@ -1464,6 +1465,108 @@ class TestRealWindow(unittest.TestCase):
         self.assertEqual(state["tool_hl"], "highlight")
         self.assertEqual(state["color"], AN.COLORS[3][1], "颜色选择没生效")
         self.assertEqual(state["width"], 6, "线宽选择没生效")
+
+
+if __name__ == "__main__":
+    unittest.main()
+
+
+class TestDaemonStyleSubprocesses(unittest.TestCase):
+    """**守护型命令不许用 `capture_output` 等管道 EOF**（2026-10-19 真机事故）。
+
+    明江："我多按几次 Ctrl+C 程序就会异常"。根因：`wl-copy` 会 fork 一个长期存活的"留守者"，
+    它 **stderr 原样继承** ⇒ `capture_output=True` 等于等一条永不 EOF 的管道 ⇒ 每次复制卡满
+    5 秒 timeout（主线程被冻住），连按几次就堆成"程序异常"。
+
+    判据用**真的**守护型形状（`sh -c 'sleep N & exit 0'`：父进程立刻退、留守者抱着管道），
+    不靠"函数被调用了"这种假绿。
+    """
+
+    def test_default_runner_returns_without_waiting_for_the_lingering_child(self):
+        daemon_argv = ["sh", "-c", "sleep 3 & exit 0"]
+        t0 = time.monotonic()
+        proc = AN._default_clipboard_runner(daemon_argv, b"x")
+        elapsed = time.monotonic() - t0
+        self.assertEqual(proc.returncode, 0)
+        self.assertLess(elapsed, 1.0,
+                        f"默认 runner 等了 {elapsed:.2f}s —— 它又在等管道 EOF 了")
+
+    def test_capture_output_would_block(self):
+        """把反例摆在判据里：接管道的那版**确实**会被留守者拖住（说明上面那条测的是真东西）。"""
+        t0 = time.monotonic()
+        subprocess.run(["sh", "-c", "sleep 1 & exit 0"], capture_output=True, timeout=10)
+        bad = time.monotonic() - t0
+        t0 = time.monotonic()
+        subprocess.run(["sh", "-c", "sleep 1 & exit 0"], stdout=subprocess.DEVNULL,
+                       stderr=subprocess.DEVNULL, timeout=10)
+        good = time.monotonic() - t0
+        self.assertGreater(bad, 0.8, f"反例没被拖住（{bad:.2f}s）—— 判据失去意义")
+        self.assertLess(good, 0.5, f"DEVNULL 那版也慢了（{good:.2f}s）")
+
+    def test_copy_to_clipboard_is_fast_with_a_daemon_shaped_command(self):
+        """端到端：`copy_to_clipboard` 在守护型命令上必须**远小于 timeout** 地返回 ok=True。"""
+        t0 = time.monotonic()
+        ok, why = AN.copy_to_clipboard(b"hello", runner=AN._default_clipboard_runner,
+                                       which=lambda _n: "/usr/bin/wl-copy")
+        elapsed = time.monotonic() - t0
+        self.assertTrue(ok, why)
+        self.assertLess(elapsed, 1.0, f"复制用了 {elapsed:.2f}s")
+
+    def test_default_runner_does_not_use_capture_output(self):
+        """静态：默认 runner 的**代码**里不许出现 `capture_output`（反例一改就红）。
+
+        ⚠ 只看代码，不看文档字符串 —— 那段注释里正写着 `capture_output=True` 这个反面教材，
+        按文本扫会误伤（第一版就误伤了，判据自己红）。
+        """
+        node = ast.parse(inspect.getsource(AN._default_clipboard_runner)).body[0]
+        code = ast.dump(ast.Module(body=[n for n in node.body
+                                         if not (isinstance(n, ast.Expr)
+                                                 and isinstance(n.value, ast.Constant)
+                                                 and isinstance(n.value.value, str))],
+                                   type_ignores=[]))
+        self.assertNotIn("capture_output", code)
+        self.assertIn("DEVNULL", code)
+
+    def test_no_daemon_command_waits_on_a_pipe_anywhere(self):
+        """全仓扫：**提 wl-copy 的调用点不许出现 `capture_output`**（含注释里的反面教材除外）。
+
+        已逐条确认过的例外写在下面（都是普通命令，父进程写完即退）：
+          * `capsplus/extcheck.py`：探索用外部命令（一次性）
+          * `capsplus/shot_ocr.py`：本地 OCR 的 `python -c`（跑完即退）
+          * `capsplus/shot_capture.py`：`journalctl`（读完即退）
+          * `capsplus/apply.py` / `capsplus/mapping_overrides.py`：keyd/工具命令（一次性）
+          * `capsplus/voice_inject.py`：**有意为之** —— 那边自己分了"守护步 vs 普通步"两类等法
+        """
+        allow_files = {"voice_inject.py"}
+        offenders = []
+
+        def code_strings_and_kwargs(fn):
+            """一个函数里**代码**用到的字符串常量与关键字参数（不含文档字符串）。"""
+            body = [n for n in fn.body
+                    if not (isinstance(n, ast.Expr) and isinstance(n.value, ast.Constant)
+                            and isinstance(n.value.value, str))]
+            strings, kwargs = [], []
+            for sub in ast.walk(ast.Module(body=body, type_ignores=[])):
+                if isinstance(sub, ast.Constant) and isinstance(sub.value, str):
+                    strings.append(sub.value)
+                if isinstance(sub, ast.keyword) and sub.arg:
+                    kwargs.append(sub.arg)
+            return strings, kwargs
+
+        for path in sorted((REPO / "capsplus").glob("*.py")):
+            if path.name in allow_files:
+                continue
+            tree = ast.parse(path.read_text(encoding="utf-8"))
+            for node in ast.walk(tree):
+                if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    continue
+                strings, kwargs = code_strings_and_kwargs(node)
+                if "capture_output" not in kwargs:
+                    continue
+                if any("wl-copy" in s or "wl-paste" in s for s in strings):
+                    offenders.append(f"{path.name}:{node.lineno}({node.name})")
+        self.assertEqual(offenders, [],
+                         f"这些点可能在等一条没人关的管子：{offenders}")
 
 
 if __name__ == "__main__":

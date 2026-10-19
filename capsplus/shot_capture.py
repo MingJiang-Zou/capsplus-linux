@@ -152,6 +152,18 @@ def command_region(args, deps=None) -> int:
     if monitors is None:
         monitors, _display = _monitor_geometry(deps)
     freeze_fn = deps.get("freeze") or (lambda mons: SFR.freeze(mons, capture_fn))
+    try:
+        return _region_flow(args, deps, monitors, freeze_fn, select, annotate_fn, providers, pin_fn,
+                            SFR)
+    finally:
+        # **四条路都清**（成功 / 失败 / 异常 / 用户取消）：冻结帧在 tmpfs 上，不清就是吃内存的
+        # 泄漏（lead 实测 41 个文件 108MB）。留最近几个给排障，见 `cleanup_runtime` 的注释。
+        if not deps.get("keep_frames"):
+            SFR.cleanup_runtime(keep=deps.get("keep") or SFR.KEEP_FRAMES)
+
+
+def _region_flow(args, deps, monitors, freeze_fn, select, annotate_fn, providers, pin_fn, SFR) -> int:
+    """`command_region` 的主体（外面那层负责 finally 清冻结帧）。"""
     frames, union, fmsg = freeze_fn(monitors)
     if not frames:
         print(f"✗ 先冻结再选这条链没走通：{fmsg}", file=sys.stderr)
@@ -282,6 +294,10 @@ def parse_args(argv):
     p.add_argument("--pin", metavar="PNG", help="把一张图钉在屏幕上（真置顶）")
     p.add_argument("--clear-pins", action="store_true",
                    help="清空屏幕上所有贴图（`Caps+Esc` 全局兜底走这条；没有贴图时也安全）")
+    p.add_argument("--clean", action="store_true",
+                   help="清掉冻结帧（tmpfs 上的中间产物；默认留最近 2 个给排障）")
+    p.add_argument("--keep", type=int, default=None, help="配 --clean：留几个（默认 2）")
+    p.add_argument("--runtime-usage", action="store_true", help="看冻结帧目录现在多大、几个文件")
     p.add_argument("--ocr-status", action="store_true", help="看 OCR 两条后端现在什么状态")
     p.add_argument("--install-local-ocr", action="store_true",
                    help="一条命令装本地 OCR（下载 ~136MB、占盘 ~392MB、模型随包带；走镜像约 40 秒）")
@@ -307,6 +323,19 @@ def main(argv=None) -> int:
             print(rec.get("raw", ""))
         return 0
 
+    if args.runtime_usage:
+        from capsplus import shot_frames as SFR
+        usage = SFR.runtime_usage()
+        mb = usage["bytes"] / 1048576.0
+        print(f"冻结帧目录：{SFR.runtime_dir()}\n  文件 {usage['files']} 个、占用 {mb:.1f} MB")
+        return 0
+    if args.clean:
+        from capsplus import shot_frames as SFR
+        keep = 2 if args.keep is None else max(0, args.keep)
+        result = SFR.cleanup_runtime(keep=keep)
+        freed = result["freed"] / 1048576.0
+        print(f"✓ 清掉 {result['removed']} 个冻结帧、释放 {freed:.1f} MB，留下 {result['left']} 个")
+        return 0
     if args.ocr_status:
         from capsplus import shot_ocr
         print(shot_ocr.describe())

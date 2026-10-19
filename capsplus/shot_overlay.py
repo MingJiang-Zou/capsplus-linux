@@ -724,11 +724,35 @@ class Overlay:
         return True
 
     def _on_motion_event(self, _widget, event, idx):
-        if self.on_motion(idx, (int(event.x), int(event.y))) != ACTION_IGNORE:
-            self._redraw()
+        """鼠标移动：**只重画该重画的那一块**（性能体检 B3）。
+
+        原来是 `invalidate_rect(None, ...)` = **每块屏整幅重画**，而指针一动就来一次；
+        整幅重画实测 p50 ≈ 18 ms（已超过 60Hz 一帧的 16.7ms），三块屏还要各来一遍。
+        现在：算出"放大镜旧位置 ∪ 新位置"这一小块，只让**指针所在那块屏**重画它。
+        """
+        before = self._pointer_dirty_rect(idx)
+        moved = self.on_motion(idx, (int(event.x), int(event.y)))
+        after = self._pointer_dirty_rect(idx)
+        if before and after:                     # 两个小矩形的并集（旧位置也要重画，不然留残影）
+            x0 = min(before[0], after[0]); y0 = min(before[1], after[1])
+            x1 = max(before[0] + before[2], after[0] + after[2])
+            y1 = max(before[1] + before[3], after[1] + after[3])
+            dirty = (x0, y0, x1 - x0, y1 - y0)
         else:
-            self._redraw()          # 十字准线跟着指针走
+            dirty = None
+        if moved == ACTION_IGNORE or dirty is None:
+            self._redraw()                                  # 拿不准就整幅（宁可慢也别花屏）
+        else:
+            self._redraw(dirty=dirty, idx=idx)
         return True
+
+    def _pointer_dirty_rect(self, idx):
+        """指针附近需要重画的那一小块（放大镜盒 + 准线，用窗口坐标）。"""
+        if idx >= len(self.windows) or not self.pointer or self.pointer[0] != idx:
+            return None
+        x, y = self.pointer[1]
+        size = MAG_SIZE + 2 * MAG_GAP
+        return (max(0, int(x - MAG_GAP)), max(0, int(y - MAG_GAP)), size, size)
 
     def _on_release_event(self, _widget, _event, idx):
         self.on_release()
@@ -763,7 +787,16 @@ class Overlay:
         self.rect = nudge_rect(self.rect, dx, dy, self.union)
         return True
 
-    def _redraw(self):
+    def _redraw(self, dirty=None, idx=None):
+        """整幅重画（`dirty=None`）或只重画一小块（给 B3 的省法）。"""
+        if dirty is not None and idx is not None and idx < len(self.windows):
+            win = self.windows[idx]
+            gdk_win = win.get_window()
+            if gdk_win is not None:
+                _Gtk, Gdk, _GLib = _gtk()
+                x, y, w, h = dirty
+                gdk_win.invalidate_rect(Gdk.Rectangle(x=x, y=y, width=int(w), height=int(h)), False)
+                return
         for win in self.windows:
             if win.get_window() is not None:
                 win.get_window().invalidate_rect(None, False)

@@ -14,6 +14,8 @@
 
 import os
 import pathlib
+import shutil
+import tempfile
 import sys
 import unittest
 
@@ -248,5 +250,127 @@ class TestHelpers(unittest.TestCase):
                 os.environ["XDG_RUNTIME_DIR"] = old
 
 
+if __name__ == "__main__":
+    unittest.main()
+
+
+@unittest.skipUnless(HAVE_CAIRO, "没有 pycairo：这条要真造图")
+class TestRuntimeCleanup(unittest.TestCase):
+    """冻结帧清理（**必须修的那条内存泄漏**）：tmpfs 上的中间产物，流程结束就该走。
+
+    lead 实测：`/run/user/1000/capsplus-shot/` **41 个文件、108MB**（`/run` 是 tmpfs ⇒ 吃的是内存，
+    每张 6400×1440 PNG ≈ 3.4MB）。判据按"跑 N 次之后文件数与占用**不增长**"来钉。
+    """
+
+    def setUp(self):
+        import shutil
+        self.dir = tempfile.mkdtemp(prefix="capsplus-runtime-test-")
+        self.addCleanup(lambda: shutil.rmtree(self.dir, ignore_errors=True))
+        self.out = pathlib.Path(self.dir)
+
+    def _fill(self, count, size=2048):
+        for i in range(count):
+            path = self.out / f"freeze-x-{i}.png"
+            path.write_bytes(b"x" * size)
+            os.utime(path, (1000 + i, 1000 + i))       # 明确的先后顺序
+
+    def test_keeps_only_the_newest(self):
+        self._fill(6)
+        result = SFR.cleanup_runtime(keep=2, out_dir=self.out)
+        self.assertEqual(result["removed"], 4)
+        self.assertEqual(result["left"], 2)
+        left = sorted(p.name for p in self.out.iterdir())
+        self.assertEqual(left, ["freeze-x-4.png", "freeze-x-5.png"], "留的必须是**最新的**那几个")
+
+    def test_never_grows_after_repeated_runs(self):
+        """跑很多次之后，目录里的文件数**不许**随着次数线性涨（泄漏就是这个形状）。"""
+        for _ in range(10):
+            self._fill(1)
+            SFR.cleanup_runtime(keep=SFR.KEEP_FRAMES, out_dir=self.out)
+        usage = SFR.runtime_usage(out_dir=self.out)
+        self.assertLessEqual(usage["files"], SFR.KEEP_FRAMES,
+                            f"清了还是涨：{usage['files']} 个文件")
+
+    def test_keep_zero_is_allowed(self):
+        self._fill(3)
+        self.assertEqual(SFR.cleanup_runtime(keep=0, out_dir=self.out)["left"], 0)
+
+    def test_missing_dir_is_not_an_error(self):
+        result = SFR.cleanup_runtime(keep=2, out_dir=pathlib.Path(self.dir) / "nope")
+        self.assertEqual(result["removed"], 0)
+
+    def test_usage_reports_files_and_bytes(self):
+        self._fill(3, size=100)
+        usage = SFR.runtime_usage(out_dir=self.out)
+        self.assertEqual(usage["files"], 3)
+        self.assertEqual(usage["bytes"], 300)
+
+    def test_region_flow_cleans_up_on_every_path(self):
+        """**四条路都清**，而且是**反复跑也不涨**（只跑一次的断言挡不住泄漏 —— 实测过）。
+
+        每条路各跑 5 次（同一个目录），断言结束时文件数 ≤ keep、占用也就是那么几张的量。
+        """
+        from capsplus import shot_capture as SC
+        ok_select = lambda f, m: ((0, 0, 10, 10), None)          # noqa: E731
+        cases = {
+            "成功": {"select": ok_select},
+            "冻结失败": {"freeze": lambda m: ([], (0, 0, 10, 10), "✗ 没抓到"), "select": ok_select},
+            "几何自检失败": {"select": lambda f, m: (None, "✗ 遮罩尺寸没对上")},
+            "选区抛异常": {"select": lambda f, m: (_ for _ in ()).throw(RuntimeError("崩"))},
+        }
+        for name, over in cases.items():
+            with self.subTest(case=name):
+                runtime = pathlib.Path(tempfile.mkdtemp(prefix="capsplus-runtime-flow-"))
+                self.addCleanup(lambda rt=runtime: shutil.rmtree(rt, ignore_errors=True))
+                stored = []
+
+                def capture(x, y, w, h, out, _stored=stored):
+                    surface = cairo.ImageSurface(cairo.FORMAT_ARGB32, max(1, w), max(1, h))
+                    surface.write_to_png(str(out))
+                    _stored.append(pathlib.Path(out))
+                    return True, "✓"
+
+                def freeze_fn(mons, _rt=runtime, _c=capture):
+                    # 真实现里 PNG 落在 runtime_dir；这里指到我们这块临时目录
+                    return SFR.freeze(mons, _c, out_dir=_rt)
+
+                deps = {"monitors": [(0, 0, 40, 30)], "capture": capture,
+                        "freeze": over.get("freeze") or freeze_fn,
+                        "select": over["select"],
+                        "annotate": lambda *a, **k: ("close", None, ""),
+                        "no_pin": True, "no_text": True}
+                args = SC.parse_args(["--region", "--out", str(runtime / "out.png")])
+                original = SFR.runtime_dir
+                cleanup_calls = []
+                real_cleanup = SFR.cleanup_runtime
+                # ⚠ 必须**盯着调用点**：只数目录里的文件挡不住"把 finally 里的清理删掉"——
+                # 冻结帧同名会被后一次覆盖/被排障保留策略挡住（实测这条反例当时没红）。
+                SFR.cleanup_runtime = lambda *a, **k: (cleanup_calls.append(k),
+                                                       real_cleanup(*a, **k))[1]
+                SFR.runtime_dir = lambda: runtime          # 让它清的是我们这块临时目录
+                try:
+                    for _ in range(5):
+                        if name == "选区抛异常":
+                            with self.assertRaises(RuntimeError):
+                                SC.command_region(args, deps)
+                        else:
+                            SC.command_region(args, deps)
+                finally:
+                    SFR.runtime_dir = original
+                    SFR.cleanup_runtime = real_cleanup
+                self.assertGreaterEqual(len(cleanup_calls), 1,
+                                       f"{name} 这条路**没有调用**清理（finally 被删了？）")
+                left = [p for p in runtime.iterdir()] if runtime.is_dir() else []
+                self.assertLessEqual(len(left), SFR.KEEP_FRAMES,
+                                     f"{name} 这条路跑 5 次后还剩 {len(left)} 个文件"
+                                     f"（{[p.name for p in left]}）—— 清漏了")
+                # 冻结那几条路确实产出过帧（否则这条判据是在空转）
+                if name != "冻结失败":
+                    self.assertTrue(stored or name in ("几何自检失败", "选区抛异常"),
+                                    f"{name}：没有帧被写出来，判据可能是空转的")
+
+
+if __name__ == "__main__":
+    unittest.main()
 if __name__ == "__main__":
     unittest.main()
