@@ -207,3 +207,106 @@ screenshotUIGroup / keyboardBox 放到所有窗口之上，`layout.js` 的注释
       env -u WAYLAND_DISPLAY GDK_BACKEND=x11 CAPSPLUS_GUI=1 \
       python3 -m unittest tests.test_shot_overlay tests.test_shot_annotate
 信号链路的真机自证夹具在 `~/.dsh/scripts/capsplus-shot/fixtures/ipc-selftest/`（`run.sh` 一条命令跑完）。
+
+## 七、第二批（2026-10-19）：冻结帧遮罩 / 贴图删除路径 / F2-F4 / OCR / 翻译
+
+### 7.1 P0：遮罩改成「**先冻结、再选**」
+明江真机反馈「框选的时候全黑屏是盲选」——旧版靠"全屏半透明窗 + 压暗 + 指望合成器透出桌面"，
+**Wayland 下拿不到 ARGB 表面时那层"透明"就是全黑**，而 xvfb（X11 有 ARGB 视觉）永远复现不了，
+当时那批像素判据全绿也拦不住。现在的链路（**顺序不能改**）：
+
+    freeze（抓一张联合矩形，不可见）→ 遮罩（每屏一窗，背景 = 该屏冻结图，**不透明**）
+      → 从冻结图裁剪（跨屏就每屏各裁一块再拼）→ 标注窗
+
+* 新模块 `capsplus/shot_frames.py`：`freeze()` / `slice_frames()` / `crop_from_frames()` / `snap_rect()`；
+  缩放按"抓回来的图多大"反推（本机实测 `scale=1`），**不硬编码**。
+* 选区走**全局逻辑坐标** ⇒ 拖出单屏、**跨屏**都成立；`Ctrl+A` = 整个联合矩形，双击 = 指针那块屏，
+  松手贴边吸附 8px。
+* **不再二次抓帧** ⇒ 旧版那套"藏窗 → settle → 再抓一帧"整段删掉（它是为"躲自己的遮罩"存在的）。
+* shell 只允许**一个**截图操作在跑（`Only one screenshot operation at a time is permitted`，实测），
+  `freeze()` 遇到这个标记会**重试**（用户连按属正常）。
+* 冻结失败 ⇒ **不开遮罩**、退出码非零：宁可说"这次没成"，也不给全黑盲选的窗。
+
+### 7.2 P0：贴图删得掉（样式表 + 五条路径 + 模态 Esc）
+`extensions/raise-browser@capsplus.example/stylesheet.css` **以前根本不存在**，而 extension.js 一直在用
+`capsplus-pin` / `capsplus-pin-close` / `capsplus-pin-box` ⇒ 那些 class 一个都不生效，`×` 是裸按钮
+（没尺寸、没背景、没 hover），这就是「删都删不掉」的直接原因。现在：
+
+* 样式表定义：贴图边框/圆角/投影、工具按钮（尺寸 + hover + active）、焦点态 `.capsplus-pin-active`；
+* **五条关闭路径**（全部收敛到 `destroyPin`）：hover 工具条（复制 / 存盘 / ×）、右键菜单（关闭 /
+  复制 / 存盘 / 透明度± / 清空全部）、双击、**模态 Esc**、`Caps+Esc` 全局兜底
+  （新信号 `ClearPins` + 新子命令 `capsplus-shot --clear-pins`，**没有贴图时也安全**）；
+* 模态那段是从 shell 自己的 JS 里读出来的（`gresource extract /usr/lib/gnome-shell/libshell-18.so
+  /org/gnome/shell/ui/main.js`）：`Main.pushModal(actor)` 返回 `Clutter.Grab`、`Main.popModal(grab)`
+  收那个 grab、actor 销毁时自动 pop、`set_key_focus` 由 pushModal 自己做（与 `can_focus` 无关）；
+  它抓**键盘+鼠标** ⇒ 点到窗外要**主动交还焦点**（代价：那一下点击被吞，注释里写明了）；
+* `tools/install-extension.sh` 补上复制 `stylesheet.css`（扩展目录是**复制**不是软链，
+  安装脚本漏了它 ⇒ 仓里改得再对，shell 那边还是裸控件）。
+* **契约变化**：`PinImage` 从 `(siiiis)` → `(ssiiiis)`（多一个 PNG 路径：工具条的"复制/存盘"要 PNG 字节，
+  用法抄 shell 自己的 `screenshot.js` 的 `St.Clipboard.set_content(…,'image/png',bytes)`）。
+
+### 7.3 F2/F3/F4 + 结果面板 + 标注增强
+* 窗内键位**只定义在一处**（`key_command()`）：F2 翻译 / F3 贴图 / F4 OCR；与 Esc / Ctrl+C / Ctrl+S /
+  Ctrl+Z(Y) 不冲突；**回车留给第一批的"确认选区"语义**（不抢）。失焦时底部提示条换成
+  「窗口没有焦点：F2/F3/F4 现在**不会**生效……点一下窗口再按」。
+* 面板（`capsplus/shot_panel.py`）：后端**一眼看清**（本地/云）、原文/译文两栏可切、复制、
+  「送去翻译」**只认 OCR 原文**（防越翻越走样）、出错给可操作下一步。
+* 标注增强：荧光笔（强制半透明 α=0.35）、序号圆标（自动 1,2,3…）、颜色 5 档 + 线宽 3 档。
+* F2/F4 **不冻界面**：后台线程 + **信箱**（主循环 50ms 轮询）。⚠ 别改回从 worker 里调
+  `GLib.idle_add` —— PyGObject 下那样会**把堆搞坏**（判据连跑三轮崩两次，实测见 7.5）。
+
+### 7.4 OCR / 翻译的两条后端（实测数字见 7.5）
+* OCR：`local`（RapidOCR + onnxruntime 跑在**独立 venv**，主进程用子进程调 `shot_ocr_local.py`）/
+  `cloud`（百度 `accurate_basic`，凭据读 `~/.dsh/skills/ocr/.env`）。`CAPSPLUS_OCR=auto|local|cloud`，
+  `auto` = **本地优先**（离线不花钱），本地没装才上云；两边都没有 ⇒ 明确说清"装什么/缺哪个凭据"。
+* 翻译：`local` = 本机 `http://127.0.0.1:12087/v1`（`qwen3.8-27b`，**只吃文本**，实测
+  `modalities.vision=false`）/ `cloud` = 阿里 token-plan 的 `deepseek-v4.1-flash`（**多模态，可直读图**）。
+  云端的 base_url 取自 `~/.bailian/config.json`，**必须补 `/compatible-mode/v1`**（站点根直接拼
+  `/chat/completions` 会 404，实测）。本机偏好时"没有 OCR 原文"会提示先按 F4；切到云之后 F2
+  可以**直接读图**（跳过 OCR）。
+* 自查命令：`capsplus-shot --ocr-status` / `--translate-status`。
+
+### 7.5 第二批的实测数字（真机，2026-10-19）
+| 项 | 数字 | 怎么来的 |
+| --- | --- | --- |
+| 云端 OCR（百度 accurate_basic） | **391 ms**（640×360、3 行、含取 token） | 自己画的测试图，`shot_ocr.ocr_cloud()` |
+| 本机翻译（qwen3.8-27b） | **1038 ms**（两行文本） | `shot_translate.translate_local()` |
+| 抓帧（冻结那一下） | 4–19 ms（shell 侧） | journal `shot result=ok … ms=` |
+| PyGObject 跨线程调 GLib | 判据连跑 3 轮崩 2 次（`corrupted size vs. prev_size`） | 改信箱后 5/5 稳定 |
+
+### 7.6 第二批的判据
+| 判据文件 | 钉什么 |
+| --- | --- |
+| `tests/test_shot_frames.py` | 联合矩形只抓一次 / 按屏切 / 忙等重试 / 跨屏裁剪的内容来源 / 吸附确定性 |
+| `tests/test_shot_overlay.py`（重写） | **背景必须是冻结图**（图案在不在，不看 alpha）/ 整块画布不透明 / 跨屏各画自己那块 / 整屏捷径 / 无动画 |
+| `tests/test_raise_pin_ui.py` | 样式表存在且"用到几个 class 就定义几个" / ≥3 条关闭路径（含 `ClearPins` 与 `--clear-pins`）/ **pushModal-popModal 配对** / 重复订阅去重 / `node --check` 语法 / 部署同步 |
+| `tests/test_shot_panel.py` | 后端标签 / 两栏切换 / 复制口径 / "送去翻译只认 OCR 原文" / 出错话术 |
+| `tests/test_shot_ocr.py` / `test_shot_translate.py` | 后端选择（本地优先、明确指定却不可用要拒绝）/ 助手 JSON 协议 / token 缓存 / 失败话术可操作 / **云直读图真的把图发出去了** / base_url 补兼容路径 |
+| `tests/test_shot_text.py` | 接线层：画面落 PNG / 偏好翻得动 / 只有云能直读图 / 与窗的接口名 |
+
+### 7.7 GTK3 上的两个真机坑（都已进判据，别改回去）
+
+**① 全屏窗口必须先给尺寸**：`win.realize()` → `fullscreen_on_monitor()` → `show_all()` 会让窗口停在
+GTK toplevel 的默认 **200×200**（mutter 把这张 stale 缓冲拉伸铺满整屏 ⇒ 看着像"整屏纯黑 / 一块矩形"）。
+正确顺序（xvfb 顺序探针实测：旧顺序 device=200×200，新顺序 device=1600×900 = 期望）：
+
+    win.set_default_size(mon_w, mon_h)      # 先给尺寸
+    win.fullscreen_on_monitor(screen, idx)  # 再全屏到该屏
+    win.show_all()                          # 最后显示；不要提前 realize()
+
+map 之后还要**自检**：窗口尺寸 == 该屏逻辑尺寸（× scale），不对就 `resize` 重试，仍不对就**关掉遮罩 +
+说清期望/实得**（`select_region` 返回 `(rect, failure)`；`command_region` 不写文件、退出码 1）。
+自检放行"设备像素 / 逻辑像素"两种解释（Wayland 上 GDK 报哪种没有定论，认死一种会变成"每次自检失败自动关窗"）。
+
+**② `draw` 里自定义绘制必须 `return True`**：`GtkWidget::draw` 的**默认处理器跑在自定义处理器之后**，
+会把控件自己的主题背景（Adwaita `#fafafa ≈ 250`）刷在我们的画上面 —— 表现是"窗口尺寸全对、屏幕整块纯白"
+（2026-10-19 真机：抓屏实测均匀 **250.0**、标准差 **0.0**；`return True` 之后同一块量到 **163.3 = 250×0.65**
+= 真实桌面 × 压暗）。
+
+**判据纪律（那次漏测的根因）**：`Gtk.DrawingArea` **没有自己的背景** ⇒ 拿它测不出"窗口背景有没有盖上来"，
+会**假绿**。这类判据必须用**真 `Gtk.Window`**（`Gtk.OffscreenWindow` 就是 `Gtk.Window` 子类，走真实主题背景
+路径），连接窗口自己的 `draw`、渲染后 `Gdk.pixbuf_get_from_window` 读回像素，断言"是帧内容 + 压暗、
+不是主题底色/纯色"。现有对照（同一反例具型"删掉 `return True`"下）：
+`TestWindowsBackgroundNotOverpaint`（真 Window）**红 4 条**且复现出 `mean=0.980 std=0.000` 那一片纯白；
+`TestRealWidgetDrawPath`（DrawingArea）**仍然全绿** —— 它只证明"draw 处理器把内容画对了"，
+证明不了"没人盖在上面"。

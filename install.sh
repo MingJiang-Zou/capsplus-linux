@@ -102,7 +102,7 @@ PY
 
 echo "== 安装 bin 软链 =="
 mkdir -p "$BIN_DIR"
-for name in capsplus capsplus-tray capsplus-qbar capsplus-settings keyd-qbar-cmd capsplus-voice; do
+for name in capsplus capsplus-tray capsplus-qbar capsplus-settings keyd-qbar-cmd capsplus-voice capsplus-shot; do
   ln -sfn "$REPO/bin/$name" "$BIN_DIR/$name"
   echo "  $BIN_DIR/$name -> $REPO/bin/$name"
 done
