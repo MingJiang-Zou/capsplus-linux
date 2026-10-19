@@ -742,8 +742,7 @@ def copy_to_clipboard(data: bytes, runner=None, which=None) -> tuple:
     which = which or shutil.which
     if which("wl-copy") is None:
         return False, "✗ 这台机没有 wl-copy（Wayland 剪贴板工具没装）"
-    runner = runner or (lambda argv, data: subprocess.run(argv, input=data, timeout=5,
-                                                          capture_output=True))
+    runner = runner or _default_clipboard_runner
     try:
         proc = runner(clipboard_command(), data)
     except (OSError, subprocess.TimeoutExpired) as exc:
@@ -752,6 +751,21 @@ def copy_to_clipboard(data: bytes, runner=None, which=None) -> tuple:
         err = getattr(proc, "stderr", b"") or b""
         return False, f"✗ wl-copy 退出码 {proc.returncode}：{err[:200].decode(errors='replace')}"
     return True, "✓ 已复制到剪贴板"
+
+
+def _default_clipboard_runner(argv, data):
+    """喂 `wl-copy`：**只等父进程退出，绝不接管道的另一端**。
+
+    ⚠ 2026-10-19 真机事故（明江："我多按几次 Ctrl+C 程序就会异常"）：`wl-copy` 会 fork 一个
+    **长期存活的"留守者"**替你守剪贴板，而它 fork 前只把 stdin/stdout 换成 /dev/null，
+    **stderr 原样继承** ⇒ 用 `capture_output=True` 就等于在等一条永不 EOF 的管道：
+    实测每次复制 `ok=False`、**卡满 5 秒 timeout**（主线程被冻住，连按几次就堆成"程序异常"），
+    而同一命令不接管道是 **rc=0、0.03 秒**。
+    与 `voice_inject.run_step` 的"守护步"是同一条规矩（那边 2026-10-19 上午刚踩过同一个坑）：
+    守护型命令不许用管道 EOF 当结束信号，输出直接丢给 DEVNULL（`returncode` 照样拿得到）。
+    """
+    return subprocess.run(argv, input=data, timeout=5,
+                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 
 def save_named(base_surface, shapes, directory=None):
