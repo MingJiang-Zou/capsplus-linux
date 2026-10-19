@@ -134,10 +134,27 @@ def binding_notes(which: str = "capl") -> dict[str, str]:
     return out
 
 
+def editable_keys(which: str) -> list[str]:
+    """该层设置页要列出的**键位全表**（含空位），顺序照参考实现的声明顺序。
+
+    空位 = 参考实现声明过、仓库默认没绑定的键（数字键 / F1-F12 / 字母 m、z 之类）。
+    表外的键（覆盖层自己造的名字）不在这一列里，但 `binding_rows` 照样会把它列出来。
+    """
+    return list(MD.EDITABLE_KEYS.get(which, ()))
+
+
 def binding_rows(which: str, mapping_data=None) -> list[tuple[str, str, str, str]]:
-    """一个层的绑定表：[(键, 动作, 说明, 来源)]，来源 = "默认" / "覆盖"。
+    """一个层的**设置页行表**：[(键, 动作, 说明, 来源)]，来源 = "默认" / "覆盖"。
 
     设置界面的「当前生效映射」表格直接用这个（不解析 Python 源码，也不解析 conf 文本）。
+
+    行分三类，顺序也是这三类（2026-10-19 加空位，起因：明江要"设置页里能配数字键与 F1-F12"）：
+      ① 仓库默认声明过的键 —— 位置不动；被覆盖层改过就换成覆盖值、来源变「覆盖」。
+      ② 空位 —— 参考实现声明过、仓库默认没绑定的键（数字键 / F1-F12 / m、z 等）：
+         动作是空串、说明写"空位"、来源算「默认」（它的状态确实来自仓库默认 = 没绑定）。
+         keyd 的层对没绑定的键是**放行**（按住 Caps 按数字键本来就照原样出数字），
+         所以空位**不渲染**、默认行为一个字都不变；用户在设置页给空位填了动作才真的生成绑定。
+      ③ 覆盖层新加的键 —— 追加在段尾（`merge_overrides` 的既有规则，与渲染出来的位置一致）。
 
     动作与渲染出来的一致（`@CAPSPLUS_BINDIR@` 已换成真实目录）—— 界面上看到什么，
     keyd 配置里就是什么，不许出现"表格里是记号、配置里是路径"两套话。
@@ -148,11 +165,17 @@ def binding_rows(which: str, mapping_data=None) -> list[tuple[str, str, str, str
     notes = binding_notes(which)
     default = dict(MD.SECTIONS).get(which, [])
     default_map = {e[0]: e[1] for e in default if not isinstance(e, str)}
-    out: list[tuple[str, str, str, str]] = []
+    declared: list[tuple[str, str, str, str]] = []
+    appended: list[tuple[str, str, str, str]] = []      # 覆盖层新加的：仍在段尾
+    present: set[str] = set()
     for entry in rows:
         if isinstance(entry, str):
             continue
         key, action = entry
-        source = "默认" if default_map.get(key) == action else "覆盖"
-        out.append((key, resolve_bindir_token(action), notes.get(key, ""), source))
-    return out
+        present.add(key)
+        item = (key, resolve_bindir_token(action), notes.get(key, ""),
+                "默认" if default_map.get(key) == action else "覆盖")
+        (declared if key in default_map else appended).append(item)
+    empty = [(key, "", MD.EMPTY_KEY_NOTE, "默认")
+             for key in editable_keys(which) if key not in present]
+    return declared + empty + appended

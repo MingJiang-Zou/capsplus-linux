@@ -152,6 +152,51 @@ SECTIONS = [
     ("capl+alt", CAPL_ALT),
 ]
 
+# ---------------------------------------------------------------------------
+# 设置页的键位全表（"这个软件一共能配哪些键位" —— 与 SECTIONS 是两件事）
+# ---------------------------------------------------------------------------
+# SECTIONS 回答的是"仓库默认绑定了什么"（渲染的唯一真相源）；
+# EDITABLE_KEYS 回答的是"设置页里能编辑哪些键位"。两者差出来的部分 = **空位**：
+# 参考实现声明过、本仓默认没绑定的键（数字键 / F1-F12 / 字母 m、z / 一批符号）。
+#
+# 来源：官方 lib/lib_keysSet.ahk 的 keySchemeInit_capslox()（默认方案）里 keyset.caps_* 与
+# keyset.caps_lalt_* 的**全部声明**（2026-10-19 逐行数出来的：capl 64 个、capl+alt 52 个）。
+# AHK 名 -> keyd 名：backquote=grave、quote=apostrophe、leftSquareBracket=leftbrace、
+# rightSquareBracket=rightbrace、ralt=rightalt；其余同名。顺序照参考实现的声明顺序，
+# 所以设置页里空位那一块也是"字母 -> 数字 -> 符号 -> F 键"这个先后。
+#
+# 空位**不渲染**（render 只读 SECTIONS）：keyd 的层对没绑定的键是**放行** ——
+# keyd 的 man 页「COMPOSITE LAYERS」一节原句："pressing control+alt+f1 preserves those modifiers,
+# emitting exactly what was pressed, as there is no explicit binding for f1 on the composite
+# layer"。也就是说按住 Caps 按数字键，本来就照原样出数字，默认行为一个字都没变；
+# 用户在设置页给空位填了动作，才由覆盖层把这条追加到该段段尾（`merge_overrides` 的既有规则）。
+_LETTERS = list("abcdefghijklmnopqrstuvwxyz")
+# 顺序照参考实现：1..9 再 0（对应上游 winbind 的第 1..10 个槽位）
+_DIGITS = list("1234567890")
+# 参考实现 capl 层声明过的符号与特殊键（grave 排在字母与数字之间，这是上游的顺序）
+_SYMBOLS_HEAD = ["grave"]
+_SYMBOLS_TAIL = [
+    "minus", "equal", "backspace", "tab", "leftbrace", "rightbrace", "backslash",
+    "semicolon", "apostrophe", "enter", "comma", "dot", "slash", "space", "rightalt",
+]
+_FKEYS = [f"f{i}" for i in range(1, 13)]
+
+
+def _editable_matrix(*, fkeys: bool) -> list[str]:
+    """一层可编辑键位的声明序。F 键只有基础层有（上游的 caps_lalt_* 里没有 F 键）。"""
+    keys = _LETTERS + _SYMBOLS_HEAD + _DIGITS + _SYMBOLS_TAIL
+    return keys + _FKEYS if fkeys else keys
+
+
+EDITABLE_KEYS = {
+    PRIMARY_LAYER: _editable_matrix(fkeys=True),
+    "capl+alt": _editable_matrix(fkeys=False),
+}
+
+# 设置页里空位那一行的"说明"列文案（动作列留空 —— 空位就是没有动作，别填假动作）
+EMPTY_KEY_NOTE = ("空位：仓库默认没绑定（按住 Caps 时这个键按原样输出）；"
+                  "在这行填个动作 → 「改这一格」就绑上了")
+
 # [ids] 段：* = 所有键盘
 IDS = "*"
 

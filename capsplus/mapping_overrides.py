@@ -161,13 +161,19 @@ def validate_action(action: str, known_keys: set[str] | None = None) -> str | No
 
 
 def layer_rows(known_keys: set[str] | None = None) -> list[tuple[str, str]]:
-    """覆盖层能改的 (段, 键) 全表 —— 界面下拉用，顺序与渲染一致。"""
+    """覆盖层能改的 (段, 键) 全表 —— 界面下拉用，顺序与设置页一致。
+
+    **含空位**：参考实现声明过、仓库默认没绑定的键（数字键 / F1-F12 / 字母 m、z 之类，
+    见 `mapping_data.EDITABLE_KEYS`）。空位写进覆盖层就等于给该层新增一条绑定，
+    渲染时追加在段尾（`merge_overrides` 的既有规则）。
+    顺序与 `capsplus.render.binding_rows` 一致：默认声明过的键在前，空位在后。
+    """
     rows: list[tuple[str, str]] = []
     for section, entries in MD.SECTIONS:
-        for entry in entries:
-            if isinstance(entry, str):
-                continue
-            rows.append((section, entry[0]))
+        declared = {e[0] for e in entries if not isinstance(e, str)}
+        rows += [(section, e[0]) for e in entries if not isinstance(e, str)]
+        rows += [(section, key) for key in MD.EDITABLE_KEYS.get(section, ())
+                 if key not in declared]
     return rows
 
 
