@@ -83,7 +83,8 @@ focus-out"这个事实**才注入（下限 120ms、上限兜底 400ms，见下�
   那条从"隔了 ≥100ms"改成钉**顺序**（焦点交出的事实必须早于注入）。2026-10-17 晚实跑
   `python3 -m unittest discover -s tests` → **682 条 OK（skipped=48）**；Xvfb + `CAPSPLUS_GUI=1`
   全量 → **682 条 OK（skipped=1）**。真机那三种可能（贴进自己 / 目标应用自己清掉 / `wl-copy`
-  没拿到选区所有权粘出旧内容）**还没定**，区分量都在这三行里，需要再测一次把行贴回来。
+  没拿到选区所有权粘出旧内容）**还没定** —— **2026-10-19 定了：三种可能都不是**，是"写剪贴板"那一步
+  压根没成功（`steps=0` + 耗时差 = `STEP_TIMEOUT_S`，见本轮 2026-10-19 条目）。
   详见 `docs/KNOWN-LIMITS.md`「语音输入的上屏」第 10 条。
 - **未实测清单**（只有真桌面 + 真人能清）：① 弹窗销毁后焦点是否真还给原文档（**本轮已经把"能不能
   观察到"变成了数据**：X11/Xvfb 实测 `unmap` 与 `destroy` 同步、`focus_out` 在没有窗口管理器时压根
@@ -91,7 +92,9 @@ focus-out"这个事实**才注入（下限 120ms、上限兜底 400ms，见下�
   `inject_diag` 才能定）；② `Ctrl+V` 在
   Edge / Chrome / GNOME 终端 / LibreOffice / VS Code 的实际落点与适用面；②b **剪贴板还原的真机
   时序** —— 300ms 够不够、常驻 worker 没有键盘焦点时 `wl-copy` 能不能真把选区所有权接回去
-  （实现只做"回读不一致就报 `verify_mismatch`"，不谎报已还原；真机成不成未测）；②c **中途改
+  （实现只做"回读不一致就报 `verify_mismatch`"，不谎报已还原。**2026-10-19 部分实测**：无键盘
+  焦点、无 activation token 的进程 `wl-copy` **能**把选区设成（见本轮条目），剩下的只是 300ms 这个
+  时长够不够、以及 worker 自己那条回读路在真机上的表现）；②c **中途改
   剪贴板**的实测手感（300ms 内自己拷了东西会不会频繁判否）；③ **ibus / libpinyin 在场时
   Enter 会不会被输入法吃掉**（头号风险，`voice_osd.key_action` 已备但没在真输入法下跑过）；
   ④ 打字中途按 `Caps+M`，键声会不会被误判成语音；⑤ 跨线程碰 GTK 会**段错误 rc=139**
@@ -113,6 +116,66 @@ focus-out"这个事实**才注入（下限 120ms、上限兜底 400ms，见下�
   `~/.local/state/capsplus/keyd-conf-backup/capslock-plus.conf.20261017-150609-494922`）；
   `capsplus-voice stop` 收 worker；`systemctl --user disable --now voice-svc` 收服务。
 - **`capsplus/__init__.py` 的 `__version__` 这次不动**（本仓规矩：打 tag 时与 CHANGELOG 一起同步）。
+
+### 2026-10-19 事故：上屏那一步从落地起**一次都没真贴上过字**（写剪贴板被判 5 秒超时）
+
+- **现象（明江真机 09:15）**：识别出 6 个字，焦点交出的事实也拿到了
+  （`gate=floor … visible=0 mapped=0 unmap=1 destroy=1`，**不是**"贴进自己弹窗"那个方向），随后
+  `inject_done backend=clipboard ok=0 code=step_failed steps=0`；两条耗时读数相减 = **5.0 秒**，
+  恰好是 `STEP_TIMEOUT_S` 本身 ⇒ 第一步"写剪贴板"被判失败，**Ctrl+V 从未执行**。
+- **根因（精确到 fd，别再靠"应该继承了管道"这种模糊说法）**：执行器用
+  `subprocess.run(..., capture_output=True, timeout=STEP_TIMEOUT_S=5.0)` 跑 `wl-copy`，而 `wl-copy`
+  会 **fork 一个常驻进程替它守剪贴板数据**，那个子进程**继承了 stderr 管道** ⇒ `capture_output`
+  等不到管道 EOF ⇒ `TimeoutExpired`。读 `wl-clipboard` 2.2.1 的 `src/wl-copy.c`
+  （`did_set_selection_callback`）：fork **之前**只换两个 fd ——
+  `dup2(devnull, STDOUT_FILENO)`（源码注释原话 *so the stdout file descriptor isn't kept alive*）
+  与 `dup2(devnull, STDIN_FILENO)`，**stderr 原样留着**；所以握着管道的是 stderr，而
+  `capture_output=True` 恰好把 stderr 也接了过来。⇒ **会 fork 常驻进程的命令，永远不许用"等管道
+  EOF"的方式判成败。**（同源两条：`--clear` 在同一个回调里提前 `exit(0)`、**根本不 fork**；父进程
+  退 0 只代表"数据交给了留守者"，不代表合成器把选区判给了我们 —— 见下一条。）
+- **修复（在工作树里，未提交）**：`run_step()` 分两类命令两种等法 ——
+  * **守护步**（`Step.daemonizes=True`，**一切 `wl-copy` 调用**，含 `--clear` / `--primary` / `--type`）：
+    stdout/stderr 重定向到状态目录里 **0600** 的临时文件，只等**父进程退出**（毫秒级），错误详情
+    只读**字节数**，读完 `os.unlink` **瞬毁** —— 文件里可能贴着用户剪贴板，所以它绝不进 message /
+    `voice.log` / 事件帧 / `status`（`os.unlink` 而非进焚化炉：那条红线保护的是"还要查证的现场"，
+    这里是"按设计必须瞬毁的隐私件"）；
+  * **普通步**（`ydotool` / `wl-paste`）：**维持** `capture_output=True` —— 它们的输出采集一个都
+    不许丢，一刀切等于再造一个"读不到错误"的瞎子。
+  另加**回读自证**：写完立刻 `wl-paste` 回读，rc=0 **且逐字节相同**才算写成功，否则报
+  **`owner_rejected`**（不是笼统的 `step_failed`）且**不发粘贴**；回 idle 的状态行也跟着加了
+  「上屏失败：`wl-copy` 没拿到剪贴板所有权」，**不许写成"上屏结束"**；`inject_done` 新增 `copy_ms=`
+  打点（"修好之后到底几毫秒成功"要看得见，不许再拿"没报错"当证据，没跑到写入步记 -1）。
+- **顺带把一条旧担心的假设实测排除了**：本机**没有** data-control 协议（45 个全局里 `data_control`
+  命中 0，只有核心 `wl_data_device_manager` v3 + `zwp_primary_selection_device_manager_v1`），
+  所以"无键盘焦点的进程设不了选区"此前只是**担心**；2026-10-19 11:07 实测排除 —— 从一个无键盘
+  焦点、无 activation token 的 shell 里 `wl-copy --type image/png < 5.62MiB.png`，**父进程毫秒级
+  返回、选区当场设成**（deskflow 日志 `sent clipboard size=5880052`）。`owner_rejected` 照样要报
+  （那是运行期事实），但它不再是"必然发生"的预期。
+- **判据**：新增 `tests/test_voice_daemonized_copy.py`（**16 条**：真子进程"父退、守护进程还握着
+  管道活着"的三种管道组合、写自证全链隐私条、"成功 / 失败 / 超时"三条路径的临时文件都必须销毁）
+  —— **改动前 14/16 红**。工作树稳定后重跑的实测数（**两种口径、各自跑法与结果**，2026-10-19 11:52
+  本机，**含并发分身在写的截图线用例**）：
+  * 默认口径：`python3 -m unittest discover -s tests` → **Ran 863 tests / OK (skipped=53)**，`rc=0`（38.6s）；
+  * 无 gi 口径：`PYTHONPATH=tools/ci/nogi CAPSPLUS_NOGI_SUB=1 python3 -m unittest discover -s tests`
+    → **Ran 863 tests / OK (skipped=89)**，`rc=0`（19.2s）。
+  ⚠ 早先这里写过的「769 条 OK（skipped=48）」是 **11:15 那一刻**的快照，已被上面这组取代；
+  条数会跟着并发分身的工作继续变 —— 任何一次都是有跑法的**实测**，但都不是"现状"，别拿它当第二份真相。
+- **「先占后贴」还没接线（写清楚，别当成已做）**：`copy` 与 `paste` 在时间上本就可以分开 ——
+  弹窗还活着、我们还有焦点时先把数据交给 `wl-copy`，销毁窗口、焦点归还之后再发 Ctrl+V。本轮只把
+  **形状**备到位（每步可独立执行 / 自证是独立函数 / `InjectResult` 带 `copy_ms`·`stages`·`commands`），
+  **故意不接线**（真机还没证明需要它，提前动时序等于把 `test_voice_focus_gate` 钉住的东西再拆一遍）。
+  真要做的成本（下面每个数都是**量出来的改动面**，不是估的）：
+  `voice_inject.inject()` 现在是 118 行一次跑完四段，要拆成"占 / 贴"两次可独立调用；
+  `voice_worker.py` 三个函数（`_arm_inject` 49 行、`_inject_with_diagnosis` 16 行、
+  `_inject_directly` 27 行）要改成"武装**之前**先在后台线程跑占、焦点交出的事实到了再跑贴"；
+  直接钉在这条链上的既有用例 **23 条**（`test_voice_clipboard` 2 + `test_voice_focus_gate` 15 +
+  `test_voice_daemonized_copy` 6）要跟着改口径，主线程名册 `MAIN_PATH_FUNCS`（13 个名字）与
+  `tools/verify-voice-mainloop.sh` 要同步，最后真机再验一次。
+  **行为代价**：剪贴板被我们占住的时间窗口从"粘贴后 300ms 起算"变成"弹窗还活着就开始占"，
+  多占的正是 `finish→unmap` 那一段（真机 `inject_diag` 里能直接读出来，本轮**未测**）。
+- **回滚**：本次改动只在 `capsplus/voice_inject.py` 与 `capsplus/voice_worker.py`（后者只加了
+  `copy_ms=` 打点与 `owner_rejected` 那行"上屏失败"的措辞），`git checkout` 这两个文件即回；
+  回滚后症状是"识别成功、报 `step_failed`、一个字都不上屏"（也就是这轮之前的状态）。
 
 ---
 

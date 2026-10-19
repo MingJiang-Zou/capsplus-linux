@@ -20,10 +20,78 @@
     primary    备份 → wl-copy --primary → ydotool 中键 → 条件还原（X11 传统的"选中即粘贴"，光标得在输入区）
     manual     什么都不注入，文本留在弹窗里，用户自己复制粘贴（零风险兜底，**也完全不碰剪贴板**）
 
-上屏的完整时序（2026-10-17 补上剪贴板备份 / 条件还原，别再退回"只写不备"）：
+上屏的完整时序（2026-10-17 补上剪贴板备份 / 条件还原；2026-10-19 补上**回读自证**）：
 
-    snapshot_clipboard() → wl-copy <文本> → ydotool Ctrl+V → 等 CLIPBOARD_SETTLE_MS
+    snapshot_clipboard() → wl-copy <文本> → **回读自证**（读回来的逐字节 == 我们写的才算写上）
+                         → ydotool Ctrl+V → 等 CLIPBOARD_SETTLE_MS
                          → **条件还原**（只有"剪贴板里还是我们写的那段"才还原）→ 释放快照
+
+### 2026-10-19 的事故：这个功能从落地起**一次都没真贴上过字**
+
+真机取证（明江 09:15）：识别 6 字，焦点事实拿到了（`gate=floor … visible=0 mapped=0 unmap=1
+destroy=1`，**不是**"贴进自己弹窗"），5 秒后 `inject_done backend=clipboard ok=0 code=step_failed
+steps=0` —— 55 减 50 恰好 `STEP_TIMEOUT_S = 5.0`。根因：执行器用
+`subprocess.run(..., capture_output=True, timeout=STEP_TIMEOUT_S)` 跑 **`wl-copy`**，而 `wl-copy`
+会 **fork 一个常驻进程替它守剪贴板数据**，那个子进程**继承了 stderr 管道** ⇒
+`capture_output` 等不到管道 EOF ⇒ `TimeoutExpired` ⇒ 第一步"写剪贴板"被判失败，Ctrl+V 从未执行。
+**会 fork 常驻的命令，永远不许用"等管道 EOF"的方式判成败。**
+
+精确到 fd（2026-10-19 读 `wl-clipboard` 2.2.1 `src/wl-copy.c` 的 `did_set_selection_callback`
+实证，别再靠"应该继承了管道"这种模糊说法）——它在 fork **之前**只换了两个 fd：
+
+    dup2(devnull, STDOUT_FILENO);   /* 源码注释：so the stdout file descriptor isn't kept alive */
+    dup2(devnull, STDIN_FILENO);    /* 只有 stdout/ stdin；**stderr 原样留着** */
+    pid_t pid = fork();  if (pid > 0) exit(0);
+
+所以**握着管道的是 stderr**：`capture_output=True` 同时接 stdout 与 stderr，正好踩中
+（`tests/test_voice_daemonized_copy.py` 里三种管道组合各试一次，把这件事钉成数据）。
+顺带两条同源事实：`--clear` 在同一个回调里**提前 `exit(0)`、根本不 fork**；父进程退 0 只代表
+"数据交给了留守者"，不代表合成器把选区判给了我们（见下面「成功必须能自证」）。
+
+由此定下本文件的执行器规则（`run_step`，两类命令两种等法，各自都有判据）：
+
+* **守护步**（`Step.daemonizes=True`，即**一切 `wl-copy` 调用**，含 `--clear`/`--primary`/`--type`）：
+  stdout/stderr 重定向到**状态目录里 0600 的临时文件**，只等**父进程退出**（毫秒级），
+  错误详情从文件里读**字节数**——文本读过即毁，绝不进 message / `voice.log` / 事件帧 / status
+  （里面可能是 `wl-copy` 经手内容的片段，本仓隐私红线；判据
+  `tests/test_voice_daemonized_copy.py` 真管道事故具型 + `TestWriteSelfProof` 全链隐私条）。
+  分类是**保守**的：源码里 `--clear` 走 `did_set_selection_callback` 的提前 `exit(0)`、**不 fork**，
+  标成守护步只是少留一个"这类命令要不要另判"的分支；不 fork 的命令用文件重定向本来也无害。
+* **普通步**（`ydotool` 发完即退、`wl-paste` 要拿 stdout 字节）：**维持** `capture_output=True`。
+  一刀切把 ydotool 的输出采集弄丢，等于再造一个"读不到错误"的瞎子——两类命令的处置表在
+  `CHANGELOG.md` 的「2026-10-19 事故」那条（「守护步 / 普通步」两段）里，别在这里再抄一份。
+
+### 成功必须能自证（`owner_rejected`）
+
+`wl-copy` 父进程 rc=0 只代表"它把数据交给了自己的守护进程"，**不代表合成器把选区所有权判给了
+我们**。「Wayland 会不会拒绝让"当时没有键盘焦点的客户端"成为数据源」这条已由 **2026-10-19 11:07
+的真机实测排除**（不是推演）：本机**没有** data-control 协议（45 个全局里 `data_control` 命中 0，
+只有核心 `wl_data_device_manager` v3 加 `zwp_primary_selection_device_manager_v1`），从一个
+**无键盘焦点、无 activation token** 的 shell 里 `wl-copy --type image/png < 5.62MiB.png`，
+父进程毫秒级返回、**选区当场设成**（deskflow 日志 `sent clipboard size=5880052`）。
+所以写入之后必须 `wl-paste` 回读（`verify_clipboard_write`）：rc=0 且回读逐字节 == 我们写的那段，
+才算"写成功"；回读不是我们的文本 ⇒ 报 **`owner_rejected`**（不是笼统的 `step_failed`），
+**粘贴那步不发**，状态与 error 帧里明说"多半是无键盘焦点的所有权被拒"——这条照样要报
+（它是运行期事实），但照上面那条实测，它**不再是"必然发生"的预期**。
+这台机连 `wl-paste` 都没有时**不把上屏判死**（既有口径），但摘要必须写"未回读核对"。
+
+### 若真机命中 `owner_rejected`：第二方案「先占后贴」的拆法（**形状已备好，worker 未接线**）
+
+`copy` 与 `paste` 在时间上本来就可以分开——弹窗还活着、我们还有焦点时把数据交给 `wl-copy`，
+销毁窗口、焦点归还之后再发 Ctrl+V。本轮把拆分需要的形状改到位，**故意不实现接线**（真机还没
+证明需要它；提前动时序等于把 `test_voice_focus_gate` 钉住的东西再拆一遍）：
+
+    ① `plan()` 返回的每一步都可**独立执行**：`run_step(step, run)` 自带守护/普通两种等法；
+    ② 自证是独立函数 `verify_clipboard_write`，"占"那半跑完当场就知道成没成；
+    ③ `InjectResult` 带 `copy_ms` / `stages` / `commands`，两段各报各的时刻。
+
+接线要做的事（成本估算**已写进 CHANGELOG**：见 `CHANGELOG.md` 的「2026-10-19 事故」那条——标题里
+那串 `一次都没真贴上过字`，正文的「先占后贴」段；逐项都是**量出来的改动面**，那里是唯一一份，
+别在这里再抄一遍）：`Session` 在 `_arm_inject` 挂起
+**之前**（弹窗还有焦点时）于**后台线程**跑 `snapshot + plan()[0] + verify`，把 `plan()[1:]` 与
+`RestoreJob` 存进 session；焦点交出的事实确认后再跑 `plan()[1]` 并 `arm_clipboard_restore`。
+段序判据 `snapshot→write→paste→restore` 不变（checker 只认相对顺序）。**别在主线程跑
+`run_step`**——那正是 `tools/verify-voice-mainloop.sh` 钉死的病根。
 
 两条不讨喜但必须坚持的边界：
 
@@ -50,12 +118,22 @@ import os
 import re
 import shutil
 import subprocess
+import tempfile
+import time
 from dataclasses import dataclass, field
+from pathlib import Path
+
+from capsplus import voice_proto as P            # 状态目录（守护步临时错误文件的家）
 
 BACKENDS = ("clipboard", "primary", "manual")
 DEFAULT_BACKEND = "clipboard"
 DEFAULT_KEYCODE_HEADER = "/usr/include/linux/input-event-codes.h"
+# 普通步（ydotool / wl-paste 这类发完即退的）的等待上限。守护步**不吃这个值去等管道**：
+# 它们只等父进程退出，而父进程退出是毫秒级的事（2026-10-19 事故后新增 `copy_ms=` 打点，
+# 修好后到底几毫秒成功要看得见，不许再靠"没报错"当证据）。
 STEP_TIMEOUT_S = 5.0
+# 守护步临时错误文件：只读这么多字节就当"错误详情"的规模（再多也只说明它话多）。
+ERRFILE_READ_CAP = 4096
 
 # 需要的键码：Ctrl+V 粘贴 + 中键点一下
 KEYCODE_NAMES = ("KEY_LEFTCTRL", "KEY_V")
@@ -161,14 +239,117 @@ class Step:
 
     `stage` 是**时序判据**看的段名（snapshot / write / paste / restore）；`describe()` 只拼
     argv，绝不拼 stdin —— 快照字节走 stdin，摘要里出现它就等于把用户剪贴板内容写进日志。
+
+    `daemonizes=True` 声明"**这条命令会 fork 常驻进程**（一切 `wl-copy` 调用都是，含 `--clear`）"。
+    执行器 `run_step` 据此换等待方式：守护步**不许**用 `capture_output` 等管道 EOF（子进程继承
+    管道 ⇒ EOF 永不到来 ⇒ 好端端的父进程被 5 秒超时判死，2026-10-19 事故全文见模块 docstring）。
+    这个属性是**执行器语义**，不是提示：新调用点忘标，功能就整体哑火且只表现为超时。
     """
     argv: list[str]
     stdin: bytes | None = None
     label: str = ""
     stage: str = ""
+    daemonizes: bool = False
 
     def describe(self) -> str:
         return f"{self.label or self.argv[0]}: " + " ".join(self.argv)
+
+
+@dataclass
+class StepOutcome:
+    """`run_step` 的统一结果形状（真 `subprocess.run` 与测试假件都被归一成这一个）。
+
+    守护步的 `stderr_text` **恒为空串**：错误详情按"存在过、读过字节数、立即销毁"处理。
+    文本一旦进对象，离"进日志"只差一个顺手，而文件里躺着的可能正是剪贴板片段（隐私红线）。
+    """
+    rc: int = 0
+    err_len: int = 0
+    ms: int = 0
+    stderr_text: str = ""
+
+
+def _ms(started: float) -> int:
+    return int(round((time.monotonic() - started) * 1000))
+
+
+def run_step(step: Step, run, state_dir: str | Path | None = None,
+             timeout: float = STEP_TIMEOUT_S) -> StepOutcome:
+    """执行一条 `Step`。**两类命令两种等法**（2026-10-19 事故根因，别再退回一刀切）。
+
+    * 普通步：`capture_output=True` 照旧 —— `ydotool` 要收 rc/stderr 判 daemon 死活、
+      `wl-paste` 要拿 stdout 字节，它们的输出采集一个都不许丢。
+    * 守护步：stdout/stderr 重定向到状态目录里 **0600** 的临时文件（`tempfile.mkstemp`
+      的固定权限），只等**父进程退出**，毫秒级；错误详情从文件读**字节数**，读完立刻销毁。
+      —— 销毁用 `os.unlink`、不进焚化炉：这文件的内容可能贴着用户的剪贴板，
+      "mv 进 attic 留 30 天"恰恰会把最不该留的东西留下。这与"删除一律进焚化炉"那条
+      规矩不冲突：那条保护的是**还要查证的现场**，这里是**按设计必须瞬毁的隐私件**。
+
+    异常照 `subprocess.run` 的原样往外抛（`OSError` / `TimeoutExpired` / `ValueError`），
+    调用方既有的 except 分支一个字都不用改；临时文件在 finally 里**必定**销毁——
+    判据：`tests/test_voice_daemonized_copy.py`（真子进程：父退、"守护进程"握着管道活着）。
+    """
+    started = time.monotonic()
+    if not step.daemonizes:
+        proc = run(step.argv, input=step.stdin, capture_output=True,
+                   text=False, timeout=timeout)
+        err = (getattr(proc, "stderr", b"") or b"")
+        return StepOutcome(rc=getattr(proc, "returncode", 0), err_len=len(err),
+                           ms=_ms(started), stderr_text=err.decode("utf-8", "replace"))
+    path = ""
+    fd = -1
+    try:
+        directory = Path(state_dir) if state_dir else P.state_dir()
+        directory.mkdir(parents=True, exist_ok=True)
+        fd, path = tempfile.mkstemp(prefix="wlerr-", dir=str(directory))
+        with os.fdopen(fd, "wb") as sink:
+            fd = -1                              # fd 已归 sink 管，防止 finally 二次关闭
+            proc = run(step.argv, input=step.stdin, stdout=sink, stderr=sink,
+                       timeout=timeout)
+        rc = getattr(proc, "returncode", 0)
+        # 父进程退了；守护进程可能还握着同一个 fd 往后写 —— 只取此刻为止的规模做诊断，
+        # "守护进程活着"本身**不是**失败（真 wl-copy 的全部工作就在它那守着数据的儿子里）。
+        err_len = 0
+        try:
+            with open(path, "rb") as handle:
+                err_len = len(handle.read(ERRFILE_READ_CAP))
+        except OSError:
+            err_len = 0                          # 读不了不拦成功判定：自证靠回读，不靠这份文件
+        return StepOutcome(rc=rc, err_len=err_len, ms=_ms(started))
+    finally:
+        if fd >= 0:
+            os.close(fd)
+        if path:
+            try:
+                os.unlink(path)
+            except OSError:
+                pass                             # 本来就不在了（或没权限）：不掩盖主流程结果
+
+
+def verify_clipboard_write(payload: bytes | None, primary: bool, wl_paste: str | None,
+                           run, timeout: float = STEP_TIMEOUT_S) -> bool | None:
+    """写入的**回读自证**（2026-10-19）：写完立刻读回来，逐字节 == 我们写的那段才算数。
+
+    为什么 rc=0 不够：`wl-copy` 父进程退得再干净，也只证明"数据交给了它自己的守护进程"。
+    Wayland **可能**拒绝让"当时没有键盘焦点的客户端"成为选区数据源（本仓未实测的那条），
+    而这种拒绝不反映在退出码上——不回读，我们就会对着一个根本没接走数据的剪贴板报成功。
+
+    返回 `True`（自证成立）/ `False`（回读不是我们的文本，或两种文本目标都读不到 ⇒
+    调用方报 `owner_rejected`）/ `None`（这台机没法回读：没装 `wl-paste` 或命令起不来 ⇒
+    本仓既有口径"**不把上屏判死**"，但摘要必须写明"未回读核对"，见
+    `test_missing_wl_paste_does_not_block_injection`）。
+    """
+    if not wl_paste or payload is None:
+        return None
+    for mime in TEXT_MIME_CANDIDATES:
+        argv = paste_argv(wl_paste, primary, "--no-newline", "--type", mime)
+        try:
+            proc = run(argv, capture_output=True, text=False, timeout=timeout)
+        except (OSError, subprocess.TimeoutExpired, ValueError):
+            return None
+        if getattr(proc, "returncode", 0) != 0:
+            continue                             # 这台机不给读这种目标，换下一种候选
+        return (getattr(proc, "stdout", b"") or b"") == payload
+    return False                                 # 两种文本目标都没有 ⇒ 里面根本不是我们的文本
 
 
 @dataclass
@@ -184,6 +365,9 @@ class InjectResult:
     stages: list[str] = field(default_factory=list)         # 实际执行过的段序（时序判据的证据）
     clipboard_note: str = ""                                # 备份情况一句话：**只含类型与字节数**
     restore_job: RestoreJob | None = None                   # 待还原的作业，交给 worker 的主循环定时器
+    # 写剪贴板那一步（守护步"父进程退出"）的毫秒数 —— 2026-10-19 事故后补的**自证打点**：
+    # 修好后"到底几毫秒成功"必须看得见（诊断行 `inject_done … copy_ms=…`），没跑到那步是 None。
+    copy_ms: int | None = None
 
     def describe(self) -> str:
         """一行结论。三种"没真上屏"的情况必须和成功区分开，不许混报。"""
@@ -191,8 +375,12 @@ class InjectResult:
             return "manual: 没注入，文本留在弹窗里"
         if self.code == "needs_manual_paste":
             return f"{self.backend}: 没自动上屏（文本已进剪贴板，自己按 Ctrl+V）"
+        if self.code == "owner_rejected":
+            return (f"{self.backend}: 没上屏——wl-copy 退了（{self.copy_ms}ms）但回读剪贴板"
+                    "不是我们写的那段，粘贴那步没发")
         if self.ok:
-            return f"{self.backend}: 已上屏（{self.steps} 步）"
+            extra = f"，写入 {self.copy_ms}ms" if self.copy_ms is not None else ""
+            return f"{self.backend}: 已上屏（{self.steps} 步{extra}）"
         return f"{self.backend}: 失败 {self.code or '?'} — {self.message[:120]}"
 
 
@@ -362,7 +550,8 @@ def plan(backend: str, probe: Probe, text: str = "") -> list[Step]:
         return []
     if backend == "clipboard":
         return [
-            Step([probe.wl_copy], stdin=payload, label="写剪贴板", stage=STAGE_WRITE),
+            Step([probe.wl_copy], stdin=payload, label="写剪贴板", stage=STAGE_WRITE,
+                 daemonizes=True),
             Step([probe.ydotool, "key",
                   *key_seq("KEY_LEFTCTRL", True, probe.keycodes),
                   *key_seq("KEY_V", True, probe.keycodes),
@@ -371,7 +560,8 @@ def plan(backend: str, probe: Probe, text: str = "") -> list[Step]:
                  label="Ctrl+V", stage=STAGE_PASTE),
         ]
     return [                                    # primary：主选区 + 中键点一下
-        Step([probe.wl_copy, "--primary"], stdin=payload, label="写主选区", stage=STAGE_WRITE),
+        Step([probe.wl_copy, "--primary"], stdin=payload, label="写主选区", stage=STAGE_WRITE,
+             daemonizes=True),
         Step([probe.ydotool, "click", CLICK_MIDDLE_DOWN, CLICK_MIDDLE_UP],
              label="中键", stage=STAGE_PASTE),
     ]
@@ -547,18 +737,22 @@ def snapshot_clipboard(probe: Probe, run, primary: bool = False,
 
 
 def restore_steps(job: RestoreJob) -> list[Step]:
-    """还原那一步的命令（纯函数）。**空剪贴板 ⇒ 清空，不是写一个空串**（判据 4）。"""
+    """还原那一步的命令（纯函数）。**空剪贴板 ⇒ 清空，不是写一个空串**（判据 4）。
+
+    两条都是 `wl-copy` ⇒ **一律 `daemonizes=True`**（2026-10-19：还原走的是和写入同一个执行器，
+    当年写入被 5 秒超时判死的路，还原一步不落全踩过 —— 别在这里漏标）。
+    """
     snap = job.snapshot
     if snap.empty:
         return [Step(copy_argv(job.wl_copy, job.primary, clear=True),
-                     stage=STAGE_RESTORE, label="清空剪贴板")]
+                     stage=STAGE_RESTORE, label="清空剪贴板", daemonizes=True)]
     mime = snap.mime or ""
     # text/plain 故意**不加 --type**：wl-copy 对纯文本会一次注册齐 text/plain;charset=utf-8、
     # TEXT、UTF8_STRING 几种目标，加了 --type 只剩一种，别的应用挑目标时会粘不到。
     # 非文本（image/png、text/uri-list、text/html）必须加：不加 wl-copy 会按二进制猜成
     # application/octet-stream，还原回来的是一张"不是图"的字节流。
     return [Step(copy_argv(job.wl_copy, job.primary, None if mime_is_plain_text(mime) else mime),
-                 stdin=snap.data, stage=STAGE_RESTORE, label="还原剪贴板")]
+                 stdin=snap.data, stage=STAGE_RESTORE, label="还原剪贴板", daemonizes=True)]
 
 
 def check_still_ours(job: RestoreJob, run) -> bool | None:
@@ -619,17 +813,18 @@ def perform_restore(job: RestoreJob, run, verify: bool = True) -> RestoreResult:
     for step in restore_steps(job):
         ran.append(" ".join(step.argv))
         try:
-            proc = run(step.argv, input=step.stdin, capture_output=True, text=False,
-                       timeout=STEP_TIMEOUT_S)
+            outcome = run_step(step, run)
         except (OSError, subprocess.TimeoutExpired, ValueError) as exc:
             return RestoreResult(code="step_failed",
                                  message=f"还原那步没跑起来 {type(exc).__name__}", commands=ran,
                                  still_ours=True)
-        rc = getattr(proc, "returncode", 0)
-        if rc != 0:
-            # 同 snapshot_clipboard：不拼 stderr，摘要里绝可能出现用户内容片段。
-            return RestoreResult(code="step_failed", message=f"还原命令退出码 {rc}", commands=ran,
-                                 still_ours=True)
+        if outcome.rc != 0:
+            # 同 snapshot_clipboard：错误文本一个字都不拼（`run_step` 对守护步只带出字节数，
+            # 文本读过即毁）；摘要里绝可能出现用户内容片段的东西，本来就不该往外走。
+            return RestoreResult(code="step_failed",
+                                message=f"还原命令退出码 {outcome.rc}"
+                                        f"（错误输出 {outcome.err_len} 字节，为护隐私不转述）",
+                                commands=ran, still_ours=True)
     if snap.empty:
         return RestoreResult(did=True, code="cleared",
                              message="原剪贴板为空 ⇒ 已按 --clear 清空", commands=ran,
@@ -674,24 +869,43 @@ def degraded_clipboard_write(text: str, backend: str, probe: Probe, run) -> Inje
     为什么值得做（2026-10-17）：`ydotoold` 不在跑是常态，但剪贴板那一步本来就可用 ——
     写进去用户按一次 Ctrl+V 就完事，比什么也没发生强。
     **注意 `ok=False`**：这不是"上屏成功"，我们没按下任何键，不许把它当成功报。
+
+    2026-10-19 两点：①这一步就是「先占后贴」的**前半段**（弹窗还在、用户自己再粘）——
+    写入走守护步执行器并**当场回读自证**；②降级场景下我们**必然没有键盘焦点**（worker 后台常驻），
+    正是"所有权可能被拒"的最坏形状 —— rc=0 却回读不到我们的文本 ⇒ 报 `owner_rejected`，
+    **不许**再对明江说"文本已写进剪贴板"（那条承诺没有证据）。
     """
     if not probe.wl_copy or backend not in ("clipboard", "primary"):
         return None
-    argv = [probe.wl_copy]                     # 降级一律写剪贴板：配的提示就是 Ctrl+V
+    step = Step([probe.wl_copy], stdin=text.encode("utf-8"), label="写剪贴板(降级)",
+                stage=STAGE_WRITE, daemonizes=True)   # 降级一律写剪贴板：配的提示就是 Ctrl+V
     try:
-        proc = run(argv, input=text.encode("utf-8"), capture_output=True,
-                   text=False, timeout=STEP_TIMEOUT_S)
+        outcome = run_step(step, run)
     except (OSError, subprocess.TimeoutExpired, ValueError):
         return None
-    if getattr(proc, "returncode", 0) != 0:
+    if outcome.rc != 0:
         return None
+    proof = verify_clipboard_write(step.stdin, False, probe.wl_paste, run)
+    if proof is False:
+        return InjectResult(
+            ok=False, backend=backend, code="owner_rejected",
+            message="降级写剪贴板：wl-copy 父进程 rc=0，但回读剪贴板**不是我们写的那段** ⇒ "
+                    "选区所有权没被接走（Wayland 拒绝没有键盘焦点的客户端成为数据源？本条未实测）。"
+                    "文本**没有**写进剪贴板，请按 Ctrl+V 前先看弹窗里的字还在不在",
+            hint="真机命中这条 ⇒ 走「先占后贴」（拆法见本模块 docstring）；临时兜底："
+                 "CAPSPLUS_VOICE_BACKEND=manual，文本只留在弹窗里自己复制",
+            commands=[" ".join(step.argv)], steps=1, keep_window=True,
+            stages=[STAGE_WRITE], copy_ms=outcome.ms,
+            clipboard_note="降级写入未成功（回读不是我们的文本），不做任何还原")
+    note = ("降级：文本留在剪贴板里等你自己粘贴，**不做还原**（还原等于把你还没粘出去的东西抽走）")
+    if proof is None:
+        note += "（这台机没装 wl-paste：未回读核对）"
     return InjectResult(ok=False, backend=backend, code="needs_manual_paste",
-                        message="按键注入用不了，文本已写进剪贴板",
+                        message="按键注入用不了，文本已写进剪贴板"
+                                + ("" if proof is True else "（未回读核对）"),
                         hint="把光标放到要输入的位置，按 Ctrl+V",
-                        commands=[" ".join(argv)], steps=1, keep_window=True,
-                        stages=[STAGE_WRITE],
-                        clipboard_note="降级：文本留在剪贴板里等你自己粘贴，**不做还原**"
-                                       "（还原等于把你还没粘出去的东西抽走）")
+                        commands=[" ".join(step.argv)], steps=1, keep_window=True,
+                        stages=[STAGE_WRITE], copy_ms=outcome.ms, clipboard_note=note)
 
 
 def inject(text: str, backend: str | None = None, probe: Probe | None = None,
@@ -701,6 +915,8 @@ def inject(text: str, backend: str | None = None, probe: Probe | None = None,
 
     `runner` 注入的是 `subprocess.run` 等价物 —— 单测必须注入假的，
     否则就会往**明江正在用的屏幕**上打键（红线），也就会真去读他的剪贴板。
+    步骤一律走 `run_step`（守护/普通两种等法，2026-10-19）；写剪贴板之后**当场回读自证**
+    （`verify_clipboard_write`），回读不是我们的文本 ⇒ `owner_rejected` 且**不发粘贴**。
 
     `restore=None` 时按 `CAPSPLUS_VOICE_RESTORE_CLIPBOARD` 定（默认开）。快照在这里**只读进内存**；
     **还原不在这里做** —— `CLIPBOARD_SETTLE_MS` 那段等待由主循环计时，到点才在后台线程跑
@@ -758,33 +974,56 @@ def inject(text: str, backend: str | None = None, probe: Probe | None = None,
         return ("注入没走完：你要的文本还留在剪贴板里，这次**不还原**"
                 f"（备份的 {job.snapshot.describe()} 已丢弃）")
 
-    # ── 第 2、3 段：写剪贴板 → 按键粘贴
+    # ── 第 2、3 段：写剪贴板（**当场回读自证**）→ 按键粘贴
     ran: list[str] = []
+    copy_ms: int | None = None
+    copy_proof: bool | None = None       # None = 这台机没法回读（不判死，摘要如实写"未回读核对"）
     for i, step in enumerate(steps, 1):
         ran.append(" ".join(step.argv))
         stages.append(step.stage or STAGE_WRITE)
         try:
-            proc = run(step.argv, input=step.stdin, capture_output=True,
-                       text=False, timeout=STEP_TIMEOUT_S)
+            outcome = run_step(step, run)
         except (OSError, subprocess.TimeoutExpired, ValueError) as exc:
             return InjectResult(backend=name, code="step_failed",
                                 message=f"第 {i}/{len(steps)} 步「{step.label}」没跑起来："
                                         f"{type(exc).__name__}: {exc}",
                                 hint=f"单独试一次：{step.describe()}",
                                 commands=ran, steps=i - 1, stages=stages, clipboard_note=aborted())
-        rc = getattr(proc, "returncode", 0)
-        if rc != 0:
-            err = (getattr(proc, "stderr", b"") or b"").decode("utf-8", "replace").strip()
+        if outcome.rc != 0:
+            if step.daemonizes:
+                # 守护步：错误文本已被执行器读过即毁，这里只带得出规模（隐私红线，见 run_step）。
+                detail = f"（错误输出 {outcome.err_len} 字节，为护隐私不转述）"
+            else:
+                detail = "：" + outcome.stderr_text.strip()[:160]
             return InjectResult(backend=name, code="step_failed",
-                                message=f"第 {i}/{len(steps)} 步「{step.label}」退出码 {rc}："
-                                        f"{err[:160]}",
+                                message=f"第 {i}/{len(steps)} 步「{step.label}」退出码 "
+                                        f"{outcome.rc}{detail}",
                                 hint=_backend_hint(name, i),
                                 commands=ran, steps=i - 1, stages=stages, clipboard_note=aborted())
+        if step.daemonizes:
+            copy_ms = outcome.ms        # 父进程退出的耗时（毫秒级才是正常形状，2026-10-19）
+            copy_proof = verify_clipboard_write(step.stdin, primary, probe.wl_paste, run)
+            if copy_proof is False:
+                return InjectResult(
+                    backend=name, code="owner_rejected",
+                    message=f"第 {i}/{len(steps)} 步「{step.label}」：wl-copy 父进程 rc=0"
+                            f"（{copy_ms}ms），但**回读剪贴板不是我们写的那段** ⇒ 选区所有权没被"
+                            "接走，粘贴那步不发。最可疑的成因（本仓未实测）：Wayland 拒绝让当时"
+                            "没有键盘焦点的客户端成为数据源。",
+                    hint="真机命中这条 ⇒ 走「先占后贴」：弹窗还在焦点上时就把数据交给 wl-copy，"
+                         "焦点归还后再发 Ctrl+V（拆法见 `voice_inject` 模块 docstring「先占后贴」一节）",
+                    commands=ran, steps=i, stages=stages, copy_ms=copy_ms,
+                    clipboard_note=("回读剪贴板里没有我们的文本 ⇒ wl-copy 多半没拿到所有权；"
+                                    "原剪贴板**大概率还是你的东西**。本次不还原（备份的 "
+                                    f"{job.snapshot.describe() if job else '没备份'} 已丢弃），"
+                                    "粘贴那步也没发 —— 别按 Ctrl+V 赌运气"))
         if sleep is not None and i < len(steps):
             sleep(0.06)         # 剪贴板服务与按键之间留一口气（daemon 侧 fork 是异步的）
     # ── 第 4 段：还原不在这里发生（等 CLIPBOARD_SETTLE_MS，由调用方的主循环计时）
+    if copy_proof is None and steps and steps[0].daemonizes:
+        note += "；写入**未回读核对**（这台机没 wl-paste，自证不了）"
     return InjectResult(ok=True, backend=name, steps=len(steps), commands=ran,
-                        stages=stages, clipboard_note=note, restore_job=job)
+                        stages=stages, clipboard_note=note, restore_job=job, copy_ms=copy_ms)
 
 
 def _backend_hint(name: str, step_no: int) -> str:

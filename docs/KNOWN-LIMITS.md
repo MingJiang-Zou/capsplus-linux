@@ -356,9 +356,15 @@ r = searchParams.get("q")?.trim() ?? e.get("prompt")
 本节解释的是 `capsplus/voice_inject.py` 为什么长成那样（只有一个默认后端 `clipboard`，
 且它**先探测再动手**）。本机环境：Ubuntu 26.04.1 / GNOME Shell 50.1 / 会话 `Type=wayland`。
 
+> **2026-10-19 逐条复核**（事故调查顺带做的，别再把老结论当现状）：
+> **1~8 仍是限制**——1、2 当天重测（数一样），3~8 读现在的代码逐条确认没变；
+> **第 9 条**是"未实测清单"本身，其中 ②b 已被**部分实测**（见 CHANGELOG 2026-10-19 条目）；
+> **第 10 条改了两处**（"`focus_out` 收不收得到"、"贴上又删是哪一种"都有真机证据了）；
+> **新增第 11 条**（剪贴板这条路自己的平台事实）。
+
 ### 1. mutter 没实现 `zwp_virtual_keyboard` 与 `zwp_input_method` ⇒ `wtype` 在 GNOME 必死
 
-- **实测日期**：2026-10-17。
+- **实测日期**：2026-10-17（**2026-10-19 复核，数一样**：`libmutter-18.so.0` 50.1-0ubuntu2.4）。
 - **怎么验的**：对 `libmutter-18.so.0` 数协议名字串 —— `zwp_virtual_keyboard=0`、`zwp_input_method=0`，
   只有 `zwp_text_input_manager_v3=1`（那是给输入法客户端用的，不是注入通道）。
 - **后果**：`wtype` 依赖前两个协议，装上也用不了；别拿它当退路。
@@ -366,6 +372,8 @@ r = searchParams.get("q")?.trim() ?? e.get("prompt")
 ### 2. `libei`（本机 `libeis1` 1.5.0-3）导出符号里 **keysym 数 = 0**
 
 - **怎么验的**：`nm -D` 只读段数符号 —— keysym 类 0 条，只有 evdev 键码那条路。
+  **2026-10-19 复核**：`nm -D /usr/lib/x86_64-linux-gnu/libei.so.1`（1.5.0）里含 `keysym` 的导出
+  符号仍是 **0** 条。
 - **后果**：想靠 libei/portal"输入 Unicode 字符"在本机不成立（打不出汉字）。
 
 ### 3. uinput 只有键码 ⇒ `ydotool type` / `dotool type` **打不出中文**
@@ -434,8 +442,10 @@ r = searchParams.get("q")?.trim() ?? e.get("prompt")
   1. **X11 下 `unmap` 与 `destroy` 同步**（Enter 之后 0.03ms 就到）⇒ "等到 unmap 事件"在这个平台上
      **等于没等**。所以注入另外要有**下限**（`voice_worker.INJECT_FLOOR_MS = 120`）：改成"只等事件"
      反而会把上屏提得比现状更早、更危险。
-  2. **`focus_out` 不一定来**：Xvfb 没有窗口管理器，这一轮就没收到（只有 unmap）。mutter 下收不收得到
-     尚未在真桌面取证 —— 这正是 `gate=cap` 那条分支存在的理由。
+  2. **`focus_out` 不一定来**：Xvfb 没有窗口管理器，这一轮就没收到（只有 unmap）。mutter 下**释放
+     事实收得到**（2026-10-19 09:15 真机那行 `inject_diag gate=floor … visible=0 mapped=0 unmap=1
+     destroy=1`——`gate=floor` 只有 `fact["released"]` 为真才会被选中，只是它比下限 120ms 更早到），
+     但**是哪一种**（`unmap` 还是 `focus_out`）仍未区分。这正是 `gate=cap` 那条分支继续存在的理由。
   3. **客户端拿不到"焦点给了谁"**：xdg-shell 没这个查询，GTK3 也没有；`set_accept_focus(False)` 只是
      X11 hint 的等价物。于是"焦点已回到原文档"**不可能被证实、只可能被证伪**（我们还 mapped /
      还可见 ⇒ 一定没交出去）。
@@ -445,8 +455,97 @@ r = searchParams.get("q")?.trim() ?? e.get("prompt")
   `capsplus-voice status` 的「上屏结论」三处同步，**不许写成"上屏结束"**。判据：
   `tests/test_voice_focus_gate.py`（四条，各带能红的反例具型）+
   `tests/test_voice_mainloop.py::TestReviewRunsOnMainThread`（真窗口那条钉的是**顺序**而不是时长）。
-- **真桌面上还没定的那一件事**：按 Enter 后"贴上又删"到底是 ①贴进了我们自己正在消失的窗口、
-  ②目标应用自己的行为、还是 ③`wl-copy` 没拿到选区所有权、粘出来的是旧内容。三条的**区分量**都在
-  `inject_diag` / `restore_diag` 这两行里（`visible`/`mapped` 是不是还 1、`gate` 是哪个、
-  `still_ours` 是什么、`Enter→注入` 与 `Enter→焦点交出` 各多少毫秒）—— 要在真机再测一次并把那两行
-  贴回来才能定。
+- **"贴上又删"是三种里的哪一种 —— 2026-10-19 定了：三种都不是。** 真机 09:15 那一轮给出的是
+  `visible=0 mapped=0`（⇒ **不是**①"贴进我们自己正在消失的窗口"）、`gate=floor`（⇒ 释放事实到了），
+  以及 `inject_done … backend=clipboard ok=0 code=step_failed steps=0` 且两条耗时读数相减恰好 =
+  `STEP_TIMEOUT_S`（5.0s）⇒ **第一步"写剪贴板"就超时被判失败，`Ctrl+V` 从未执行**（⇒ 也谈不上
+  ②"目标应用自己的行为"、③"粘出来的是旧内容"——粘贴这个动作根本没发生）。所以这条功能**从落地起
+  一次都没真贴上过字**：那次"贴上去了又消失"里的前半句不成立 —— 至于用户当时看到的闪动究竟是
+  什么，本轮**没有再取证**，别顺着往下写。
+  区分量仍在 `inject_diag` / `restore_diag` / `inject_done`（现在多了 `copy_ms=`）这几行里。
+
+### 11. 剪贴板这条路自己的两条平台事实（2026-10-19 实测，不是推测）
+
+这一条解释 `voice_inject.run_step()` 为什么把命令分成"守护步 / 普通步"两类来等，以及为什么写完
+剪贴板必须**回读自证**（经过见 CHANGELOG 2026-10-19 条目）。
+
+- **`wl-copy` 会 fork 一个常驻进程替它守剪贴板数据，而那个进程继承了 stderr**。读本机
+  `wl-clipboard` 2.2.1 的 `src/wl-copy.c`（`did_set_selection_callback`）：fork **之前**只
+  `dup2(/dev/null, STDOUT_FILENO)`（源码注释原话：*so the stdout file descriptor isn't kept alive*）
+  与 `dup2(/dev/null, STDIN_FILENO)`，**stderr 原样留着**。而
+  `subprocess.run(..., capture_output=True)` 把 stdout **和 stderr** 都接过来 ⇒ **管道 EOF 永不到来**，
+  一条毫秒级就该返回的命令被判成超时（本次事故：5 秒）。⇒ **会 fork 常驻进程的命令，不许用"等管道
+  EOF"判成败。** 同源事实：`--clear` 在同一个回调里提前 `exit(0)`、**根本不 fork**。
+- **父进程 rc=0 ≠ 选区所有权到手**：`wl-copy` 退 0 只说明"数据交给了它自己的守护进程"。要判"真的
+  写上了"必须**回读**（`wl-paste` 逐字节比对，`verify_clipboard_write`）；回读不是我们的文本 ⇒ 报
+  `owner_rejected`（不是笼统的 `step_failed`）且**不发粘贴**。
+- **"无键盘焦点的进程设不了选区" —— 这个担心在本机是错的（实测排除）**：本机**没有** data-control
+  协议（45 个全局里 `data_control` 命中 0，只有核心 `wl_data_device_manager` v3 +
+  `zwp_primary_selection_device_manager_v1`），所以此前只是"担心"；2026-10-19 11:07 从一个**无键盘
+  焦点、无 activation token** 的 shell 里 `wl-copy --type image/png < 5.62MiB.png`：父进程毫秒级返回、
+  **选区当场设成**（deskflow 日志 `sent clipboard size=5880052`）。⇒ `owner_rejected` 仍要报（那是
+  运行期事实），但它**不是"必然发生"的预期**，别拿它当已知结论去解释别的现象。
+
+---
+
+## 设置页能编辑的键位 = 上游声明的**全表**，没绑定的键显示成"空位"（2026-10-19 核实 + 单测）
+
+- **原来为什么"有些快捷键没有"**：设置页那两列（"层/键/动作/说明/来源"）不是手写的清单，
+  它由 `capsplus/render.py:binding_rows()` 从 `capsplus/mapping_data.py:SECTIONS` **派生**出来，
+  `capsplus/mapping_overrides.py:layer_rows()` 也是同一份派生。所以设置页缺的键 = 表里就没声明的键，
+  两者差集**恒为空**（2026-10-19 实测：`binding_rows` 的键序列与 `SECTIONS` 逐层相等）。
+- **缺口在表，不在界面**。量出来的数是（2026-10-19，读 `~/.dsh/refs/capslock-v3.3.0/lib_keysSet.ahk`
+  的 `keySchemeInit_capslox()`，逐个 `keyset.caps_*` / `keyset.caps_lalt_*` 数）：
+
+  | 层 | 上游声明 | 本仓默认绑定 | 差（= 设置页原来没有的） |
+  | --- | --- | --- | --- |
+  | `capl` | 64 | 31 | **33**：`m`、`z`、`grave`、`1`–`0`、`minus`、`equal`、`tab`、`leftbrace`、`rightbrace`、`backslash`、`apostrophe`、`rightalt`、`f1`–`f12` |
+  | `capl+alt` | 52 | 25 | **27**：`c`、`m`、`q`、`v`、`x`、`z`、`grave`、`1`–`0`、`minus`、`equal`、`tab`、`leftbrace`、`rightbrace`、`backslash`、`apostrophe`、`enter`、`space`、`rightalt` |
+
+- **现在怎么做的**：`mapping_data.EDITABLE_KEYS` 是"设置页要列出的键位全表"（顺序照上游声明：
+  字母 → `grave` → 数字 `1..9,0` → 符号 → `f1`–`f12`；F 键只有基础层有，上游 `caps_lalt_*` 里没有）。
+  不在 `SECTIONS` 里的那些就是**空位**：动作列留空、说明列写"空位"。
+- **空位不渲染，也不吞键**：`render()` 只读 `SECTIONS`，所以空位不进 `conf`。
+  按 keyd 的层语义，层里没绑定的键是**放行**（man「COMPOSITE LAYERS」原句：
+  *"pressing control+alt+f1 preserves those modifiers, emitting exactly what was pressed,
+  as there is no explicit binding for f1 on the composite layer"*）—— 也就是说
+  按住 Caps 按数字键，本来就照原样出数字，默认行为一个字都没变。
+  用户在设置页给空位填了动作，才由覆盖层把这条**追加到该段段尾**（`merge_overrides` 的既有规则，
+  与渲染出来的位置一致）。
+- **为什么不直接把数字键/F 键写成默认绑定**：仓里 `tests/test_render.py:TestReferenceEquivalence`
+  断言"渲染出来的绑定集 == 参考配置的绑定集"（两向差集都必须为空），**任何新增默认绑定都会让它红**；
+  参考配置在仓外、且它是"上游移植"的对账物，不能为了新功能去改它。所以"新增组合"只能走用户覆盖层。
+  要不要放开这条（改成"参考配置 ⊆ 渲染 + 参考那几条一字不改"）是**另一个决定**，得先问人。
+- **判据**：`tests/test_editable_keys.py`（21 条）。①设置页列出的键集 == `EDITABLE_KEYS`；
+  ②数字/F 键走"校验 → 覆盖层 → 合并 → 渲染"真的生成绑定、且只多出这一条；
+  ③空位不进默认渲染、既有绑定的**顺序与字面值**与参考配置逐条一致（比集合相等更严）；
+  ④表里每个键名都在 keyd 自己的 `list-keys` 里（有 keyd 才跑）。
+  反例具型：把 `1`/`0`/`f1`/`f12`/`m`/`z` 任一个从表里删掉，①必须红。
+- **真机验法**（我这边不许动 `/etc/keyd`，只能他按）：设置页第③页 → 点 `capl / 1` 那行 →
+  编辑条填 `C-c` → 「改这一格」→「应用」→ 按住 Caps 按 `1` 应触发复制；`f1` 同理。
+  不想要了就选中那行点「恢复默认」，再「应用」。
+- **还没跟上的一处**：`README.md` / `README.template.md` 里那张"组合键 → 功能"表仍只列**真实绑定**
+  （`KEY_TABLE_NOTES` 生成的），没提空位与数字/F 键 —— 这次没改（文件不在本轮写范围内）。
+
+## 「先 Caps+Z 再 N」这种两段组合：keyd 有机制，但**本仓现在配不出来**（2026-10-19 读 man，未真机实测）
+
+- **keyd 没有"按键序列"**（没有 record/playback、没有 leader key）：这点先排除，别指望 `macro` 能做到
+  （`macro` 是发出一串键，不是等一串键）。
+- **有对应的机制**：`oneshot(<layer>)` —— man「ACTIONS」原句 *"If tapped, activate the supplied layer
+  for the duration of the next keypress."* 轻按一下激活某层、**下一次按键**在该层里解释，
+  形状上就是"先 Z 再 N"。另一条更确定的写法是 `z = layer(新层)`（按住 Z 的同时按 N）或
+  `[capl+z]` 复合层；`chord_timeout` 那套 `z+n = 动作` 是"两个键几乎同时按下"，也不是先后关系。
+- **但今天配不出来，两道闸**：
+  1. 设置页只允许改 `capl` / `capl+alt`（`mapping_overrides.ALLOWED_SECTIONS`），而
+     `oneshot(x)` / `layer(x)` 点名的层**必须在渲染出的配置里真实存在**（man「Bindings」一节：
+     `<layer>` 是 an existing layer 的名字）；
+  2. 于是要么往 `SECTIONS` 加第三层（比如 `[capl_z]` 及其键位矩阵），要么接受复合层
+     `[capl+z]` —— **两者都是"新增默认绑定"，会撞上 `TestReferenceEquivalence`**（见上一节），
+     要先把那条判据的口径定下来。
+- **真机还没验的那一点**（别顺着往下信）：`oneshot` 层是在 `[capl]` 里被点着的，
+  而"按住 Caps"这个层紧接着就松开了 —— **oneshot 的待命状态跨不跨得过成员层的释放**，man 没写、
+  我也没测（本机不许动 `/etc/keyd`）。真要有这条路，第一步就是拿一条最小配置问这句话。
+- **要验的话怎么验**（他有 sudo，我这边只做只读核实）：临时往 `/etc/keyd/` 里放一条最小实验配置
+  → `sudo keyd reload` → 试"轻按 Caps+Z 松手、再按 N"，看 N 是被吃掉还是照原样出；
+  验完 `sudo rm` 那个文件再 reload 就回到现状（`capsplus apply` 只管自己那份 `capslock-plus.conf`）。
+  救命组合仍然是 `backspace+escape+enter`。

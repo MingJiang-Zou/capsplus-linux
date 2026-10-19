@@ -691,7 +691,11 @@ class TestDiagnosticsCarryNoText(unittest.TestCase):
         allowed = {"gate", "unconfirmed", "enter_ms", "release_ms", "released", "release_kind",
                    "at_us", "finish_us", "inject_us", "visible", "realized", "mapped", "mapped_by_timeline",
                    "unmap_seen", "focus_out_seen", "destroy_seen", "entries", "timeline",
-                   "backend", "ok", "code", "steps"}
+                   "backend", "ok", "code", "steps",
+                   # 2026-10-19 补：写剪贴板那步（守护步"父进程退出"）的毫秒数。它是**状态量**
+                   # （一个整数耗时），不是内容；`inject_done … copy_ms=` 靠它自证
+                   # "父退是毫秒级、不是被 5 秒超时判死"。登记在这里等于承认它是诊断面的一部分。
+                   "copy_ms"}
         self.assertEqual(set(diag) - allowed, set(), f"诊断里混进了没登记过的字段：{set(diag)}")
         self.assertNotIn("text", diag, "诊断 dict 里出现了 text 字段 = 文本可能被带出去")
 

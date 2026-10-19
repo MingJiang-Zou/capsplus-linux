@@ -78,8 +78,23 @@ def _sandbox_dir(name: str) -> Path:
     return path
 
 
+# 2026-10-19：`run_step` 的守护步在**状态目录**里开 0600 临时错误文件（读完即毁）。
+# 本模块有一批判据在 `env()` 之外直接调 inject/perform_restore（还原链那几个），没有模块级
+# 护栏就会把文件写进明江的真状态目录 —— 护栏必须是默认值，不能靠每个类自觉（TestSandboxGuard
+# 的同一个教训）。`env()` 的 with-patch 仍可覆盖；两处指的都是本模块 SANDBOX 下的子目录。
+_ORIG_STATE_DIR = os.environ.get("CAPSPLUS_STATE_DIR")
+
+
+def setUpModule():
+    os.environ["CAPSPLUS_STATE_DIR"] = str(_sandbox_dir("module"))
+
+
 def tearDownModule():
     _cleanup_sandbox()
+    if _ORIG_STATE_DIR is None:
+        os.environ.pop("CAPSPLUS_STATE_DIR", None)
+    else:
+        os.environ["CAPSPLUS_STATE_DIR"] = _ORIG_STATE_DIR
 
 
 def _proc(rc=0, out=b"", err=b""):
@@ -242,7 +257,12 @@ class TestSequenceOrdering(unittest.TestCase):
         self.assertEqual(stage_order_violations(armed, expect_restore=True), [], armed)
 
     def test_runner_saw_the_snapshot_commands_before_the_copy(self):
-        """行为级：假剪贴板记录的**实际命令顺序**逐字钉死 —— 代码里一挪动就红。"""
+        """行为级：假剪贴板记录的**实际命令顺序**逐字钉死 —— 代码里一挪动就红。
+
+        2026-10-19 起，`wl-copy` 之后多一条**回读自证**（`wl-paste --no-newline --type …`，
+        逐字节比对"写进去的就是剪贴板里的那份"）。它不是第二段，`stages` 里也不该多一段 ——
+        它属于 write 那段的自证；命令序列这条判据照样把它逐字钉住。
+        """
         clip = FakeWaylandClipboard({"text/html": "<b>原文</b>".encode("utf-8")})
         with env():
             INJ.inject(OUR_TEXT, backend="clipboard", probe=probe(), runner=clip)
@@ -250,6 +270,7 @@ class TestSequenceOrdering(unittest.TestCase):
             "/usr/bin/wl-paste --list-types",
             "/usr/bin/wl-paste --no-newline --type text/html",
             "/usr/bin/wl-copy",
+            "/usr/bin/wl-paste --no-newline --type text/plain;charset=utf-8",   # 回读自证
             "/usr/bin/ydotool key 29:1 47:1 47:0 29:0",
         ], f"上屏的命令顺序变成这样了：{clip.joined}")
 
@@ -259,7 +280,11 @@ class TestSequenceOrdering(unittest.TestCase):
         with env():
             result = INJ.inject(OUR_TEXT, backend="clipboard", probe=probe(), runner=clip)
         self.assertIsNotNone(result.restore_job)
-        self.assertEqual(len(clip.calls), 4, f"inject 里就还原了：{clip.joined}")
+        # 快照读 2 条 + 写 1 条 + 回读自证 1 条 + Ctrl+V 1 条；多出来的那条就是"偷偷还原了"。
+        self.assertEqual(len(clip.calls), 5, f"inject 里就还原了：{clip.joined}")
+        self.assertEqual(clip.joined[-1], "/usr/bin/ydotool key 29:1 47:1 47:0 29:0",
+                         f"最后一条命令不是粘贴 ⇒ 还原插在注入里了：{clip.joined}")
+        self.assertNotIn("--clear", " ".join(clip.joined))
 
     # -- 反例具型 --------------------------------------------------------------
     def test_counterexample_snapshot_moved_after_copy_is_red(self):
@@ -308,12 +333,21 @@ class TestSequenceOrdering(unittest.TestCase):
         self.assertEqual(clip.joined[2], "/usr/bin/wl-copy --primary")
 
     def test_disabled_switch_reads_nothing_from_the_clipboard(self):
-        """开关关掉时**连读都不读**（少一次对用户数据的访问），也不留待还原作业。"""
+        """开关关掉时**不做快照读**（少一次对用户数据的访问），也不留待还原作业。
+
+        2026-10-19 起这条要说得更准：`inject` 里还有一次读 —— **回读自证**自己刚写进去的那段
+        （判"写没写成"，与还原无关，开关管不了它）。所以判据钉的是**没有 `--list-types` 快照读**，
+        而不是"一条 wl-paste 都不许有"；后者会把回读自证也一起判死。
+        """
         clip = FakeWaylandClipboard({"text/html": b"x"})
         with env(**{INJ.RESTORE_ENV: "0"}):
             result = INJ.inject(OUR_TEXT, backend="clipboard", probe=probe(), runner=clip)
         self.assertEqual(clip.joined,
-                         ["/usr/bin/wl-copy", "/usr/bin/ydotool key 29:1 47:1 47:0 29:0"])
+                         ["/usr/bin/wl-copy",
+                          "/usr/bin/wl-paste --no-newline --type text/plain;charset=utf-8",
+                          "/usr/bin/ydotool key 29:1 47:1 47:0 29:0"])
+        self.assertNotIn("--list-types", " ".join(clip.joined),
+                         "开关关着还去列类型读快照 = 多一次对用户剪贴板数据的访问")
         self.assertIsNone(result.restore_job)
         self.assertIn("CAPSPLUS_VOICE_RESTORE_CLIPBOARD=0", result.clipboard_note)
 
@@ -328,14 +362,21 @@ class TestSequenceOrdering(unittest.TestCase):
                 self.assertTrue(INJ.restore_from_env(), value)
 
     def test_degraded_write_never_arms_a_restore(self):
-        """探测没过 ⇒ 只写剪贴板等用户自己粘贴：这时还原会把**他还没粘出去的东西**抽走。"""
+        """探测没过 ⇒ 只写剪贴板等用户自己粘贴：这时还原会把**他还没粘出去的东西**抽走。
+
+        2026-10-19 起降级路径当场**回读自证**（它是「先占后贴」的前半段：我们必然没有键盘焦点，
+        正是"所有权可能被拒"的最坏形状），所以命令里多一条回读 —— 那是自证，不是还原。
+        """
         clip = FakeWaylandClipboard({"text/html": b"x"})
         with env():
             result = INJ.inject(OUR_TEXT, backend="clipboard",
                                 probe=probe(ydotool_daemon=False), runner=clip)
         self.assertEqual(result.code, "needs_manual_paste")
         self.assertIsNone(result.restore_job)
-        self.assertEqual(clip.joined, ["/usr/bin/wl-copy"], clip.joined)
+        self.assertEqual(clip.joined,
+                         ["/usr/bin/wl-copy",
+                          "/usr/bin/wl-paste --no-newline --type text/plain;charset=utf-8"],
+                         clip.joined)
         self.assertIn("不做还原", result.clipboard_note)
 
     def test_manual_backend_touches_the_clipboard_not_at_all(self):
@@ -807,8 +848,10 @@ class TestWorkerRestorePlumbing(unittest.TestCase):
         srv = self._server(clip)
         self._inject(srv, **{INJ.RESTORE_ENV: "0"})
         self.assertEqual(srv._deferred, [], "开关关着还挂定时器 = 白等一场")
-        self.assertEqual([c for c in clip.joined if "wl-paste" in c], [],
-                         "开关关着还去读用户的剪贴板 = 多一次不必要的数据访问")
+        # 只判"没有 `--list-types` 快照读"：回读自证（判自己刚写的那段）与还原开关无关，
+        # 把它一起判死等于逼代码放弃自证（2026-10-19）。
+        self.assertEqual([c for c in clip.joined if "--list-types" in c], [],
+                         "开关关着还去列类型读用户的剪贴板 = 多一次不必要的数据访问")
         self.assertIn("开关关着", srv.clipboard_summary)
 
     def test_slot_holds_the_oldest_snapshot_across_two_utterances(self):
@@ -820,6 +863,10 @@ class TestWorkerRestorePlumbing(unittest.TestCase):
         self.assertEqual(srv._clip_job.snapshot.mime, "text/html")
         self.assertEqual(len(srv._clip_job.ours), 2, "两次写的文本都要认作「我们的」")
         first_fn()                                      # 到点：只还原一次，还原成最早那份
+        # 到点回调只把活交给**后台线程**（形状判据见下一条），所以这里必须等它干完：
+        # 立刻断言等于赌线程调度（真栽过：同一条判据在改动前后各偏向一边）。
+        self.assertTrue(wait_for(lambda: clip.clip.get("text/html") is not None),
+                        f"到点后没还原成最初那份：{clip.joined}")
         self.assertEqual(clip.clip.get("text/html"), "<b>原物</b>".encode("utf-8"))
         self.assertIsNone(srv._clip_job)
 
@@ -859,6 +906,9 @@ class TestWorkerRestorePlumbing(unittest.TestCase):
         self.assertIn("已备份", frame["clipboard"])
         _ms, fn = srv._deferred[0]
         fn()
+        # 同上：到点的还原在后台线程里跑，"到点"不等于"已经干完"，等它落地再断言。
+        self.assertTrue(wait_for(lambda: "已还原" in srv._status_frame()["clipboard"]),
+                        srv._status_frame()["clipboard"])
         self.assertIn("已还原", srv._status_frame()["clipboard"])
         self.assertNotIn(OUR_TEXT, json.dumps(srv._status_frame(), ensure_ascii=False),
                          "状态帧里不许带上屏的文本（既有隐私语义不许回退）")

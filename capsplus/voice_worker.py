@@ -196,13 +196,20 @@ def inject_diag_line(diag: dict) -> str:
 
 
 def inject_done_line(diag: dict) -> str:
-    """注入**回来之后**的那一行：后端、成不成、代码、步数。同样只有状态量。"""
+    """注入**回来之后**的那一行：后端、成不成、代码、步数、写入毫秒数。同样只有状态量。
+
+    `copy_ms=`（2026-10-19 补）是"写剪贴板那步的父进程**几毫秒退的**"——事故当天的形状是
+    等不到管道 EOF、整整 `STEP_TIMEOUT_S` 5 秒判死；修好后这一列该是毫秒级的小数字。
+    没跑到写入步（manual / 前置失败）记 -1；`code=owner_rejected` 时它是"rc=0 但所有权没拿到"
+    那次尝试的耗时。
+    """
     parts = (f"backend={diag.get('backend') or 'none'}",
              f"ok={1 if diag.get('ok') else 0}",
              f"code={diag.get('code') or '-'}",
              f"steps={_num(diag.get('steps'), 0)}",
              f"gate={diag.get('gate') or 'none'}",
-             f"unconfirmed={1 if diag.get('unconfirmed') else 0}")
+             f"unconfirmed={1 if diag.get('unconfirmed') else 0}",
+             f"copy_ms={_num(diag.get('copy_ms'), -1)}")
     return "inject_done " + " ".join(parts)
 
 
@@ -242,6 +249,9 @@ def build_diag(ui, gate: str, inject_us: int, finish_us: int) -> dict:
 
 def idle_note(diag: dict) -> str:
     """回 idle 的那句话：**没证实的事不许写成成功**。"""
+    if diag and diag.get("code") == "owner_rejected":
+        # 2026-10-19：写入"rc=0"但回读自证没过 ⇒ 连粘贴都没发，这不是"结束"，是**失败**。
+        return "上屏失败：wl-copy 没拿到剪贴板所有权（rc=0 但回读不是我们的文本）"
     if diag and diag.get("gate") == "cap":
         return "上屏未确认：未观察到焦点交出，注入可能落进自己"
     return "上屏结束"
@@ -542,7 +552,8 @@ class Session:
         self.inject_summary = result.describe()
         done = dict(diag or {})
         done.update(backend=result.backend or "", ok=bool(result.ok),
-                    code=result.code or "", steps=int(result.steps or 0))
+                    code=result.code or "", steps=int(result.steps or 0),
+                    copy_ms=result.copy_ms)
         P.log_line(inject_done_line(done))
         self.server.last_inject_diag = done
         self.inject_diag = done
