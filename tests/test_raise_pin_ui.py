@@ -28,6 +28,7 @@ import pathlib
 import re
 import shutil
 import subprocess
+import tempfile
 import sys
 import unittest
 
@@ -378,14 +379,62 @@ def _extract_functions(source: str, names) -> str:
 
 
 def _run_node(script_body: str) -> subprocess.CompletedProcess:
+    """把一段 JS 写成临时文件、用 node 真跑一遍。
+
+    ⚠ **跑完要清掉那个临时目录**（2026-10-20 发现的：原来 `mkdtemp` 之后没人收，
+    `/tmp/capsplus-extjs-*` 一天堆了 **141 个**、每个 282 字节 —— 机器上"散件"就是这么攒出来的）。
+    清场用 `shutil.rmtree`，不是"删除"，但同样属于中间产物：**跑完即清**是这一层的义务
+    （中间的 JS 源码没有必要留；要复算的人 poke 一下 `_node_source()` 就有了）。
+    """
     import tempfile
-    path = pathlib.Path(tempfile.mkdtemp(prefix="capsplus-extjs-")) / "probe.mjs"
-    path.write_text(script_body, encoding="utf-8")
-    return subprocess.run(["node", str(path)], capture_output=True, text=True, timeout=60)
+    directory = pathlib.Path(tempfile.mkdtemp(prefix="capsplus-extjs-"))
+    try:
+        path = directory / "probe.mjs"
+        path.write_text(script_body, encoding="utf-8")
+        return subprocess.run(["node", str(path)], capture_output=True, text=True, timeout=60)
+    finally:
+        shutil.rmtree(directory, ignore_errors=True)
 
 
 HOVER_FNS = ["HOVER_GRACE_MS", "TOOLBAR_GAP", "toolbarGeometry", "toolbarButtons",
              "hitButton", "hoverPlan"]
+
+
+class TestNodeProbeCleansUpAfterItself(unittest.TestCase):
+    """`_run_node` 跑完必须把临时目录收掉（2026-10-20：一天攒了 141 个 `/tmp/capsplus-extjs-*`）。"""
+
+    def test_temp_dir_is_removed_after_the_run(self):
+        seen = {}
+
+        def fake_run(argv, **kwargs):
+            seen["path"] = pathlib.Path(argv[1])
+            self.assertTrue(seen["path"].exists(), "跑之前那个 JS 文件得真写出来了")
+            return subprocess.CompletedProcess(argv, 0, "ok", "")
+
+        real = subprocess.run
+        subprocess.run = fake_run
+        try:
+            _run_node("console.log(1)")
+        finally:
+            subprocess.run = real
+        self.assertFalse(seen["path"].exists(), f"临时文件还在：{seen['path']}")
+        self.assertFalse(seen["path"].parent.exists(), f"临时目录还在：{seen['path'].parent}")
+
+    def test_temp_dir_is_removed_even_when_node_fails(self):
+        """node 自己炸了（超时）也要把临时目录收掉 —— 只写在 happy path 上等于没收。"""
+        def fake_run(argv, **kwargs):
+            raise subprocess.TimeoutExpired(argv, 60)
+
+        before = set(pathlib.Path(tempfile.gettempdir()).glob("capsplus-extjs-*"))
+        real = subprocess.run
+        subprocess.run = fake_run
+        try:
+            with self.assertRaises(subprocess.TimeoutExpired):
+                _run_node("while(1){}")
+        finally:
+            subprocess.run = real
+        after = set(pathlib.Path(tempfile.gettempdir()).glob("capsplus-extjs-*"))
+        self.assertEqual(after - before, set(), f"超时那次把临时目录留下了：{after - before}")
 
 
 class TestHoverToolbarIsReachable(unittest.TestCase):
