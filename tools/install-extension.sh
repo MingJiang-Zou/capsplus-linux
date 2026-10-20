@@ -27,16 +27,44 @@ if [ ! -f "$SRC_DIR/extension.js" ]; then
 fi
 
 mkdir -p "$DST_DIR"
-cp "$SRC_DIR/metadata.json" "$SRC_DIR/extension.js" "$DST_DIR/"
+
+# ⚠ 必须**原子落盘**（先在同目录写临时名，再 rename）—— 2026-10-20 真事故：
+#   本 unit 是 After=graphical-session.target，正好在 gnome-shell 扫描扩展目录时执行 `cp`，
+#   于是 shell 读到了**拷贝中的半截文件**：
+#     gnome-shell: Extension raise-browser@capsplus.example:
+#       TypeError: malformed UTF-8 character sequence at offset 8190
+#   （8190 ≈ 8192-2 = 一个汉字被切在两半；文件本身两份都合法，坏的只是那一刻的时序）
+#   ⇒ 扩展 import 失败 ⇒ 抓帧通道没有 ⇒ 明江按 Caps+F1 完全没反应、只能重登。
+#   同目录 rename 是原子的：shell 只会看到"旧完整文件"或"新完整文件"。
+install_atomic() {
+    _rel="$1"; _base="$(basename "$1")"
+    # 内容一样就**一个字节都不写**：稳态下登录时根本不碰这些文件，连"被读到半截"的机会都没有
+    if [ -f "$DST_DIR/$_base" ] && \
+       [ "$(md5sum < "$SRC_DIR/$_rel" | cut -d' ' -f1)" = "$(md5sum < "$DST_DIR/$_base" | cut -d' ' -f1)" ]; then
+        return 0
+    fi
+    cp "$SRC_DIR/$_rel" "$DST_DIR/.$_base.tmp.$$"
+    mv -f "$DST_DIR/.$_base.tmp.$$" "$DST_DIR/$_base"
+}
+install_atomic metadata.json
+install_atomic extension.js
 # stylesheet.css 也要复制：GNOME 会自动加载**扩展目录下**的同名样式表，
 # 少了它 extension.js 里那些 style_class 一个都不生效 —— 2026-10-19 明江那句
 # "贴出来的图 删都删不掉"就是这条（`×` 变成裸按钮：没尺寸、没背景、没 hover）。
 if [ -f "$SRC_DIR/stylesheet.css" ]; then
-    cp "$SRC_DIR/stylesheet.css" "$DST_DIR/"
+    install_atomic stylesheet.css
 else
     echo "⚠ 缺 $SRC_DIR/stylesheet.css：贴图会退回裸控件观感（按钮看不出能点）" >&2
 fi
-say "✓ 已复制到 $DST_DIR（含 stylesheet.css）"
+# 落盘后校对：尺寸 + md5 两边一致才认（半截文件从此当场现形，而不是等 shell 报 UTF-8 错）
+for _f in metadata.json extension.js stylesheet.css; do
+    [ -f "$SRC_DIR/$_f" ] || continue
+    if [ "$(md5sum < "$SRC_DIR/$_f" | cut -d' ' -f1)" != "$(md5sum < "$DST_DIR/$_f" | cut -d' ' -f1)" ]; then
+        echo "✗ $_f 落盘后与源不一致（原子拷贝失败？）" >&2
+        exit 1
+    fi
+done
+say "✓ 已复制到 $DST_DIR（含 stylesheet.css；原子落盘 + md5 校对）"
 
 # 追加进已启用列表（保留用户原有的，不覆盖）
 if command -v gsettings >/dev/null 2>&1; then
