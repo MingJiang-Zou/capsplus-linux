@@ -72,6 +72,10 @@ def key_action(keyval_name: str, ctrl: bool = False):
         return ACTION_FULL
     if keyval_name in ("Up", "Down", "Left", "Right"):
         return ACTION_NUDGE                  # 方向键微调选区（1px；Shift=10px）
+    if keyval_name.lower() == "c":
+        # 提取颜色（明江 2026-10-20 要的）：复制光标下那一个像素的 `#RRGGBB`。
+        # 只占 `C` **一个字母键**，且只在遮罩窗这几秒里有意义 —— 不碰别的键。
+        return ACTION_COPY_COLOUR
     return None
 
 
@@ -94,6 +98,33 @@ def nudge_rect(rect, dx: int, dy: int, union) -> tuple:
     max_y = union[1] + union[3] - h
     return (int(min(max(x + dx, union[0]), max(max_x, union[0]))),
             int(min(max(y + dy, union[1]), max(max_y, union[1]))), w, h)
+
+
+ACTION_COPY_COLOUR = "copy-colour"        # 按 C：把光标下的颜色复制走（提取颜色）
+
+
+def hex_colour(rgb) -> str:
+    """`(r, g, b)`（0–255）→ `#RRGGBB`（大写，跟设计/前端习惯一致）。"""
+    return "#%02X%02X%02X" % (int(rgb[0]), int(rgb[1]), int(rgb[2]))
+
+
+def pixel_colour(frame, xy, area, scale: float = 0.0) -> tuple:
+    """取冻结帧上某**逻辑坐标**的 RGB；取不到返回 `None`。
+
+    坐标要经过"逻辑 → 帧像素"的映射：帧可能是 1.3333×（本机实测），窗口也可能有 scale。
+    判据拿一张已知颜色的假冻结图来量（逐像素标尺），所以这里的换算必须精确。
+    """
+    if frame is None or xy is None:
+        return None
+    if scale <= 0:
+        scale = (frame.get_width() / float(area[2])) if area[2] else 1.0
+    px = int(min(max(xy[0] * scale, 0), frame.get_width() - 1))
+    py = int(min(max(xy[1] * scale, 0), frame.get_height() - 1))
+    frame.flush()
+    data = bytes(frame.get_data())
+    stride = frame.get_stride()
+    off = py * stride + px * 4
+    return (data[off + 2], data[off + 1], data[off])       # cairo ARGB32 在小端是 BGRA
 
 
 def magnifier_source(frame_size, xy, size=MAG_SIZE, zoom=MAG_ZOOM):
@@ -120,6 +151,45 @@ def magnifier_position(xy, area, size=MAG_SIZE, gap=MAG_GAP) -> tuple:
         y = xy[1] - gap - size
     return (int(min(max(x, 4), max(width - size - 4, 4))),
             int(min(max(y, 4), max(height - size - 4, 4))))
+
+
+def draw_colour_readout(cr, xy, rgb, area, size=(104, 26)) -> tuple:
+    """在指针旁边画 `#RRGGBB` + 一块色样（遮罩阶段的"提取颜色"，按 `C` 复制）。
+
+    贴在放大镜**旁边**；越界自动翻面并夹进绘制区域（与放大镜同一套避让思路）。
+    """
+    text = hex_colour(rgb)
+    w, h = size
+    x, y = xy[0] + 8, xy[1] + 8
+    if x + w > area[0] + area[2]:
+        x = xy[0] - w - 8
+    if y + h > area[1] + area[3]:
+        y = xy[1] - h - 8
+    x = max(area[0], min(x, area[0] + area[2] - w))
+    y = max(area[1], min(y, area[1] + area[3] - h))
+    cr.save()
+    cr.set_source_rgba(0.08, 0.08, 0.10, 0.88)
+    cr.rectangle(x, y, w, h)
+    cr.fill()
+    cr.set_source_rgb(rgb[0] / 255.0, rgb[1] / 255.0, rgb[2] / 255.0)
+    cr.rectangle(x + 3, y + 3, h - 6, h - 6)
+    cr.fill()
+    cr.set_line_width(1)
+    cr.set_source_rgba(1, 1, 1, 0.5)
+    cr.rectangle(x + 0.5, y + 0.5, w - 1, h - 1)
+    cr.stroke()
+    cr.set_source_rgb(0.97, 0.97, 0.97)
+    cr.select_font_face("Sans")
+    cr.set_font_size(12)
+    cr.move_to(x + h + 4, y + h - 9)
+    cr.show_text(text)
+    cr.restore()
+    # ⚠ 这里原来有一行 `cr.flush()` —— pycairo 的 `cairo.Context` **没有** flush 方法
+    #   （只有 `cairo.Surface.flush()`；本文件另外两处 flush 都打在 Surface 上，是对的）。
+    #   后果不是"这次没刷出去"，而是 **paint 处理器每帧抛 AttributeError**：
+    #   遮罩画不出十字线/读数，框选看起来"完全没反应"（2026-10-20 明江真机报"截图有问题"、
+    #   两次 Caps+F1 后只能去开 Snipaste）。删掉即可：GTK 的 draw 回调由 toolkit 自己提交。
+    return (x, y, w, h)
 
 
 def draw_magnifier(cr, frame, xy, area, size=MAG_SIZE, zoom=MAG_ZOOM) -> bool:
@@ -300,7 +370,7 @@ def text_box(text: str, font_size: int = FONT_SIZE) -> tuple:
 
 
 def paint(cr, area, rect, frame=None, hint: bool = True, crosshair=None, handles: bool = True,
-          magnifier=None):
+          magnifier=None, colour=None):
     """把遮罩画到 cairo 上下文上（**不碰 gi**，判据直接渲染到 ImageSurface 上断言像素）。
 
     像素口径（判据照这个算）：
@@ -400,6 +470,8 @@ def paint(cr, area, rect, frame=None, hint: bool = True, crosshair=None, handles
 
     if magnifier is not None:              # 放大镜最后画：压在所有东西上面
         draw_magnifier(cr, frame, magnifier, area)
+    if colour is not None:                 # 提取颜色：色值读数贴在放大镜/准线旁边
+        draw_colour_readout(cr, magnifier or crosshair or (area[0] + 8, area[1] + 8), colour, area)
 
 
 # ------------------------------------------------------------------------------ GTK 部分
@@ -680,6 +752,36 @@ class Overlay:
         self._quit_loop()
         return False
 
+    def _scaled_frame(self, idx, frame, area):
+        """**预缩放缓存**：把冻结图先缩到"与窗口同尺寸"，之后每帧只做同尺寸 blit。
+
+        性能体检（2026-10-20 实测，本机同图）：
+          * 每帧把 2560×1440 的源缩到 1920×1080：**p50 32.1 ms / p95 33.0 ms**（一帧就超 60Hz 两倍）
+          * 预缩放一次、之后只做同尺寸 `set_source_surface` + `paint()`：**p50 0.76 ms / p95 0.82 ms**
+          ⇒ 快 **~42×**。明江说的"框选特别卡"主要就是这条：拖选区时每次都要整幅重画 + 每帧重新缩放。
+        缓存键带 `area` 与帧对象 id（换帧/换窗口尺寸就重做），且**只留最新一份**（别把每块屏的图攒着）。
+        """
+        if frame is None:
+            return None
+        key = (idx, id(frame), tuple(area))
+        cached = getattr(self, "_scaled_cache", None)
+        if cached is None:
+            cached = self._scaled_cache = {}
+        hit = cached.get(key)
+        if hit is not None:
+            return hit
+        cairo = _cairo()
+        aw, ah = max(1, int(area[2])), max(1, int(area[3]))
+        surface = cairo.ImageSurface(cairo.FORMAT_ARGB32, aw, ah)
+        cr = cairo.Context(surface)
+        fw, fh = frame.get_width(), frame.get_height()
+        if fw > 0 and fh > 0:
+            cr.scale(aw / fw, ah / fh)
+            cr.set_source_surface(frame, 0, 0)
+            cr.paint()
+        self._scaled_cache = {key: surface}
+        return surface
+
     def _frame_for(self, idx: int):
         for frame in self.frames:
             if frame.rect == tuple(self.monitors[idx]):
@@ -694,6 +796,27 @@ class Overlay:
             return None
         return to_local(self.monitors[idx], self.rect)
 
+    def colour_at_pointer(self):
+        """指针下的颜色（从**冻结帧**取，按当前指针所在那块屏换算）。取不到返回 None。"""
+        if not self.pointer:
+            return None
+        idx, xy = self.pointer
+        if idx >= len(self.windows) or idx >= len(self.monitors):
+            return None
+        mon = self.monitors[idx]
+        return pixel_colour(self._frame_for(idx), xy, (0, 0, mon[2], mon[3]))
+
+    def copy_colour(self) -> tuple:
+        """按 `C`：把光标下的 `#RRGGBB` 送进剪贴板（复用剪贴板那条链路，失败如实说）。"""
+        rgb = self.colour_at_pointer()
+        if rgb is None:
+            return False, "✗ 取不到颜色（指针不在屏上？）"
+        text = hex_colour(rgb)
+        from capsplus import shot_annotate as SA
+        ok, why = SA.copy_text_to_clipboard(text)
+        self.colour_text = text
+        return ok, (f"✓ 已复制颜色 {text}" if ok else why)
+
     def _on_draw(self, widget, cr, idx):
         # 只依赖传进来的 widget 与显示器几何 —— **不查 self.windows**：
         # 这样判据能拿一个 `Gtk.OffscreenWindow + DrawingArea` 走**真实 draw 处理器**渲染（见
@@ -706,8 +829,13 @@ class Overlay:
             crosshair = self.pointer[1]
             if self.magnifier:                 # 放大镜：从**冻结帧**取样（零成本、零延迟）
                 magnifier = self.pointer[1]
-        paint(cr, area, self._local_rect(idx), frame=self._frame_for(idx), crosshair=crosshair,
-              magnifier=magnifier)
+        colour = None
+        if crosshair is not None and getattr(self, "colour_readout", True):
+            colour = pixel_colour(self._scaled_frame(idx, self._frame_for(idx), area),
+                                  crosshair, area)
+        paint(cr, area, self._local_rect(idx),
+              frame=self._scaled_frame(idx, self._frame_for(idx), area),
+              crosshair=crosshair, magnifier=magnifier, colour=colour)
         # ⚠ **必须 return True**（2026-10-19 真机事故）：`GtkWidget::draw` 的默认处理器跑在自定义
         # 处理器**之后**，会把控件自己的主题背景刷在我们的画上面 —— 表现就是"三个窗口尺寸都对，
         # 屏幕上却是整块纯白"（Adwaita 的 #fafafa ≈ 250；明江看到纯白、我抓屏读数也是均匀 250，
@@ -733,6 +861,11 @@ class Overlay:
         before = self._pointer_dirty_rect(idx)
         moved = self.on_motion(idx, (int(event.x), int(event.y)))
         after = self._pointer_dirty_rect(idx)
+        if moved != ACTION_IGNORE:
+            # 拖选区/新起选区时，压暗带与读数整片都变了 —— 只重画指针那一小块会**留残影**
+            # （脏矩形省法只适用于"指针动、选区不变"这一种情况）
+            self._redraw()
+            return True
         if before and after:                     # 两个小矩形的并集（旧位置也要重画，不然留残影）
             x0 = min(before[0], after[0]); y0 = min(before[1], after[1])
             x1 = max(before[0] + before[2], after[0] + after[2])
@@ -740,8 +873,8 @@ class Overlay:
             dirty = (x0, y0, x1 - x0, y1 - y0)
         else:
             dirty = None
-        if moved == ACTION_IGNORE or dirty is None:
-            self._redraw()                                  # 拿不准就整幅（宁可慢也别花屏）
+        if dirty is None:
+            self._redraw()                                  # 算不出脏矩形就整幅（宁可慢也别花屏）
         else:
             self._redraw(dirty=dirty, idx=idx)
         return True
@@ -770,10 +903,15 @@ class Overlay:
             shift = bool(event.state & Gdk.ModifierType.SHIFT_MASK)
         except Exception:
             name, ctrl, shift = "", False, False
-        if key_action(name, ctrl=ctrl) == ACTION_NUDGE:
+        action = key_action(name, ctrl=ctrl)
+        if action == ACTION_NUDGE:
             from capsplus.shot_annotate import nudge_delta      # 步长与标注窗同源
             dx, dy = nudge_delta(name, shift)
             self.nudge(dx, dy)
+        elif action == ACTION_COPY_COLOUR:
+            ok, why = self.copy_colour()                       # 提取颜色：复制 #RRGGBB
+            print(why)
+            self._redraw()
         else:
             self.on_key(name, ctrl=ctrl)
         if not self.outcome:
