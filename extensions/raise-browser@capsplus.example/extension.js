@@ -509,15 +509,33 @@ function setPinOpacity(pin, op) {
 // 鼠标离开贴图那一步就把工具条收了，永远到不了按钮。修法是双保险：
 //   ① 工具条放进贴图**内部**（右上角），鼠标不必离开 actor 就能到按钮；
 //   ② leave 不立刻 hide，给 HOVER_GRACE_MS 宽限，进工具条/按钮就取消。
-const HOVER_GRACE_MS = 250;             // 200–300ms 那段（lead 的要求）
+const HOVER_GRACE_MS = 250;             // 200–300ms 宽限：跨空隙也能走到工具条上
+const TOOLBAR_GAP = 6;                  // 工具条与贴图之间的空隙（宽限要大于走过去的时间）
 
-/** 工具条在贴图**内部**的位置：右上角内缩，保证"鼠标不离开贴图就能点"。 */
-function toolbarGeometry(pinWidth, pinHeight, barWidth, barHeight) {
-    const pad = 4;
-    const x = Math.max(pad, Math.round(pinWidth - barWidth - pad));
-    const y = pad;
-    return {x, y, inside: x >= 0 && y >= 0
-        && x + barWidth <= pinWidth && y + barHeight <= pinHeight};
+/**
+ * 工具条的位置：**在贴图外面**（明江 2026-10-20 明确：摆里面"会挡住贴图部分内容"）。
+ *
+ * 默认**下方**、下面放不下翻**上方**；再越界就左右挪，保证整条都在 stage 里。
+ * 返回的 `overlaps` 是判据要的那个硬条件：**与贴图矩形零重叠**。
+ * 与贴图之间留 `TOOLBAR_GAP` 的空隙 —— 跨这段空隙时靠 hover 宽限（`HOVER_GRACE_MS`）接住，
+ * 所以"点不到"的病根（离开就 hide）不能复发。
+ */
+function toolbarGeometry(pinWidth, pinHeight, barWidth, barHeight,
+                         pinX = 0, pinY = 0, stageW = 0, stageH = 0) {
+    const below = pinHeight + TOOLBAR_GAP;                  // 贴图右下角的相对坐标
+    let y = below;
+    if (stageH && pinY + pinHeight + TOOLBAR_GAP + barHeight > stageH)
+        y = -TOOLBAR_GAP - barHeight;                       // 下面放不下 ⇒ 翻到上方
+    let x = Math.max(0, Math.round(pinWidth - barWidth));   // 默认与贴图右缘对齐
+    if (stageW) {
+        const absX = pinX + x;
+        if (absX + barWidth > stageW)
+            x = Math.max(0, stageW - pinX - barWidth);
+        if (pinX + x < 0)
+            x = -pinX;
+    }
+    const overlaps = x < pinWidth && x + barWidth > 0 && y < pinHeight && y + barHeight > 0;
+    return {x, y, overlaps};
 }
 
 /** 三个按钮的命中矩形（点击区要够大：工具条高 h、每个按钮宽 w）。 */
@@ -583,7 +601,8 @@ function buildPinToolbar(pin) {
     // 工具条是**贴图的子 actor**，而且画在贴图**内部右上角**（lead 的修法 ①）：
     // 之前画在 `pin.height + 6`（贴图外面），鼠标离开贴图那一步就够不着按钮了。
     const BAR_H = 34, BAR_W = 34 * 3 + 4;
-    const geo = toolbarGeometry(pin.width, pin.height, BAR_W, BAR_H);
+    const geo = toolbarGeometry(pin.width, pin.height, BAR_W, BAR_H, pin.x, pin.y,
+                                global.stage.width, global.stage.height);
     bar.set_size(BAR_W, BAR_H);
     bar.set_position(geo.x, geo.y);
     pin.toolbarGeometry = geo;
@@ -592,7 +611,7 @@ function buildPinToolbar(pin) {
     let i = 0;
     for (const child of bar.get_children())
         child.set_size(34, BAR_H);
-    pinLog('toolbar', `x=${geo.x} y=${geo.y} inside=${geo.inside}`);
+    pinLog('toolbar', `x=${geo.x} y=${geo.y} overlaps=${geo.overlaps}`);
     // hover 宽限（lead 的修法 ②）：进工具条取消隐藏、离开重新起算
     const arm = () => {
         const r = hoverPlan(pin.hover || {visible: true, deadline: 0}, 'bar-leave',

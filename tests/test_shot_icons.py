@@ -24,6 +24,12 @@ import unittest
 REPO = pathlib.Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO))
 
+try:
+    import cairo as _cairo_probe
+    _HAVE_CAIRO = True
+except Exception:
+    _HAVE_CAIRO = False
+
 from capsplus import shot_icons as I        # noqa: E402
 from capsplus import shot_style as S        # noqa: E402
 
@@ -260,3 +266,25 @@ import re  # noqa: E402  （放在末尾：上面的用例用得到，但读起�
 
 if __name__ == "__main__":
     unittest.main()
+
+
+@unittest.skipUnless(_HAVE_CAIRO, "没有 pycairo：这条要真渲染图标")
+class TestEveryToolIconHasInk(unittest.TestCase):
+    """每个工具图标都**真画出东西**（吸管第一版画了 0 个像素 —— 空图标=按钮看着是空的）。
+
+    这条比"图标两两不同"更硬：0 墨量的图标彼此也"不同"（都不同），但那是个空按钮。
+    """
+
+    def test_each_tool_icon_has_ink(self):
+        from capsplus import shot_icons as I
+        blank = []
+        for name in I.TOOL_ICONS:
+            surface = I.render_icon(name, 22, (0, 0, 0, 1))
+            surface.flush()
+            data = bytes(surface.get_data())
+            stride = surface.get_stride()
+            ink = sum(1 for y in range(surface.get_height()) for x in range(surface.get_width())
+                      if data[y * stride + x * 4 + 3] > 40)
+            if ink < 20:
+                blank.append(f"{name}({ink}px)")
+        self.assertEqual(blank, [], f"这些工具图标是空的：{blank}")

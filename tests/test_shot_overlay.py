@@ -107,9 +107,15 @@ class TestKeyAndButtonMap(unittest.TestCase):
         self.assertEqual(OV.key_action("A", ctrl=True), OV.ACTION_FULL)
 
     def test_letter_keys_are_not_stolen_without_ctrl(self):
-        """遮罩窗短暂持有键盘焦点：**不许**抢明江的普通按键（'a' 不该被当成全选）。"""
-        for name in ("a", "c", "s", "z", "space", "F5", ""):
+        """遮罩窗短暂持有键盘焦点：**除明江点名的 `C` 之外**，不许抢普通按键。
+
+        `C` = 提取颜色（2026-10-20 明江要的功能，他自己建议用 C：复制光标下的 `#RRGGBB`）。
+        这条是**唯一放行的字母键**，别的一个都不许加 —— 多一个都算偷他的输入。
+        """
+        for name in ("a", "s", "z", "d", "b", "space", "F5", ""):
             self.assertIsNone(OV.key_action(name), f"{name} 不该被遮罩吃掉")
+        self.assertEqual(OV.key_action("c"), OV.ACTION_COPY_COLOUR)
+        self.assertEqual(OV.key_action("C"), OV.ACTION_COPY_COLOUR, "大写 C（Shift）也认）")
 
     def test_buttons(self):
         self.assertEqual(OV.button_action(1, False), OV.ACTION_START)
@@ -1052,21 +1058,25 @@ class TestMotionOnlyRedrawsADirtyRect(unittest.TestCase):
         def get_window(self):
             return self.gdk
 
-    def _overlay(self, count=2):
+    @staticmethod
+    def _overlay_only(count=2):
         """只要"重画范围"这部分行为：`on_motion` 换成一个只做记账的桩。
 
         真实 `on_motion` 里还有拖拽/吸附等状态，本判据不管那些（它们各有自己的判据）；
         但**指针记账**要保留，因为脏矩形就是按指针算的。
         """
         ov = OV.Overlay.__new__(OV.Overlay)
-        ov.windows = [self._FakeWin() for _ in range(count)]
+        ov.windows = [TestMotionOnlyRedrawsADirtyRect._FakeWin() for _ in range(count)]
         ov.pointer = None
 
         def on_motion(idx, xy):
             ov.pointer = (idx, xy)
-            return OV.ACTION_UPDATE
+            return OV.ACTION_IGNORE         # **纯指针移动**（选区不变）才走脏矩形省法
         ov.on_motion = on_motion
         return ov
+
+    def _overlay(self, count=2):
+        return self._overlay_only(count)
 
     def test_motion_inside_one_monitor_invalidates_a_small_rect_on_that_monitor(self):
         ov = self._overlay()
@@ -1099,3 +1109,61 @@ class TestMotionOnlyRedrawsADirtyRect(unittest.TestCase):
         ov._on_motion_event(None, _Ev(0, 10, 10), 0)
         self.assertIn(None, ov.windows[0].gdk.calls)
         self.assertEqual(before, (2, 2, 80, 80))
+
+
+@unittest.skipUnless(HAVE_CAIRO, "没有 pycairo：这条要真建 surface")
+class TestFrameIsPreScaledOnce(unittest.TestCase):
+    """② 每帧不许重新缩放冻结图（**"框选特别卡"的主因**）。
+
+    实测（2026-10-20）：每帧把 2560×1440 的源缩到 1920×1080 = **p50 32.1 ms**；
+    预缩放成同尺寸后只做 blit = **p50 0.76 ms**（~42×）。判据：同一帧连续画两次，
+    第二次不许再建 surface（缓存命中），且喂给 `paint` 的 frame **尺寸与绘制区域一致**。
+    """
+
+    def test_second_draw_reuses_the_cache(self):
+        ov = OV.Overlay.__new__(OV.Overlay)
+        ov.monitors = [(0, 0, 400, 300)]
+        frame_surface = pattern_surface(640, 480)          # 故意不是 1:1（1.3333× 那种）
+
+        class _Frame:
+            rect = (0, 0, 400, 300)
+            surface = frame_surface
+        ov.frames = [_Frame()]
+        area = (0, 0, 400, 300)
+        first = ov._scaled_frame(0, frame_surface, area)
+        self.assertIsNotNone(first)
+        self.assertEqual((first.get_width(), first.get_height()), (400, 300),
+                         "缓存后的帧必须与绘制区域同尺寸（否则每帧还得缩放）")
+        second = ov._scaled_frame(0, frame_surface, area)
+        self.assertIs(second, first, "第二次没有命中缓存 —— 又在每帧重新缩放")
+
+    def test_area_change_invalidates_the_cache(self):
+        ov = OV.Overlay.__new__(OV.Overlay)
+        frame_surface = pattern_surface(640, 480)
+        a = ov._scaled_frame(0, frame_surface, (0, 0, 400, 300))
+        b = ov._scaled_frame(0, frame_surface, (0, 0, 800, 600))
+        self.assertIsNot(a, b, "窗口尺寸变了还拿老缓存 ⇒ 会拉伸错位")
+        self.assertEqual((b.get_width(), b.get_height()), (800, 600))
+
+    def test_none_frame_is_tolerated(self):
+        ov = OV.Overlay.__new__(OV.Overlay)
+        self.assertIsNone(ov._scaled_frame(0, None, (0, 0, 10, 10)))
+
+
+class TestDraggingRepaintsTheWholeBand(unittest.TestCase):
+    """拖选区时**必须整幅重画**：压暗带整片都变，只重画指针那一小块会留残影。
+
+    （这是我上一轮做脏矩形省法时留下的隐患，性能体检时抓出来的。）
+    """
+
+    def test_drag_triggers_a_full_repaint_not_a_dirty_rect(self):
+        ov = TestMotionOnlyRedrawsADirtyRect._overlay_only()
+        ov.pointer = (0, (100, 100))
+
+        def on_motion(idx, xy):
+            ov.pointer = (idx, xy)
+            return OV.ACTION_UPDATE         # 正在拖选区
+        ov.on_motion = on_motion
+        ov._on_motion_event(None, _Ev(0, 140, 160), 0)
+        self.assertIn(None, ov.windows[0].gdk.calls,
+                      "拖选区时只重画了脏矩形 —— 压暗带会留残影")

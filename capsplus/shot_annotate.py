@@ -50,16 +50,16 @@ BADGE_RADIUS = 14
 BADGE_FONT_SIZE = 16
 
 TOOLS = ("rect", "ellipse", "arrow", "line", "highlight", "pen",
-         "badge", "text", "mosaic", "eraser")
+         "badge", "text", "mosaic", "eraser", "eyedropper")
 TOOL_LABELS = {"rect": "矩形", "ellipse": "椭圆", "arrow": "箭头", "line": "直线",
                "highlight": "荧光笔", "pen": "自由笔", "badge": "序号",
-               "text": "文字", "mosaic": "马赛克", "eraser": "橡皮"}
+               "text": "文字", "mosaic": "马赛克", "eraser": "橡皮", "eyedropper": "吸管"}
 
 # 工具条分组（**组间细分隔线**，绘制类在左、标记类居中、编辑类靠右；判据断言"分组齐全且无重复"）
 TOOL_GROUPS = (
     ("rect", "ellipse", "arrow", "line", "highlight", "pen"),
     ("badge", "text", "mosaic"),
-    ("eraser",),
+    ("eraser", "eyedropper"),          # 工具组：橡皮与吸管都是"作用于已有画面"的
 )
 
 # 选中态手柄（8 个）与命中容差
@@ -331,10 +331,11 @@ def render(cr, base_surface, shapes, size=None, selected=None, hover=None) -> No
             cr.rectangle(x + 0.5, y + 0.5, max(w - 1, 1), max(h - 1, 1))
             cr.stroke()
         elif shape.kind == "arrow":
-            cr.move_to(x, y + h)                     # 从选区左下 → 右上（拖出来的对角线方向）
-            cr.line_to(x + w, y)
+            start, end = shape_endpoints(shape)       # **方向按画的人定的**（不再写死对角线）
+            cr.move_to(*start)
+            cr.line_to(*end)
             cr.stroke()
-            tri = arrow_head((x, y + h), (x + w, y))
+            tri = arrow_head(start, end)
             cr.move_to(*tri[0])
             for pt in tri[1:]:
                 cr.line_to(*pt)
@@ -359,8 +360,9 @@ def render(cr, base_surface, shapes, size=None, selected=None, hover=None) -> No
             cr.restore()
             cr.stroke()
         elif shape.kind == "line":
-            cr.move_to(x, y + h)
-            cr.line_to(x + w, y)
+            start, end = shape_endpoints(shape)       # 同上：端点与方向都按实际拖拽
+            cr.move_to(*start)
+            cr.line_to(*end)
             cr.stroke()
         elif shape.kind == "pen":
             _draw_polyline(cr, shape)
@@ -370,6 +372,41 @@ def render(cr, base_surface, shapes, size=None, selected=None, hover=None) -> No
             _draw_mosaic(cr, base_surface, shape.rect, size)
 
     _draw_selection(cr, selected, hover)
+
+
+DIRECTIONAL_TOOLS = ("arrow", "line")     # 有方向的：起点/终点不能靠"矩形对角线"猜
+
+
+def shape_endpoints(shape) -> tuple:
+    """箭头/直线的 `(起点, 终点)`。
+
+    有 `points` 就用它（**方向是画的人定的**）；没有则退回"矩形左下 → 右上"——
+    那是老数据的兼容路径（老图形没存方向），新画的图形一律走 points。
+    """
+    if shape.points and len(shape.points) >= 2:
+        return (tuple(shape.points[0]), tuple(shape.points[-1]))
+    x, y, w, h = shape.rect
+    if shape.kind == "arrow":
+        return ((x, y + h), (x + w, y))
+    return ((x, y), (x + w, y + h))
+
+
+def set_shape_endpoints(shape, start, end) -> None:
+    """把端点写回图形：`points` 存方向，`rect` 存包围盒（正宽高，选择/手柄/裁剪都用它）。"""
+    shape.points = [tuple(start), tuple(end)]
+    shape.rect = _points_rect(shape.points)
+
+
+def _point_segment_distance(point, start, end) -> float:
+    """点到线段的距离（箭头/直线的命中判定用）。"""
+    px, py = point
+    x0, y0 = start
+    x1, y1 = end
+    dx, dy = x1 - x0, y1 - y0
+    if dx == 0 and dy == 0:
+        return math.hypot(px - x0, py - y0)
+    t = max(0.0, min(1.0, ((px - x0) * dx + (py - y0) * dy) / float(dx * dx + dy * dy)))
+    return math.hypot(px - (x0 + t * dx), py - (y0 + t * dy))
 
 
 def _shape_state(shape) -> tuple:
@@ -498,12 +535,17 @@ def clamp_rect_to_image(rect, image_size) -> tuple:
 
 
 def clip_shape_to_image(shape, image_size) -> bool:
-    """把某个图形的几何裁进截图矩形；返回是否被裁过。"""
+    """把某个图形的几何裁进截图矩形；返回是否被裁过。
+
+    ⚠ 点集类图形（自由笔 / 箭头 / 直线）必须**先夹点、再由点算包围盒** —— 顺序反了的话
+    `clamp_rect_to_image`（保持宽高往回收）会把已经算好的盒子再挪一次，方向跟着串。
+    """
     before = (tuple(shape.rect), tuple(shape.points) if shape.points else None)
-    shape.rect = clamp_rect_to_image(shape.rect, image_size)
     if shape.points:
         shape.points = [clamp_to_image(pt, image_size) for pt in shape.points]
         shape.rect = _points_rect(shape.points)
+    else:
+        shape.rect = clamp_rect_to_image(shape.rect, image_size)
     return (tuple(shape.rect), tuple(shape.points) if shape.points else None) != before
 
 
@@ -530,6 +572,11 @@ def hit_test(shape, xy, tol=SELECT_TOL, inside=False) -> bool:
     x, y, w, h = shape_bounds(shape)
     if shape.kind == "highlight":
         return (x - tol <= xy[0] <= x + w + tol) and (y - tol <= xy[1] <= y + h + tol)
+    if shape.kind in DIRECTIONAL_TOOLS:
+        # 箭头/直线是**斜的**：按"点到线段的距离"判命中。
+        # 只看包围盒边线的话，点在斜线正中反而不算命中（2026-10-20 顺手修的）
+        start, end = shape_endpoints(shape)
+        return _point_segment_distance(xy, start, end) <= tol + shape.width
     # 线状/框状图元：按边线的距离判定（点空心处不算命中）
     near_x = min(abs(xy[0] - x), abs(xy[0] - (x + w))) <= tol + shape.width
     near_y = min(abs(xy[1] - y), abs(xy[1] - (y + h))) <= tol + shape.width
@@ -736,6 +783,26 @@ def clipboard_command() -> list:
     return list(CLIPBOARD_CMD)
 
 
+def copy_text_to_clipboard(text: str, runner=None, which=None) -> tuple:
+    """把**文本**（色值那种）送进剪贴板：`wl-copy --type text/plain` + 同样的守护步规矩。
+
+    与复制图片走同一条 runner（守护型命令不接管道，见 `_default_clipboard_runner` 的教训）。
+    """
+    import shutil
+    which = which or shutil.which
+    if which("wl-copy") is None:
+        return False, "✗ 这台机没有 wl-copy（Wayland 剪贴板工具没装）"
+    runner = runner or _default_clipboard_runner
+    argv = list(CLIPBOARD_CMD) + ["--type", "text/plain"]
+    try:
+        proc = runner(argv, str(text).encode("utf-8"))
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return False, f"✗ wl-copy 失败：{exc}"
+    if getattr(proc, "returncode", 0) != 0:
+        return False, f"✗ wl-copy 退出码 {proc.returncode}"
+    return True, f"✓ 已复制 {text}"
+
+
 def copy_to_clipboard(data: bytes, runner=None, which=None) -> tuple:
     """复制到剪贴板；返回 `(ok, 说明)`。没有 wl-copy 时**如实说**，不假装成功。"""
     import shutil
@@ -845,8 +912,16 @@ class Annotator:
             out.append(self.pending)
         return out
 
+    picked = ""            # 吸管取到的颜色（`#RRGGBB`，状态栏显示）
+
     def press(self, image_xy) -> None:
         """按下：**先看是不是在动已有标注**（拖动/缩放手柄），否则起一笔新的。"""
+        if self.tool == "eyedropper":
+            ok, hex_ = self.pick_colour(image_xy)      # 取色不产生图形、不进撤销栈
+            if ok:
+                self.message = f"✓ 取了颜色 {hex_}（接着画的图元就用它）"
+            self._drag_mode = None
+            return
         mode = self.start_drag(image_xy)
         self._drag_mode = mode
         self.drag_from = None if mode != "draw" else image_xy
@@ -869,6 +944,10 @@ class Annotator:
             from capsplus.shot_frame import normalize_rect
             rect = normalize_rect(self.drag_from[0], self.drag_from[1], image_xy[0], image_xy[1])
             self.pending = Shape(self.tool, rect, color=self.color, width=self.width)
+            if self.tool in DIRECTIONAL_TOOLS:
+                # **方向要留住**：矩形只有正宽高，光靠它推不出"从哪拖到哪"
+                # （2026-10-20 P0：起点到处跑、终点 y 不动就是这么来的）
+                set_shape_endpoints(self.pending, self.drag_from, image_xy)
 
     def release(self) -> bool:
         """松手：拖动/缩放落地（记一笔编辑），画的那笔画进栈（太小的丢掉）。"""
@@ -943,7 +1022,18 @@ class Annotator:
         shape = self.selected
         if shape is None:
             return False
-        shape.rect = clamp_rect_to_image(resize_rect(shape.rect, handle, image_xy), self.size)
+        old_rect = shape.rect
+        new_rect = resize_rect(old_rect, handle, image_xy)
+        shape.rect = new_rect
+        if shape.points and shape.kind in DIRECTIONAL_TOOLS:
+            # 端点按"旧盒子 → 新盒子"的比例映射：方向保持，端点跟着手柄走
+            ox, oy, ow, oh = old_rect
+            nx, ny, nw, nh = new_rect
+            shape.points = [
+                (int(round(nx + (p[0] - ox) * (nw / ow if ow else 1))),
+                 int(round(ny + (p[1] - oy) * (nh / oh if oh else 1))))
+                for p in shape.points]
+        clip_shape_to_image(shape, self.size)
         return True
 
     def nudge_selected(self, dx, dy) -> bool:
@@ -1034,6 +1124,26 @@ class Annotator:
                                        BADGE_RADIUS * 2, BADGE_RADIUS * 2),
                              text=str(number), color=self.color, width=self.width))
         return True
+
+    def pick_colour(self, image_xy) -> tuple:
+        """吸管：取画布上那一个像素的颜色，设为当前绘制颜色；返回 `(ok, hex)`。
+
+        颜色**从底图（截图）取**、不是从标注层取 —— 所以精确到那个像素。
+        """
+        x, y = int(image_xy[0]), int(image_xy[1])
+        if not (0 <= x < self.size[0] and 0 <= y < self.size[1]):
+            return False, ""
+        try:
+            self.base.flush()
+            data = bytes(self.base.get_data())
+            stride = self.base.get_stride()
+            off = y * stride + x * 4
+            rgb = (data[off + 2], data[off + 1], data[off])        # cairo 小端是 BGRA
+        except Exception:
+            return False, ""
+        self.color = (rgb[0] / 255.0, rgb[1] / 255.0, rgb[2] / 255.0, 1.0)
+        self.picked = "#%02X%02X%02X" % rgb
+        return True, self.picked
 
     def click(self, image_xy) -> str:
         """单击：文字弹输入框、序号当场落一个圆标、**橡皮删掉点中的标注**，其余什么也不做。"""
@@ -1468,7 +1578,8 @@ class Annotator:
             return
         from capsplus import shot_style
         selected = shape_label(self.selected) if self.selected is not None else ""
-        self._status.set_text(shot_style.status_text(self.focused, selected, self.message))
+        self._status.set_text(shot_style.status_text(self.focused, selected, self.message,
+                                                     picked=self.picked))
         if getattr(self, "_status_more", None) is not None:
             self._status_more.set_text(shot_style.status_more(self.focused))
 

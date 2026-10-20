@@ -221,7 +221,8 @@ SECONDARY_KEYS = ("F2 翻译", "F3 贴图", "F4 OCR", "Ctrl+Y 重做",
                   "方向键微调（Shift=10px）", "Del 删掉选中", "右键菜单")
 
 
-def status_text(focused: bool = True, selected: str = "", message: str = "") -> str:
+def status_text(focused: bool = True, selected: str = "", message: str = "",
+                picked: str = "") -> str:
     """状态栏**主行**：消息 · 选中了什么 · 常用键（大一点）。
 
     ⚠ 与 `status_more()` 分两档显示（lead："太密、层次没出来"）：常用键给主行，其余键收成次要那行。
@@ -230,6 +231,8 @@ def status_text(focused: bool = True, selected: str = "", message: str = "") -> 
     if message:
         parts.append(message)
     parts.append(f"已选：{selected}" if selected else "未选中标注（点一下标注就能拖/改）")
+    if picked:                                   # 吸管取到的颜色（提取颜色那条功能）
+        parts.append(f"取色 {picked}")
     if not focused:
         parts.append("窗口没有焦点：F2/F3/F4 现在**不会**生效 —— 点一下窗口再按")
     parts.append("　·　".join(PRIMARY_KEYS))

@@ -332,12 +332,15 @@ log.push(['tick-after-cancel', step('tick', 3000), state.visible]);
 log.push(['bar-leave', step('bar-leave', 3100), state.visible]);
 log.push(['tick-early', step('tick', 3200), state.visible]);
 log.push(['tick-expired', step('tick', 3400), state.visible]);
-const geo = toolbarGeometry(400, 300, 106, 34);
+const geo = toolbarGeometry(400, 300, 106, 34, 200, 100, 1920, 1080);
+const geoBottom = toolbarGeometry(400, 300, 106, 34, 200, 380, 1920, 700);   // 贴图贴近下沿
+const geoEdge = toolbarGeometry(400, 300, 106, 34, 1800, 100, 1920, 1080);   // 贴右边界
 const buttons = toolbarButtons(geo, 34, 3);
 const hit = hitButton(buttons, geo.x + 2, geo.y + 10);
 const hitClose = hitButton(buttons, geo.x + 2 * 34 + 2, geo.y + 10);
 const miss = hitButton(buttons, geo.x - 50, geo.y - 50);
-console.log('SUMMARY ' + JSON.stringify({log, geo, hit, hitClose, miss, grace: HOVER_GRACE_MS}));
+console.log('SUMMARY ' + JSON.stringify({log, geo, geoBottom, geoEdge, hit, hitClose, miss,
+                                        grace: HOVER_GRACE_MS, barW: 106, barH: 34}));
 """
 
 
@@ -381,7 +384,8 @@ def _run_node(script_body: str) -> subprocess.CompletedProcess:
     return subprocess.run(["node", str(path)], capture_output=True, text=True, timeout=60)
 
 
-HOVER_FNS = ["HOVER_GRACE_MS", "toolbarGeometry", "toolbarButtons", "hitButton", "hoverPlan"]
+HOVER_FNS = ["HOVER_GRACE_MS", "TOOLBAR_GAP", "toolbarGeometry", "toolbarButtons",
+             "hitButton", "hoverPlan"]
 
 
 class TestHoverToolbarIsReachable(unittest.TestCase):
@@ -421,17 +425,30 @@ class TestHoverToolbarIsReachable(unittest.TestCase):
         self.assertEqual(data["hitClose"], 2, "× 要一击即中")
         self.assertEqual(data["miss"], -1, "没点到就该返回 -1（别误触发）")
 
-    def test_toolbar_sits_inside_the_pin(self):
+    def test_toolbar_never_overlaps_the_pin(self):
+        """**工具条与贴图矩形零重叠**（明江 2026-10-20：摆里面"会挡住贴图部分内容"）。
+
+        坐标断言（不是"看起来没压"）：工具条矩形与贴图矩形必须有**空隙**、不许相交；
+        位置默认在下方，下面放不下翻上方，贴到屏幕边缘时还得留在 stage 里。
+        """
         data = self._summary()
-        self.assertTrue(data["geo"]["inside"],
-                        "工具条跑到贴图外面了：" + str(data["geo"]) + "（鼠标得离开 actor 才够得着）")
-        # 光看纯函数不够：**接线也得用它的结果**（把 set_position 挪回贴图外面 = 反例 BQ）
+        geo, bar_w, bar_h = data["geo"], data["barW"], data["barH"]
+        pin_w, pin_h = 400, 300
+
+        def overlaps(g, w=bar_w, h=bar_h):
+            return g["x"] < pin_w and g["x"] + w > 0 and g["y"] < pin_h and g["y"] + h > 0
+        self.assertFalse(overlaps(geo), f"工具条压在贴图上了：{geo}")
+        self.assertFalse(geo["overlaps"], "函数自己报的 overlaps 也该是 false")
+        self.assertGreaterEqual(geo["y"], pin_h + 1, "默认该在下方（留空隙）")
+        self.assertLess(data["geoBottom"]["y"], 0, "底下放不下时该翻到上方")
+        self.assertFalse(overlaps(data["geoBottom"]), "翻到上方后也不许压住贴图")
+        self.assertGreaterEqual(data["geoEdge"]["x"] + bar_w, 0, "越界要拉回可见范围")
+        self.assertLessEqual(200 + data["geoEdge"]["x"] + bar_w, 1920, "整条工具条要在屏幕内")
+        # 接线也要用它的结果（摆回内部 = 反例）
         bar = self.src[self.src.index("function buildPinToolbar"):]
         bar = bar[:bar.index("\n}")]
-        code = strip_comments(bar)
-        self.assertIn("bar.set_position(geo.x, geo.y)", code,
-                      "工具条没按 toolbarGeometry 的结果摆 —— 又摆到贴图外面去了")
-        self.assertNotIn("pin.height +", code, "工具条被摆到贴图下沿外面了")
+        self.assertIn("bar.set_position(geo.x, geo.y)", strip_comments(bar),
+                      "工具条没按 toolbarGeometry 的结果摆")
 
     def test_leave_does_not_hide_immediately_in_the_source(self):
         """源码层面再钉一次：贴图的 leave-event 里**不许**直接 `toolbar.hide()`。"""

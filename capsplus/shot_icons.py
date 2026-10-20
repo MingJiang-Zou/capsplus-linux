@@ -22,20 +22,22 @@ DEFAULT_LINE = 1.8
 ICON_NAMES = (
     "rect", "ellipse", "arrow", "line", "highlight", "pen",      # 绘制类
     "badge", "text", "mosaic",                                   # 标记类
-    "eraser", "undo", "redo",                                    # 编辑类
+    "eraser", "eyedropper", "undo", "redo",                      # 编辑类
     "copy", "save", "pin", "close",                              # 动作类
     "ocr", "translate", "check", "magnifier",                    # 辅助
 )
 
 # 工具 → 图标（工具自身的名字就是图标名，这里只是留个显式的对照表，防止改名时漏改）
 TOOL_ICONS = {name: name for name in ("rect", "ellipse", "arrow", "line", "highlight",
-                                      "pen", "badge", "text", "mosaic", "eraser")}
+                                      "pen", "badge", "text", "mosaic", "eraser",
+                                      "eyedropper")}
 
 # 每个图标的悬浮提示（工具条用，别写"2px"这种没人看得懂的东西）
 TIPS = {
     "rect": "矩形", "ellipse": "椭圆", "arrow": "箭头", "line": "直线",
     "highlight": "荧光笔", "pen": "自由笔", "badge": "序号", "text": "文字",
     "mosaic": "马赛克", "eraser": "橡皮（点一下删掉那个标注）",
+    "eyedropper": "吸管（点一下取那个像素的颜色）",
     "undo": "撤销（Ctrl+Z）", "redo": "重做（Ctrl+Y）",
     "copy": "复制到剪贴板（Enter）", "save": "存盘（Ctrl+S）",
     "pin": "贴到屏幕上（F3）", "close": "关闭（Esc）",
@@ -121,6 +123,18 @@ def draw_icon(cr, name: str, size: float, line: float = DEFAULT_LINE) -> bool:
                 cr.rectangle(lo + ix * step + s * 0.02, lo + iy * step + s * 0.02,
                              step - s * 0.06, step - s * 0.06)
                 cr.fill()
+    elif name == "eyedropper":
+        # 吸管：斜管身 + 尖头 + 顶上的球（与其它图标同一支笔触，画完自己 stroke）
+        cr.move_to(lo + s * 0.10, hi - s * 0.10)
+        cr.line_to(mid + s * 0.06, mid - s * 0.04)
+        cr.stroke()
+        cr.move_to(lo + s * 0.06, hi - s * 0.20)        # 尖头（一个小三角）
+        cr.line_to(lo + s * 0.20, hi - s * 0.06)
+        cr.line_to(lo + s * 0.10, hi - s * 0.10)
+        cr.close_path()
+        cr.fill()
+        cr.arc(hi - s * 0.16, lo + s * 0.16, s * 0.13, 0, 2 * math.pi)
+        cr.stroke()
     elif name == "eraser":
         cr.move_to(lo, hi - s * 0.12)            # 斜着的橡皮块
         cr.line_to(mid - s * 0.02, lo + s * 0.06)

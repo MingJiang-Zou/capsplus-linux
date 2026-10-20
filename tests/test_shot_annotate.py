@@ -27,7 +27,8 @@ import unittest
 REPO = pathlib.Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO))
 
-from capsplus import shot_annotate as AN          # noqa: E402
+from capsplus import shot_annotate as AN
+from capsplus import shot_overlay as OV          # noqa: E402
 from capsplus import shot_frame as SF             # noqa: E402
 
 try:
@@ -1567,6 +1568,222 @@ class TestDaemonStyleSubprocesses(unittest.TestCase):
                     offenders.append(f"{path.name}:{node.lineno}({node.name})")
         self.assertEqual(offenders, [],
                          f"这些点可能在等一条没人关的管子：{offenders}")
+
+
+if __name__ == "__main__":
+    unittest.main()
+
+
+@unittest.skipUnless(HAVE_CAIRO, "没有 pycairo：这条要真造图/真渲染")
+class TestArrowAndLineEndpoints(unittest.TestCase):
+    """箭头/直线的**起点与终点必须就是按下的点与抬起的点**（2026-10-20 真机 P0）。
+
+    明江原话：「标注箭头和直线的时候有 bug，在点击拖动添加箭头的时候，**箭头的起始点会到处跑
+    （和鼠标移动方向关联）**，**箭头的终点反而不会 y 轴移动**」。
+
+    实测根因（先复现、后定位）：`drag()` 用 `normalize_rect(A, B)` 落地成一个**正宽高**矩形，
+    而渲染箭头时是**写死的"选区左下 → 右上"对角线**（`move_to(x, y+h) → line_to(x+w, y)`）——
+    方向信息在 job 之前就丢了。于是：
+      * 起点 = 矩形的某个角（随拖拽象限翻来翻去）⇒ "到处跑"；
+      * 竖直方向上，矩形顶边 `min(y0,y1)` 与高度 `|dy|` 反向变化 ⇒ 终点 y 被钉住 ⇒ "终点不随 y 动"。
+    **不是**上一批"落笔裁在截图内"引入的（把裁剪整个关掉，本判据照样红——见 class
+    `TestClippingDoesNotChangeEndpoints` 与 mutation 记录）。
+    """
+
+    def _annotator(self):
+        return AN.Annotator(white_surface(400, 300), screen=(400, 300),
+                            directory=temp_dir(), clip=lambda _d: (True, "s"))
+
+    def _drag(self, tool, a, b):
+        an = self._annotator()
+        an.set_tool(tool)
+        an.press(a)
+        an.drag(b)
+        self.assertTrue(an.release(), f"{tool}: {a}→{b} 没落地")
+        return an.stack.shapes[-1]
+
+    def test_endpoints_are_the_pressed_and_released_points(self):
+        quadrants = {"右下": ((60, 60), (300, 240)), "右上": ((60, 240), (300, 60)),
+                     "左下": ((300, 60), (60, 240)), "左上": ((300, 240), (60, 60))}
+        for tool in ("arrow", "line"):
+            for name, (a, b) in quadrants.items():
+                with self.subTest(tool=tool, quadrant=name):
+                    shape = self._drag(tool, a, b)
+                    self.assertEqual(AN.shape_endpoints(shape), (a, b),
+                                     f"{tool} 在「{name}」方向拖出来的起点/终点不是按下/抬起的点")
+
+    def test_cross_screen_start_still_keeps_the_direction(self):
+        """跨屏起手（从一块屏拖到另一块）也要保持方向。"""
+        an = AN.Annotator(white_surface(800, 300), screen=(800, 300),
+                          directory=temp_dir(), clip=lambda _d: (True, "s"))
+        an.set_tool("arrow")
+        an.press((100, 250))
+        an.drag((700, 50))
+        self.assertTrue(an.release())
+        self.assertEqual(AN.shape_endpoints(an.stack.shapes[-1]), ((100, 250), (700, 50)))
+
+    def test_moving_and_resizing_keeps_both_ends_consistent(self):
+        an = self._annotator()
+        an.set_tool("arrow")
+        an.press((60, 60))
+        an.drag((300, 240))
+        an.release()
+        shape = an.stack.shapes[-1]
+        an.select_at((180, 150), tol=30)
+        an.move_selected(10, -20)
+        self.assertEqual(AN.shape_endpoints(shape), ((70, 40), (310, 220)), "拖动后两端都要跟着挪")
+        r = AN.shape_bounds(shape)
+        an.resize_selected("se", (r[0] + r[2] + 40, r[1] + r[3] + 20))
+        start, end = AN.shape_endpoints(shape)
+        bx, by, bw, bh = AN.shape_bounds(shape)
+        # 端点永远落在包围盒的两个对角上（缩放/移动后也是），这次盒子被拉到 280×200
+        self.assertEqual((end[0] - start[0], end[1] - start[1]), (bw, bh),
+                         "端点该跟着手柄走（方向不变、和包围盒对角一致）")
+        self.assertGreater(end[1], start[1],
+                           "这次是「左上 → 右下」拖的：起点该在上、终点在下，方向不许翻")
+
+    def test_arrow_head_is_at_the_end_we_released_on(self):
+        """像素标尺：箭头改在**终点**那一侧（画到空白底上，数哪一侧有线）。"""
+        an = self._annotator()
+        an.set_tool("arrow")
+        an.press((60, 60))
+        an.drag((340, 260))
+        an.release()
+        shape = an.stack.shapes[-1]
+        out = AN.render_to_surface(white_surface(400, 300), [shape])
+        out.flush()
+        data = bytes(out.get_data())
+        stride = out.get_stride()
+
+        def ink(x, y):
+            off = y * stride + x * 4
+            return sum(1 for i in range(3) if data[off + i] < 200)
+        near_end = sum(ink(x, y) for x in range(300, 340) for y in range(220, 260))
+        near_start = sum(ink(x, y) for x in range(60, 100) for y in range(60, 100))
+        self.assertGreater(near_end, near_start,
+                           "箭头头部不在我们松手的那个端点（还是画在写死的对角线上）")
+
+
+@unittest.skipUnless(HAVE_CAIRO, "没有 pycairo：这条要真造图")
+class TestEveryToolInEveryDragQuadrant(unittest.TestCase):
+    """顺手查一遍**所有**图元在四个象限拖出来的几何（lead 要求"别只修箭头"）。
+
+    判据：① 图形整块落在截图内（裁剪仍生效）；② 包围盒 == 按下点与抬起点的规范化矩形
+    （四个象限各一遍）—— 有符号问题的图元会在这里露出来。
+    """
+
+    def test_bounds_match_the_drag_rect_in_all_quadrants(self):
+        from capsplus.shot_frame import normalize_rect
+        quadrant = {"右下": ((60, 60), (320, 260)), "右上": ((60, 260), (320, 60)),
+                    "左下": ((320, 60), (60, 260)), "左上": ((320, 260), (60, 60))}
+        for tool in AN.TOOLS:
+            if tool in ("text", "badge", "eyedropper"):
+                continue        # 这三个是"点一下"的（文字/序号/吸管），不靠拖
+            for name, (a, b) in quadrant.items():
+                with self.subTest(tool=tool, quadrant=name):
+                    an = AN.Annotator(white_surface(400, 300), screen=(400, 300),
+                                      directory=temp_dir(), clip=lambda _d: (True, "s"))
+                    an.set_tool(tool)
+                    an.press(a)
+                    an.drag(b)
+                    if tool == "pen":
+                        an.drag(((a[0] + b[0]) // 2, (a[1] + b[1]) // 2))
+                    if not an.release():
+                        self.assertIn(tool, ("pen",), f"{tool} 在「{name}」没落地")
+                        continue
+                    shape = an.stack.shapes[-1]
+                    x, y, w, h = AN.shape_bounds(shape)
+                    self.assertGreaterEqual(x, 0, f"{tool}/{name} 越出左边界")
+                    self.assertGreaterEqual(y, 0, f"{tool}/{name} 越出上边界")
+                    self.assertLessEqual(x + w, 400, f"{tool}/{name} 越出右边界")
+                    self.assertLessEqual(y + h, 300, f"{tool}/{name} 越出下边界")
+                    if tool != "pen":
+                        self.assertEqual((x, y, w, h), normalize_rect(a[0], a[1], b[0], b[1]),
+                                         f"{tool}/{name} 的包围盒和拖出来的矩形不一致（符号问题）")
+
+
+class TestClippingDoesNotChangeEndpoints(unittest.TestCase):
+    """反证："落笔裁到截图内"**不是**箭头方向 bug 的成因。
+
+    把裁剪完全关掉（模拟加裁剪之前的行为）跑同一条几何判据：如果仍然红，就说明病灶在
+    "方向信息在落地时就丢了"，与裁剪无关。这条判据保证以后不会有人把锅甩错地方。
+    """
+
+    def test_shape_endpoints_helper_is_not_the_problem(self):
+        rect_from_points = AN.shape_endpoints
+        shape = AN.Shape("arrow", (60, 60, 240, 180), points=[(60, 60), (300, 240)])
+        self.assertEqual(rect_from_points(shape), ((60, 60), (300, 240)),
+                         "存了端点就该原样读出来（问题在落地时没存）")
+
+
+@unittest.skipUnless(HAVE_CAIRO, "没有 pycairo：这条要真造图")
+class TestEyedropperPicksExactPixels(unittest.TestCase):
+    """提取颜色（2026-10-20 新功能）：**逐像素标尺**，不许"看着差不多"。
+
+    遮罩阶段的读数与标注窗的吸管都从**冻结图/底图**取色，判据用一张已知颜色的假图来量：
+    每个测试点都断言 `#RRGGBB` **精确相等**；反例（取样坐标偏 1px）必红 —— 这张图每一列颜色都不同。
+    """
+
+    def _gradient(self, w=16, h=4):
+        """每一列颜色都不同的假冻结图：(x, y) 的颜色 = (x*16, y*32, 0x40)。"""
+        surface = cairo.ImageSurface(cairo.FORMAT_ARGB32, w, h)
+        cr = cairo.Context(surface)
+        for x in range(w):
+            for y in range(h):
+                cr.set_source_rgb(x * 16 / 255.0, y * 32 / 255.0, 0x40 / 255.0)
+                cr.rectangle(x, y, 1, 1)
+                cr.fill()
+        surface.flush()
+        return surface
+
+    def test_overlay_reads_the_exact_hex(self):
+        frame = self._gradient()
+        for x, y in ((0, 0), (3, 1), (15, 3), (7, 2)):
+            with self.subTest(px=(x, y)):
+                rgb = OV.pixel_colour(frame, (x, y), (0, 0, 16, 4), scale=1.0)
+                self.assertEqual(rgb, (x * 16, y * 32, 0x40), f"({x},{y}) 取到的不是那个像素")
+                self.assertEqual(OV.hex_colour(rgb), "#%02X%02X%02X" % (x * 16, y * 32, 0x40))
+
+    def test_one_pixel_offset_changes_the_result(self):
+        """反例守则：这张图**每一列都不同** ⇒ 坐标偏 1px 一定读出差值（判据不是碰运气）。"""
+        frame = self._gradient()
+        a = OV.pixel_colour(frame, (5, 1), (0, 0, 16, 4), scale=1.0)
+        b = OV.pixel_colour(frame, (6, 1), (0, 0, 16, 4), scale=1.0)
+        self.assertNotEqual(a, b, "偏 1px 读出来一样 ⇒ 这条判据分辨不出偏移")
+
+    def test_overlay_scales_logical_coords_to_frame_pixels(self):
+        """帧是 2×（缩放屏）时，逻辑坐标要先放大再取样。"""
+        frame = self._gradient(32, 8)
+        rgb = OV.pixel_colour(frame, (5, 1), (0, 0, 16, 4))       # 自动推 scale=2
+        self.assertEqual(rgb, ((5 * 2) * 16 % 256, (1 * 2) * 32 % 256, 0x40))
+
+    def test_annotator_eyedropper_sets_the_colour_and_next_shape_uses_it(self):
+        base = self._gradient(64, 32)
+        an = AN.Annotator(base, screen=(64, 32), directory=temp_dir(), clip=lambda _d: (True, "s"))
+        an.set_tool("eyedropper")
+        an.press((6, 2))
+        self.assertEqual(an.picked, "#%02X%02X%02X" % (6 * 16, 2 * 32, 0x40))
+        self.assertEqual(an.color, (6 * 16 / 255.0, 2 * 32 / 255.0, 0x40 / 255.0, 1.0))
+        self.assertEqual(an.stack.shapes, [], "取色不该产生图形")
+        # 接着画一个矩形：必须用刚取的颜色
+        an.set_tool("rect")
+        an.press((8, 4))
+        an.drag((40, 24))
+        an.release()
+        self.assertEqual(an.stack.shapes[-1].color, an.color, "新图元没用吸管的颜色")
+        # 状态栏是 GTK 控件（没建窗口时没有）—— 直接用纯函数断言状态文本
+        from capsplus import shot_style as _S
+        self.assertIn(an.picked, _S.status_text(True, "", an.message, picked=an.picked),
+                      "状态栏文本要显示取到的 hex")
+
+    def test_eyedropper_outside_the_image_is_a_no_op(self):
+        an = AN.Annotator(self._gradient(), screen=(16, 4), directory=temp_dir(),
+                          clip=lambda _d: (True, "s"))
+        before = an.color
+        an.set_tool("eyedropper")
+        an.press((-5, -5))
+        self.assertEqual(an.color, before, "图外取色不该改颜色")
+        self.assertEqual(an.picked, "")
 
 
 if __name__ == "__main__":
