@@ -21,12 +21,17 @@
 电平（2026-10-20 加）：每段录音在交出去之前量一次电平并把"实际施加的增益"一起交给上层，
 这样 `voice.log` / `capsplus-voice status` 里能回答"这次说话有多响"，而不是只有"底噪多少"。
 增益默认 1.0（不加），理由与上界都在 `voice_levels` 的模块 docstring 里（实测数字，别凭感觉改）。
+
+**录音期**的电平（同一天补）：`live()` 每帧更新一次（帧 30ms），给录音中的指示条 / status 读，
+所以"现在到底有没有在听到我说话"在**录的时候**就能看见，而不必等录完看结果。它只更新已采到的帧，
+不额外读时钟 —— 时间轴与 VAD 用的是同一条（`vad.frames × frame_ms`），两处不可能对不上。
 """
 
 from __future__ import annotations
 
 import os
 import shutil
+import struct
 import subprocess
 import threading
 from dataclasses import dataclass
@@ -95,6 +100,27 @@ def capture_argv(seconds: float, params: V.VadParams = V.VadParams(),
     return argv
 
 
+def classify_capture_failure(stderr: str) -> str:
+    """arecord 的 stderr → 错误码。
+
+    为什么要分类（2026-10-20）：`HINTS["device-busy"]` 过去**只是一条没人用的文案** ——
+    设备被占时走的是通用的 `no-data`，给的下一步是"麦克风没被授权"，方向直接错了
+    （用户会去查权限，而真正的动作是 `pactl set-default-source` 换个源）。
+    **只按 stderr 里真有的线索分**：没线索就退回通用的 `no-data` —— 宁可少说，不许编。
+    """
+    low = (stderr or "").lower()
+    if "busy" in low or "resource unavailable" in low:
+        return "device-busy"
+    return "no-data"
+
+
+def _empty_live() -> dict:
+    """`live()` 的形状。**只在这里定义一次** —— 少写一个键会让调用方拿到 KeyError，
+    而这条路是"给状态用"的，绝不该因为少个字段把录音链带崩。"""
+    return {"elapsed_ms": 0, "rms": 0.0, "peak": 0, "voiced_frames": 0,
+            "gate": 0.0, "speaking": False}
+
+
 class Recorder:
     """一次一个录音会话（照 Qbar 的 worker 线程写法：线程只负责读管道，UI 靠回调）。
 
@@ -127,10 +153,21 @@ class Recorder:
         self.state = "idle"
         self.pcm = bytearray()
         self.vad = V.Vad(self.p)
+        self._live: dict = _empty_live()
 
     # -- 对外 ---------------------------------------------------------------
     def is_recording(self) -> bool:
         return self.state == "recording"
+
+    def live(self) -> dict:
+        """录音**进行中**的电平与时长（线程安全快照；没在录就是一份全零）。
+
+        只有状态量，没有内容，也没有识别文本 —— 可以随便进日志、进 socket。
+        `rms` 是**最近一帧**的 RMS（30ms 窗），不是整段平均：指示条要的是"现在响不响"，
+        整段平均会把一次咳嗽糊进十秒的安静里，看不出任何东西。
+        """
+        with self._lock:
+            return dict(self._live)
 
     def start(self) -> bool:
         """开始录音。已经在录就返回 False（幂等，按键连点两次不会开出两个 arecord）。"""
@@ -140,6 +177,7 @@ class Recorder:
             self._stop_request = ""
             self.pcm = bytearray()
             self.vad = V.Vad(self.p)
+            self._live = _empty_live()
             self._set_state("recording")
         self._thread = threading.Thread(target=self._run, daemon=True)
         self._thread.start()
@@ -227,6 +265,7 @@ class Recorder:
                     break                             # EOF：进程退了或被终止
                 self.pcm += chunk
                 event = self.vad.push(chunk)
+                self._note_live(chunk)
                 if event in ("endpoint", "max_duration"):
                     break
         finally:
@@ -238,11 +277,25 @@ class Recorder:
         pcm = bytes(self.pcm)
         if not pcm:
             why = " ".join(errs).strip() or f"arecord 退出码 {getattr(proc, 'returncode', None)}"
-            self._fail("no-data", why)
+            self._fail(classify_capture_failure(why), why)
             return
         result = self._finalize(event)
         seg, levels = self._prepare(self._trim(pcm, result), result)
         self._deliver(Recording(pcm=seg, vad=result, levels=levels))
+
+    def _note_live(self, chunk: bytes) -> None:
+        """把这一帧的电平记进 `live()`。**读的是 VAD 刚算出来的那份**（不重算 RMS ——
+        两处各算一遍早晚会漂，本仓为这类"第二份真相"付过代价）。峰值只多一次解包。"""
+        frames = self.vad.frames
+        n = len(chunk) // self.p.sample_width
+        peak = 0
+        if n:
+            peak = max(abs(v) for v in struct.unpack("<%dh" % n, chunk[:n * self.p.sample_width]))
+        rms = self.vad.rms[-1] if self.vad.rms else 0.0
+        with self._lock:
+            self._live = {"elapsed_ms": frames * self.p.frame_ms, "rms": rms, "peak": peak,
+                          "voiced_frames": self.vad.voiced_frames, "gate": self.vad.gate,
+                          "speaking": bool(self.vad.speech_start >= 0)}
 
     def _drain_stderr(self, proc, sink: list[str]) -> None:
         try:

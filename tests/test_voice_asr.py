@@ -77,6 +77,9 @@ class _Handler(BaseHTTPRequestHandler):
             return self._send({"ok": True, "text": "晚了", "ms": 1200})
         if mode == "ok":
             return self._send({"ok": True, "text": "早上九点开会", "ms": 137})
+        if mode.startswith("text:"):
+            # 任意文本的桩：术语替换表那条链要拿**指定的识别结果**验（2026-10-20 加）
+            return self._send({"ok": True, "text": mode[len("text:"):], "ms": 7})
         if mode == "not_wav":
             if raw[:4] != b"RIFF":
                 return self._send({"ok": False, "error": "ffmpeg-failed"})
@@ -418,6 +421,52 @@ class TestGuardHasTeeth(unittest.TestCase):
                      "bad_size", "empty", "no_pcm"):
             self.assertIn(code, A.HINTS, f"HINTS 少了 {code}")
             self.assertTrue(A.HINTS[code].strip(), f"HINTS[{code}] 是空的")
+
+
+class TestGlossaryReachesTheRecognitionText(unittest.TestCase):
+    """术语替换表必须**接在识别结果上**，而且它坏了不许把识别带崩。
+
+    为什么这批判据值得写（2026-10-20）：SenseVoice 这个模型**没有热词**可用
+    （理由写在 `voice_glossary` 的模块 docstring 里），于是"专名总是认错"这件事只能靠
+    一层后处理兜。光有纯函数不够 —— 它得真的走在 `recognize()` 的成功路径上，
+    而且 `AsrResult.terms` 要能把"这次改了几处"带出去，否则用户看到的还是一个说不清的"识别率低"。
+    """
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.table = Path(self._tmp.name) / "glossary.tsv"
+        self.table.write_text("帮晒\tBonsai\n", encoding="utf-8")
+        self._env = mock.patch.dict(os.environ, {"CAPSPLUS_VOICE_GLOSSARY": str(self.table)})
+        self._env.start()
+        self.addCleanup(self._env.stop)
+
+    def _recognize(self, reply_text: str):
+        server, _seen, patch = with_stub(f"text:{reply_text}")
+        self.addCleanup(stop_stub, server, patch)
+        return A.recognize(pcm_silence(50))
+
+    def test_the_table_rewrites_the_text_and_the_count_comes_back(self):
+        result = self._recognize("帮晒这个项目")
+        self.assertTrue(result.ok)
+        self.assertEqual(result.text, "Bonsai这个项目")
+        self.assertEqual(result.terms, 1, "命中数没带出来，用户就没法知道表到底生没生效")
+        self.assertIn("terms=1", result.describe())
+
+    def test_no_hit_leaves_the_text_alone(self):
+        result = self._recognize("早上九点开会")
+        self.assertEqual(result.text, "早上九点开会")
+        self.assertEqual(result.terms, 0)
+
+    def test_a_broken_table_never_breaks_recognition(self):
+        """表是**用户自己改的数据**：它坏掉时正确的表现是"这次没替换"，不是"这次没识别"。"""
+        with mock.patch.dict(os.environ, {"CAPSPLUS_VOICE_GLOSSARY": "/dev/null/没有这个目录/x"}):
+            from capsplus import voice_glossary as G
+            with mock.patch.object(G, "load", side_effect=OSError("表读炸了")):
+                result = self._recognize("帮晒这个项目")
+        self.assertTrue(result.ok, "表坏了把识别也带崩了")
+        self.assertEqual(result.text, "帮晒这个项目")
+        self.assertEqual(result.terms, 0)
 
 
 if __name__ == "__main__":

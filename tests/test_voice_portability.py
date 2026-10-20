@@ -36,7 +36,7 @@ sys.path.insert(0, str(REPO))
 NOGI_DIR = REPO / "tools" / "ci" / "nogi"
 
 VOICE_MODULES = ("voice_proto", "voice_vad", "voice_asr", "voice_recorder",
-                 "voice_inject", "voice_osd", "voice_worker")
+                 "voice_inject", "voice_osd", "voice_worker", "voice_glossary")
 LAUNCHER = REPO / "bin" / "capsplus-voice"
 
 RUN_GUI = os.environ.get("CAPSPLUS_GUI") == "1"
@@ -602,6 +602,42 @@ class TestOsdRealWindow(unittest.TestCase):
             outcome = self.O.VoiceUi().show()
         self.assertEqual(outcome.action, "unavailable")
         self.assertFalse(outcome.commit)
+
+    # -- 录音期那块牌子（默认关；开了就必须真的在屏幕上、且不可聚焦）----------------
+    def test_badge_is_not_built_unless_opted_in(self):
+        """默认关的理由是焦点（Wayland 没有"别把焦点给我"），所以"没开就不建窗"必须被判据锁住。"""
+        with mock.patch.dict(os.environ, {self.O.BADGE_ENV: ""}):
+            badge = self.O.VoiceUi()
+            self.assertFalse(badge.open_badge())
+            self.assertIsNone(badge._window, "没开开关却建了窗 —— 那就会抢用户的键盘焦点")
+
+    def test_badge_window_is_small_non_focusable_and_shows_progress(self):
+        """开了开关就必须真在屏幕上、**不可聚焦**，并且心跳真的刷到那行字上。
+
+        为什么钉"不可聚焦"：牌子是贴在屏幕中间的指示牌，抢焦点就等于用户说着话、
+        键盘却落在我们这块牌子上（`window_plan("recording")` 的 accept_focus=False 就是为它）。
+        """
+        with mock.patch.dict(os.environ, {self.O.BADGE_ENV: "1"}):
+            badge = self.O.VoiceUi()
+            self.addCleanup(lambda: badge._window and badge._window.destroy())
+            self.assertTrue(badge.open_badge(), "开了开关却建不出牌子")
+            self.pump(0.2)
+            self.assertIsNotNone(badge._window)
+            self.assertFalse(badge._window.get_accept_focus(), "录音期牌子可聚焦 = 会抢键盘")
+            self.assertEqual(badge.mode, "recording")
+            self.assertFalse(badge._scroll.get_visible(),
+                             "牌子期还把文本框容器显示着（那它就不是一块小条了）")
+            self.assertEqual(badge._window.get_default_size(),
+                             (self.O.BADGE_WIDTH, self.O.BADGE_HEIGHT),
+                             "牌子没缩成小条 —— 默认尺寸还是 review 那个大窗")
+            badge.post_progress(3200, 3000.0, 9000, 150.0, 60000)
+            self.pump(0.2)
+            text = badge._label.get_text()
+            for want in ("3.2s", "RMS 3000", "有声"):
+                self.assertIn(want, text, f"牌子上少了 {want}：{text!r}")
+            badge.close_badge()
+            self.pump(0.2)
+            self.assertIsNone(badge._window, "牌子用完必须销毁（焦点才能自然归还）")
 
 
 class TestRealWindowRefusesTrueWaylandWithoutOptIn(unittest.TestCase):

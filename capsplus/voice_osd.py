@@ -42,6 +42,9 @@ from dataclasses import dataclass
 from functools import partial
 
 MODES = ("recording", "review", "notice")
+# 录音心跳事件的类型名。**单独拎出来当常量**：`_emit` 要用它做"没窗口就丢"的判断，
+# 写字面量两处迟早漂开，漂开的后果是心跳又被攒起来（就是它要防的那个 bug）。
+PROGRESS_KIND = "progress"
 # 窗口生命周期里我们要记下来的五种信号（`focus_in`/`focus_out` 连的是 GTK 的
 # `focus-in-event`/`focus-out-event`，见 `LIFECYCLE_SIGNALS`）。
 LIFECYCLE_KINDS = ("map", "unmap", "focus_in", "focus_out", "destroy")
@@ -70,6 +73,54 @@ LABELS = {
 def badge_enabled() -> bool:
     """录音期要不要真弹窗。默认 **不要**（理由见模块 docstring 第 1 条）。"""
     return os.environ.get(BADGE_ENV) == "1"
+
+
+# 录音指示条那块小窗的尺寸。窄而矮：它是贴在屏幕中间的一块牌子，不是面板。
+BADGE_WIDTH = 460
+BADGE_HEIGHT = 76
+# 电平判读的两条线，**按 VAD 当次的门限**算（不另写一个绝对阈值 ——
+# 这个仓为"门限的第二份真相"付过两次代价，见 voice_levels 的模块 docstring）。
+#   > 门限        ⇒ 这一帧在 VAD 眼里就是"有声"，与判定完全一致；
+#   > 门限 × 0.3  ⇒ 还没过门但明显有动静（说话声偏轻、或离得远）；
+#   再低         ⇒ 就是底噪／没在说话。
+QUIET_RATIO = 0.3
+
+
+def level_verdict(rms: float, gate: float) -> str:
+    """"现在这一帧算不算有声"的**唯一**一处判读（牌子与 `meter --live` 共用）。
+
+    `gate <= 0`（还没校准完）时返回 "—"：**宁可少说，不许编** —— 拿一个假的判读去
+    指导用户调麦克风，比不判读更糟。
+    """
+    if gate <= 0:
+        return "—"
+    if rms > gate:
+        return "有声"
+    if rms > gate * QUIET_RATIO:
+        return "偏轻"
+    return "还没听到说话"
+
+
+def recording_line(elapsed_ms: int, rms: float, peak: int, gate: float = 0.0,
+                   max_ms: int = 0) -> str:
+    """录音**进行中**那块牌子上的一行字（纯函数，无 gi 也能测）。
+
+    为什么要有（2026-10-20 明江原话「只可以是短语音」）：上一版录音期屏幕上什么都没有，
+    于是"它到底还在不在录、有没有听到我说话、已经录了多久"三件事全靠猜；
+    而端点判定恰恰是**按静音时长**下刀的，用户看不见就会以为"它自己断了"。
+    这条把三件事都摆在脸上：时长 / 电平读数 / 电平判读。
+
+    `gate` 传 0（比如还没校准完）时不猜判读，只报数（判读规则见 `level_verdict`）。
+    """
+    parts = [f"● 录音中 {elapsed_ms / 1000.0:.1f}s", f"电平 RMS {rms:.0f} / 峰 {peak}"]
+    if gate > 0:
+        verdict = level_verdict(rms, gate)
+        if verdict == "偏轻":
+            verdict += "（凑近一点）"
+        parts.append(f"{verdict}（门限 {gate:.0f}）")
+    if max_ms > 0 and elapsed_ms >= max_ms - 5000:
+        parts.append(f"快到 {max_ms / 1000:.0f}s 上限了")
+    return " · ".join(parts)
 
 
 def window_plan(mode: str) -> dict:
@@ -256,6 +307,7 @@ class VoiceUi:
         self._window = None
         self._probe_widget = None          # 销毁后**只留着读状态量**的那份窗口引用
         self._view = None
+        self._scroll = None
         self._label = None
         self._loop = None
         self._action = ""
@@ -284,6 +336,15 @@ class VoiceUi:
     def post_error(self, code: str, message: str = "", hint: str = "") -> None:
         self._emit(("error", code, message, hint))
 
+    def post_progress(self, elapsed_ms: int, rms: float, peak: int,
+                      gate: float = 0.0, max_ms: int = 0) -> None:
+        """录音中的心跳：把"还在录 / 录了多久 / 现在多响"刷到那块牌子上。
+
+        **没有窗口时直接丢掉**（不是攒着）—— 见 `_emit` 的 `PROGRESS_KIND` 分支。
+        """
+        self._emit((PROGRESS_KIND, int(elapsed_ms), float(rms), int(peak),
+                    float(gate), int(max_ms)))
+
     def close(self) -> None:
         self._emit(("close", self._action or "closed"))
 
@@ -291,6 +352,10 @@ class VoiceUi:
         if self._done:                       # show() 已经返回过：会话结束，别再攒事件
             return
         if self._window is None:
+            # 心跳类事件**只在有窗口时才有意义**：攒着它们会在建窗那一刻一次放出来
+            # （录音 60s = 60 次刷新），把真正要显示的 note/文本淹掉。
+            if event[0] == PROGRESS_KIND:
+                return
             self._pending.append(event)
             return
         try:
@@ -388,6 +453,12 @@ class VoiceUi:
                               (message or code) + (("\n" + hint) if hint else ""))
         elif kind == "close":
             self._finish(event[1])
+        elif kind == PROGRESS_KIND:
+            _, elapsed_ms, rms, peak, gate, max_ms = event
+            if self._window is not None and self.mode == "recording":
+                self.note = recording_line(elapsed_ms, rms, peak, gate, max_ms)
+                if self._label is not None:
+                    self._label.set_text(self.note)
         return False
 
     # -- 建窗 -----------------------------------------------------------------
@@ -429,6 +500,7 @@ class VoiceUi:
         scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
         scroll.add(self._view)
         box.pack_start(scroll, True, True, 0)
+        self._scroll = scroll
         self._window.add(box)
 
         self._apply_mode(window_plan(self.mode))
@@ -436,6 +508,40 @@ class VoiceUi:
             self._apply(event)
         self._pending.clear()
         self._window.show_all()
+
+    def open_badge(self) -> bool:
+        """录音期那块指示牌。**默认关**（`CAPSPLUS_VOICE_BADGE=1` 才开，理由见模块 docstring 第 1 条：
+        Wayland 没有"别把焦点给我"这个请求，所以"绝不抢焦点"的唯一可靠实现是那时候没有窗口）。
+
+        返回 True = 已经挂在屏幕上，调用方随后可以 `post_progress()` 刷它。
+        必须在**主线程**调（建窗不是线程安全的，口径同 `open_review`）。
+        """
+        if not badge_enabled():
+            return False
+        if self._window is not None:
+            return True
+        if threading.current_thread() is not threading.main_thread():
+            return False
+        try:
+            self.build()
+        except Exception:                                 # noqa: BLE001 开不了牌子不该影响录音
+            return False
+        self.mode = "recording"
+        self._apply_mode(window_plan("recording"))
+        if self._scroll is not None:
+            # 牌子期不要文本框：`set_no_show_all` 是 GTK3 里唯一能让 `show_all()`
+            # 也跳过它的写法（`hide()` 会被后面的 show_all 覆盖回来，实测过）。
+            self._scroll.set_no_show_all(True)
+            self._scroll.hide()
+        self._window.set_default_size(BADGE_WIDTH, BADGE_HEIGHT)
+        self._window.resize(BADGE_WIDTH, BADGE_HEIGHT)
+        self._window.show_all()
+        return True
+
+    def close_badge(self) -> None:
+        """牌子用完就收。它只是块指示牌，**没有结局要交回**，所以不进 review 那条回调链。"""
+        if self._window is not None:
+            self._finish("badge-closed")
 
     def open_review(self) -> UiOutcome | None:
         """**主线程、非阻塞**地建好 review 窗。成功返回 None（结局稍后走 `on_finish`）；

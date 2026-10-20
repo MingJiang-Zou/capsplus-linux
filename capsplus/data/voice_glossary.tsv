@@ -1,0 +1,20 @@
+# SPDX-License-Identifier: GPL-2.0-only
+# 语音识别「术语替换表」的内置条目。格式：错误<TAB>正确（只认 TAB，不认空格）。
+#
+# 规则（细则与理由见 capsplus/voice_glossary.py）：
+#   · 一次扫描、最长优先、改完即止，不做级联替换；
+#   · ASCII 键要求词边界（JSQ 不命中 JSQX）；中文键不得短于 2 个字；
+#   · 只放**系统性专名错字**——专名不会长在别的词里，所以 2 字键基本安全。
+#     别把常用词写进来（中文不分词，"帮晒" 写进来会连 "帮忙晒太阳" 一起改）。
+#
+# 自己那份放 ~/.local/share/capsplus/voice_glossary.tsv（同名的键以用户那份为准），
+# 或者用 CAPSPLUS_VOICE_GLOSSARY=<绝对路径> 指到别处；=off 关掉整层替换。
+#
+# ⚠ 下面四条来自 2026-10-07 的同模型实测（SenseVoice int8 转写 B 站音频时的系统性错字，
+#   出处 ~/.dsh/memories/echo/experience.md「bilibili 字幕 asr sensevoice」那条）。
+#   其余留空 —— 明江自己的专名（型号、项目名）Echo 手上没有实测到的错法，
+#   编条目等于往识别结果里注入没发生过的错，**不许编**。以后真机遇到就往这里加一条。
+帮晒	Bonsai
+邦晒	Bonsai
+JSQ	GSQ
+开元万岁	开源万岁

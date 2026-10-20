@@ -14,6 +14,8 @@
 #     capsplus-voice meter [秒数]  # 只量麦克风电平（RMS/峰值/分位 + 当前门限 + 建议）：
 #                                #   **不碰会话**（不起录音线程、不写 socket、不弹窗、不送识别），
 #                                #   默认 3 秒。抱怨"识别不准"时先跑它，能分清"说得轻"还是"底噪高"。
+#     capsplus-voice meter --live [秒数]  # 同上，但把电平**实时**打在同一行上（默认 10 秒、上限 60）：
+#                                #   对着麦克风说一句就能看见条子动不动、有没有过当前门限。
 #
 # 三条不许改的口径（都在 docs/KNOWN-LIMITS.md 与 tests/ 的判据里）：
 #   ① shebang 是 `#!/bin/sh`（本机是 dash）—— **不许用 bash 数组**，`A=(…)` 会当场
@@ -41,7 +43,7 @@ RUN_DIR="${CAPSPLUS_RUN_DIR:-/run/user/$USER_UID}"
 CMD="${1:-toggle}"
 case "$CMD" in
   toggle|start|stop|status|meter) ;;
-  *) echo "用法: capsplus-voice toggle|start|stop|status|meter [秒数]" >&2; exit 2 ;;
+  *) echo "用法: capsplus-voice toggle|start|stop|status|meter [--live] [秒数]" >&2; exit 2 ;;
 esac
 if [ "$#" -eq 0 ]; then set -- toggle; fi
 

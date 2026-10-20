@@ -84,11 +84,12 @@ class AsrResult:
     message: str = ""
     hint: str = ""
     body_bytes: int = 0
+    terms: int = 0          # 术语替换表命中了几条（0 = 一个字没动）
 
     def describe(self) -> str:
         """一行诊断（进日志用，**不含识别出来的文本**）。"""
         if self.ok:
-            return f"ok={self.ms}ms chars={len(self.text)}"
+            return f"ok={self.ms}ms chars={len(self.text)} terms={self.terms}"
         return f"code={self.code or '?'} message={self.message[:120]}"
 
 
@@ -262,7 +263,20 @@ def recognize(pcm: bytes, *, sample_rate: int = 16000, lang_code: str | None = N
     if not got:
         return AsrResult(code="empty", message="服务答了空串", hint=_hint("empty"),
                          body_bytes=len(wav))
-    return AsrResult(ok=True, text=got, ms=int(data.get("ms", 0) or 0), body_bytes=len(wav))
+    got, terms = _apply_glossary(got)
+    return AsrResult(ok=True, text=got, ms=int(data.get("ms", 0) or 0),
+                     body_bytes=len(wav), terms=terms)
+
+
+def _apply_glossary(text: str) -> tuple[str, int]:
+    """术语替换表这一层（规则与理由见 `voice_glossary`）。**它坏了也不许让识别失败** ——
+    表是数据、用户会自己改，改错表的代价必须是"这次没替换"，不是"这次没识别"。"""
+    try:
+        from . import voice_glossary as G
+        fixed, hits = G.apply(text)
+        return fixed, len(hits)
+    except Exception:                                 # noqa: BLE001
+        return text, 0
 
 
 def _try_json(text: str) -> dict | None:

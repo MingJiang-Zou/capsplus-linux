@@ -56,6 +56,7 @@ from __future__ import annotations
 import os
 import select
 import socket
+import struct
 import sys
 import threading
 import time
@@ -321,6 +322,9 @@ class Session:
         self.inject_diag: dict = {}       # 注入那一刻的状态量（纯数据，无文本）
         self.text = ""
         self._ui = None
+        self.badge_ui = None           # 录音期那块指示牌（默认关，见 voice_osd.badge_enabled）
+        self.live_summary = ""         # 录音**进行中**的那行读数（只有状态量，无内容）
+        self.progress_logged_ms = 0    # 上一次把心跳写进日志时的时长（限流用）
         self._lock = threading.Lock()
         self._done = threading.Event()
         self.discarded = False          # 被服务端丢掉的会话不再发任何事件
@@ -361,7 +365,31 @@ class Session:
                 popener=self.server.popen)
             self._set_state("recording", note="开始采集")
             self.recorder.start()
+        # 牌子必须在**主线程**建（`handle` 跑在每连接的后台线程，GTK3 不许跨线程建窗 ——
+        # 2026-10-17 那次「无响应」的病根就是这一条），所以走 post 回主线程。
+        self.server.post(self._open_badge)
         return {"ignored": False, "state": self.state}
+
+    # -- 录音期指示牌（默认关）--------------------------------------------------
+    def _open_badge(self) -> None:
+        """主线程：录音期那块指示牌。**默认关**，`CAPSPLUS_VOICE_BADGE=1` 才真弹
+        （理由：Wayland 没有"别把焦点给我"，见 `voice_osd` 模块 docstring 第 1 条）。"""
+        if self.state != "recording" or not self._alive():
+            return
+        from capsplus import voice_osd
+        if not voice_osd.badge_enabled():
+            return
+        ui = voice_osd.VoiceUi()
+        if not ui.open_badge():
+            ui.close_badge()
+            return
+        self.badge_ui = ui
+
+    def _close_badge(self) -> None:
+        """主线程：录音结束就把牌子收掉（它没有结局要交回，不进 review 那条回调链）。"""
+        ui, self.badge_ui = self.badge_ui, None
+        if ui is not None:
+            ui.close_badge()
 
     def stop_current(self) -> dict:
         """再按一次键：录音中就收尾送识别；识别中就等它出结果；弹窗中就丢弃。"""
@@ -392,6 +420,7 @@ class Session:
         self.discarded = True
         if self.recorder is not None:
             self.recorder.stop("abandoned")
+        self.server.post(self._close_badge)
         self._set_state("idle", note=note)
 
     def _alive(self) -> bool:
@@ -403,9 +432,11 @@ class Session:
             return                       # 我们在 start_recording 里已经报过了
 
     def _on_recorder_error(self, code: str, message: str, hint: str) -> None:
+        self.server.post(self._close_badge)      # 牌子不能留在屏幕上（这条回调在录音线程）
         self.server.broadcast(P.error_event(code, message, hint))
 
     def _on_recording_done(self, rec: Recording) -> None:
+        self.server.post(self._close_badge)
         if not self._alive():
             return
         if rec.vad is not None:
@@ -840,6 +871,7 @@ class Server:
         return P.state_event(state, note=note, pid=os.getpid(),
                              vad=session.vad_summary if session else "",
                              level=session.level_summary if session else "",
+                             live=session.live_summary if session else "",
                              truncated=session.truncation if session else "",
                              asr=session.asr_summary if session else "",
                              inject=session.inject_summary if session else "",
@@ -878,12 +910,43 @@ class Server:
 
     def _watchdog_tick(self) -> bool:
         """主线程**唯一**的周期任务（每秒）：90s 兜底时限；review 期永不咬人
-        （判据在 `should_abandon`）。返回 False（quit 了）主循环就把这个定时器摘掉。"""
+        （判据在 `should_abandon`）。返回 False（quit 了）主循环就把这个定时器摘掉。
+
+        录音期顺手把心跳刷一次（`_record_progress`）。**刻意不再开第二个 timer**：
+        本仓为"主线程只有一个周期任务"这条定过口径（`tools/verify-voice-mainloop.sh`
+        钉的是主线程不许睡觉），第二个定时器迟早会和这个咬在一起。1 Hz 对"还在录／录了多久／
+        现在多响"完全够 —— 要更细的连续波形用 `capsplus-voice meter --live`。
+        """
         session = self.session
         if session is not None and not session.done() and should_abandon(session):
             session.abandon(f"超过 {int(MAX_SESSION_S)}s 没走完")
             self.session = None
+        elif session is not None and session.state == "recording" and session.recorder is not None:
+            self._record_progress(session)
         return not self._quit.is_set()
+
+    PROGRESS_LOG_EVERY_MS = 5000      # 心跳进日志的限流：首拍一次，之后每 5s 一次
+
+    def _record_progress(self, session: "Session") -> None:
+        """主线程：把录音当前读数刷到牌子上、写进 status，并按 5s 限流记一行日志。
+
+        为什么要有（2026-10-20）：`voice.log` 过去只有录完那一行 `voice_level`，
+        于是"他到底有没有在说话"在**录的时候**是黑箱；端点判定偏偏是按静音时长下刀的，
+        用户看不见就会以为"它自己断了"。
+        """
+        from capsplus import voice_osd                      # 只用到纯函数，不建窗
+        live = session.recorder.live()
+        session.live_summary = voice_osd.recording_line(
+            live["elapsed_ms"], live["rms"], live["peak"], live["gate"], self.params.max_ms)
+        if session.badge_ui is not None:
+            session.badge_ui.post_progress(live["elapsed_ms"], live["rms"], live["peak"],
+                                           live["gate"], self.params.max_ms)
+        logged = session.progress_logged_ms
+        if logged == 0 or live["elapsed_ms"] - logged >= self.PROGRESS_LOG_EVERY_MS:
+            session.progress_logged_ms = live["elapsed_ms"]
+            P.log_line(f"voice_progress elapsed_ms={live['elapsed_ms']} "
+                       f"rms={live['rms']:.0f} peak={live['peak']} gate={live['gate']:.0f} "
+                       f"speaking={int(bool(live['speaking']))}")
 
     def _run_fallback_loop(self) -> None:
         """没有 GLib 的机器的降级主循环：**阻塞在 select 等 self-pipe**，每轮最多
@@ -1106,7 +1169,13 @@ def cmd_status() -> int:
     print(f"前后留手   : 句首 {p_.trim_pad_head_ms}ms / 句尾 {p_.trim_pad_tail_ms}ms"
           f"（句首留得多是因为弱起音容易不过门，实测见 voice_vad.TRIM_PAD_HEAD_MS）")
     print(f"电平与增益 : 增益 {L.gain_from_env():.2f}×（{L.GAIN_ENV}）"
-          f" —— 量一遍用 `capsplus-voice meter`")
+          f" —— 量一遍用 `capsplus-voice meter`，要**边看边调**用 `meter --live`")
+    from capsplus import voice_glossary as G
+    print(f"术语替换表 : {G.describe()}（整词匹配、改完即止；=off 关掉）")
+    # 还在录就把当前读数摆出来 —— 这是"停顿多久会被判停"那个问题的现场答案
+    live = frame.get("live") or ""
+    if frame.get("state") == "recording" and live:
+        print(f"录音中读数 : {live}")
     notes = V.env_notes()
     if notes:
         print(f"  环境变量覆盖: {' '.join(notes)}")
@@ -1160,18 +1229,136 @@ def cmd_meter(seconds: float = 3.0) -> int:
     return 0
 
 
-def meter_seconds(argv: list[str]) -> float:
-    """`meter [秒数]`：默认 3 秒。参数不合法就**报错退出**而不是偷偷按 3 秒跑。"""
-    raw = argv[1] if len(argv) > 1 else ""
+LIVE_MIN_S = 1.0                # `meter --live` 的时长上下限
+LIVE_MAX_S = 60.0
+LIVE_REFRESH_MS = 100           # 同一行刷新的节拍：比 30ms 帧粗，够跟手又不刷屏
+LIVE_BAR_WIDTH = 20
+
+
+def meter_live_line(elapsed_ms: int, rms: float, peak: int, gate: float,
+                    width: int = LIVE_BAR_WIDTH) -> str:
+    """`meter --live` 那一行（纯函数：CI 没有麦克风也能把渲染钉住）。
+
+    条子按**当前门限**标定，`gate` 那一格正好是半程 —— 满格的判读与 VAD 的门限是同一个数，
+    不会出现"条子满了但 VAD 说没说话"这种自相矛盾（门限的第二份真相本仓付过两次代价）。
+    """
+    from capsplus import voice_osd as OSD
+    if gate > 0:
+        filled = int(round(width * min(1.0, rms / (2 * gate))))
+    else:
+        filled = 0
+    bar = "█" * filled + "·" * (width - filled)
+    return (f"{elapsed_ms / 1000.0:5.1f}s  RMS {rms:7.0f}  峰 {peak:6d}  "
+            f"[{bar}]  {OSD.level_verdict(rms, gate)}")
+
+
+def run_meter_live(reader, seconds: float, params: V.VadParams, out=None,
+                   refresh_ms: int = LIVE_REFRESH_MS) -> bytes:
+    """边读边刷那一行。`reader` 是个 `read(n)` 回来的字节流（真机是 arecord 的 stdout，测试给 BytesIO）。
+
+    返回采到的全部 PCM —— 收尾时可以直接喂 `voice_levels.measure()` 出那份"事后统计"，
+    于是 `meter` 与 `meter --live` 的结论必然一致（同一段字节、同一个测量函数）。
+    """
+    out = out or sys.stdout
+    frame_bytes = params.frame_bytes
+    total = max(1, int(round(seconds * params.sample_rate)) * params.sample_width)
+    collected = bytearray()
+    frames: list[float] = []
+    next_paint = 0
+    peak = 0
+    while len(collected) < total:
+        try:
+            # 只读到够用为止：多读一帧会让"采了 N 秒"变成 N+0.03 秒，
+            # 而这条命令的用途正是"量一段固定时长的电平"（判据钉着这条，见 test_voice_progress）。
+            chunk = reader.read(min(frame_bytes, total - len(collected)))
+        except (OSError, ValueError):
+            break
+        if not chunk:
+            break
+        collected += chunk
+        frames.append(V.frame_rms(chunk, params))
+        n = len(chunk) // params.sample_width
+        if n:
+            peak = max(peak, max(abs(v) for v in
+                                 struct.unpack("<%dh" % n, chunk[:n * params.sample_width])))
+        elapsed_ms = len(frames) * params.frame_ms
+        if elapsed_ms >= next_paint:
+            next_paint = elapsed_ms + max(params.frame_ms, refresh_ms)
+            gate = V.energy_gate(V.percentile(frames[:params.calib_frames],
+                                              params.noise_percentile), params)
+            out.write("\r" + meter_live_line(elapsed_ms, frames[-1], peak, gate))
+            out.flush()
+    out.write("\n")
+    return bytes(collected)
+
+
+def cmd_meter_live(seconds: float = 10.0) -> int:
+    """`capsplus-voice meter --live [秒数]`：把 RMS/峰值打在**同一行**上，跟着说话变。
+
+    与 `meter` 的分工：那个是"采完给一份统计"，这个是"看着它动" ——
+    调麦克风增益、判断"到底是我没说话还是它没听见"时，一份事后统计不如一条会动的条子。
+    采样口径与 `meter` **完全相同**（同一条 arecord 命令、同一个 `voice_levels.measure`），
+    所以两者对同一段声音给出的结论必须一致。
+    """
+    import shutil
+    import subprocess
+
+    from capsplus.voice_recorder import ARECORD, arecord_argv
+    params = V.params_from_env()
+    if shutil.which(ARECORD) is None:
+        print(f"meter: PATH 里没有 {ARECORD}：sudo apt install alsa-utils", file=sys.stderr)
+        return 1
+    print(f"实时电平（{seconds:g}s，Ctrl+C 可中断；条子半程 = 当前门限）")
+    proc = subprocess.Popen(arecord_argv(params), stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE)
+    try:
+        pcm = run_meter_live(proc.stdout, seconds, params)
+    except KeyboardInterrupt:
+        pcm = b""
+    finally:
+        try:
+            proc.terminate()
+            proc.wait(timeout=2)
+        except Exception:                                # noqa: BLE001
+            proc.kill()
+    if not pcm:
+        detail = (proc.stderr.read() or b"").decode("utf-8", "replace").strip()[:200]
+        print(f"meter: 没采到数据（{detail or '空流'}）："
+              f"`pactl list short sources` 看默认源在不在，或 CAPSPLUS_VOICE_DEVICE 指定一个",
+              file=sys.stderr)
+        return 1
+    levels = L.measure(pcm, params)
+    print(f"—— 这一段的小结（与 `meter` 用同一个测量函数）——")
+    for line in L.report_lines(levels, params):
+        print(line)
+    return 0
+
+
+def meter_args(argv: list[str]) -> tuple[bool, float]:
+    """`meter [秒数]` / `meter --live [秒数]` →（是不是实时模式，秒数）。
+
+    参数不合法就**报错退出**而不是偷偷按默认值跑 —— 一个打错的参数不该看起来像量成功。
+    """
+    rest = list(argv[1:])
+    live = False
+    for flag in ("--live", "-l"):
+        if flag in rest:
+            live = True
+            rest.remove(flag)
+    if len(rest) > 1:
+        raise ValueError(f"meter 只收一个秒数，收到 {rest!r}")
+    raw = rest[0] if rest else ""
+    lo, hi = (LIVE_MIN_S, LIVE_MAX_S) if live else (1.0, 30.0)
+    default = 10.0 if live else 3.0
     if not raw:
-        return 3.0
+        return live, default
     try:
         value = float(raw)
     except ValueError:
         raise ValueError(f"秒数要是个数字，收到 {raw!r}")
-    if not 1.0 <= value <= 30.0:
-        raise ValueError(f"秒数要在 1~30 之间（收到 {value:g}）：量一次电平不需要更久")
-    return value
+    if not lo <= value <= hi:
+        raise ValueError(f"秒数要在 {lo:g}~{hi:g} 之间（收到 {value:g}）")
+    return live, value
 
 
 def main(argv: list[str]) -> int:
@@ -1188,12 +1375,13 @@ def main(argv: list[str]) -> int:
         return cmd_status()
     if cmd == "meter":
         try:
-            return cmd_meter(meter_seconds(argv))
+            live, seconds = meter_args(argv)
+            return cmd_meter_live(seconds) if live else cmd_meter(seconds)
         except ValueError as exc:
             print(f"meter: {exc}", file=sys.stderr)
             return 2
-    print(f"用法：capsplus-voice toggle|start|stop|status|meter [秒数]（serve 是内部用的）",
-          file=sys.stderr)
+    print(f"用法：capsplus-voice toggle|start|stop|status|"
+          f"meter [--live] [秒数]（serve 是内部用的）", file=sys.stderr)
     return 2
 
 
