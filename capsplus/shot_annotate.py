@@ -30,7 +30,8 @@ from pathlib import Path
 
 from capsplus.shot_panel import KIND_OCR, KIND_TRANSLATE, PanelModel
 # 布局常量与 CSS 同源（**不在这里再写一份**：间距/尺寸只在 shot_style 里定义）
-from capsplus.shot_style import BAR_GAP, STATUS_FONT, SWATCH, TOOL_BTN, WIDTH_DOT
+from capsplus.shot_style import (BAR_GAP, PRIMARY_KEYS, SECONDARY_KEYS, STATUS_FONT, SWATCH,
+                                 TOOL_BTN, WIDTH_DOT)
 
 COLOR_ANNOT = (0.90, 0.15, 0.15, 1.0)     # 标注默认红（Snipaste 也是这个习惯）
 COLOR_SHADOW = (0.0, 0.0, 0.0, 0.55)
@@ -41,6 +42,9 @@ MOSAIC_BLOCK = 12
 TEXT_LIMIT = 500
 POLL_MS = 50                        # 后台结果回主循环的轮询间隔（见 _drain_mailbox：不用 idle_add）
 CANVAS_MARGIN = 14                        # 截图四周的留白（中性底色衬托）
+# 工具条两侧各留的边（窗口宽度下限里算上它）。实测：请求 1034px 的窗口拿到手是 **1032px**
+# （GTK/X11 那 2px 的去向没查清），所以留宽一点，别让"装得下"变成刚好压线。
+BAR_EDGE = 8
 CANVAS_BG = (0.106, 0.106, 0.118)         # 画布中性底色（与 CSS `.cp-canvas` 同色）
 HIGHLIGHT_ALPHA = 0.35                    # （旧口径，保留给显式传参的场景）
 # 荧光笔就是**半透明黄**这一支：不跟随颜色选择 —— 之所以定死，是因为"深色底 + 深色笔"会调出
@@ -82,6 +86,18 @@ COLORS = (("红", (0.90, 0.15, 0.15, 1.0)),
           ("橙", (1.00, 0.55, 0.10, 1.0)))     # 明江要求"颜色至少 6 个"（原 5 个不够）
 WIDTHS = (2, 3, 6)
 
+# ── 工具/颜色/线宽的**窗内快捷键**（2026-10-20 加，明江：工具条上"有几个按钮不知道什么意思"）──
+# 这一段是**唯一一份定义**：按钮提示（`tool_tip`/`colour_tip`/`width_tip`）、状态栏那两行
+# （`tool_key_hint`）、键处理（`tool_for_key`/`colour_for_key`/`width_for_key`）全都读它，
+# 免得"提示里写 R、实际按 R 没反应"这种两头对不上。字母键不引 Ctrl，所以与 Ctrl+C/S/Z/Y/P 不冲突。
+TOOL_KEYS = {"rect": "R", "ellipse": "E", "arrow": "A", "line": "L", "highlight": "H",
+             "pen": "P", "badge": "B", "text": "T", "mosaic": "M", "eraser": "X",
+             "eyedropper": "I"}
+# 颜色按**顺序**占 1..7、线宽接着占 8/9/0（与工具条上从左到右的排列一致，不用记）
+COLOR_KEYS = {name: str(idx + 1) for idx, (name, _rgba) in enumerate(COLORS)}
+WIDTH_KEYS = {int(width): key for width, key in zip(WIDTHS, ("8", "9", "0"))}
+# 工具条上"是什么"的短说明只在 `shot_icons.TIPS` 里有一份（`tool_tip()` 拼名字/键/说明三样）
+
 ACTION_UNDO = "undo"
 ACTION_REDO = "redo"
 ACTION_COPY = "copy"
@@ -101,11 +117,76 @@ CONTEXT_MENU = (("复制到剪贴板", ACTION_COPY), ("存盘", ACTION_SAVE),
 
 # 窗内键位（**只在这一份里定义**，提示条与事件处理都读它 —— 免得两头对不上）
 KEY_ACTIONS = {"F2": ACTION_TRANSLATE, "F3": ACTION_PIN, "F4": ACTION_OCR}
-HINT_FOCUSED = ("Enter 复制并关 · F2 翻译 · F3 贴图 · F4 OCR · Ctrl+C 复制 · Ctrl+S 存盘 · "
-                "Ctrl+Z 撤销 · Ctrl+Y 重做 · 方向键微调标注（Shift=10px）· Del 删掉选中 · "
-                "右键菜单 · Esc 关")
 HINT_UNFOCUSED = ("窗口没有焦点：F2/F3/F4 现在**不会**生效（这是提示，不是按了没反应）"
                   "—— 点一下窗口再按")
+
+
+# --------------------------------------------------- 按钮提示（是什么 + 快捷键，**同一份表**）
+def tool_tip(tool: str) -> str:
+    """工具按钮的悬浮提示：`矩形（R）：拖一个矩形框`。
+
+    名字读 `TOOL_LABELS`、键读 `TOOL_KEYS`、说明读 **`shot_icons.TIPS`**（不在这里再抄一份说明）
+    —— 三样各只有一处定义，所以提示里写的键就是真按得响的键。
+    """
+    from capsplus.shot_icons import TIPS
+    label = TOOL_LABELS.get(tool, tool)
+    key = TOOL_KEYS.get(tool, "")
+    head = f"{label}（{key}）" if key else label
+    what = TIPS.get(tool, "")
+    return f"{head}：{what}" if what and what != label else head
+
+
+def colour_tip(name: str) -> str:
+    """颜色圆点的提示：`颜色：红（1）：画出来的线/框用这个色`。"""
+    key = COLOR_KEYS.get(name, "")
+    return f"颜色：{name}（{key}）：画出来的线/框用这个色" if key else f"颜色：{name}"
+
+
+def width_tip(width) -> str:
+    """线宽圆点的提示：`线宽 3px（9）：越粗越显眼，马赛克不受它影响`。"""
+    key = WIDTH_KEYS.get(int(width), "")
+    body = f"线宽 {int(width)}px"
+    return f"{body}（{key}）：越粗越显眼" if key else f"{body}：越粗越显眼"
+
+
+def tool_key_hint() -> str:
+    """工具/颜色/线宽的键位一栏（**从上面三张表现算**，所以永远不会和实现漂）。
+
+    状态栏第二行与 `hint_text()` 都读它 —— 明江要的"键位提示保持与实现一致"就靠这条。
+    """
+    tools = " ".join(f"{TOOL_KEYS[t]}={TOOL_LABELS[t]}" for t in TOOLS if TOOL_KEYS.get(t))
+    colours = " ".join(f"{key}={name}" for name, key in COLOR_KEYS.items())
+    widths = " ".join(f"{key}={int(w)}px" for w, key in WIDTH_KEYS.items())
+    return f"工具：{tools} · 颜色：{colours} · 线宽：{widths}"
+
+
+def tool_for_key(name: str):
+    """字母键 → 工具名（没这个键返回 None）。`TOOL_KEYS` 是唯一一份表。"""
+    key = (name or "").lower()
+    for tool, hot in TOOL_KEYS.items():
+        if hot.lower() == key:
+            return tool
+    return None
+
+
+def colour_for_key(name: str):
+    """数字键 → 颜色 rgba（没这个键返回 None）。"""
+    for colour, key in COLOR_KEYS.items():
+        if key == (name or ""):
+            return dict(COLORS)[colour]
+    return None
+
+
+def width_for_key(name: str):
+    """数字键 → 线宽（没这个键返回 None）。"""
+    for width, key in WIDTH_KEYS.items():
+        if key == (name or ""):
+            return width
+    return None
+
+
+HINT_FOCUSED = ("　·　".join(tuple(PRIMARY_KEYS) + tuple(SECONDARY_KEYS))
+                + "　·　" + tool_key_hint())
 
 CLIPBOARD_CMD = ("wl-copy", "--type", "image/png")
 
@@ -462,16 +543,24 @@ def draw_canvas(cr, canvas, base_surface, shapes, selected=None, hover=None) -> 
     cr.restore()
 
 
-def window_plan(image_size, screen, bar_h=40, margin=CANVAS_MARGIN, gap=BAR_GAP) -> dict:
+def window_plan(image_size, screen, bar_h=40, margin=CANVAS_MARGIN, gap=BAR_GAP,
+                min_width=0) -> dict:
     """窗口规划：**先给工具条留一条带**（图像下方），再把截图缩放到剩下的空间里。
 
     这样"工具条不遮挡截图"在几何上就成立（不是靠运气）；只有连最小缩放都放不下时，
     `bar_layout` 才会退回"贴着图内下沿"，并被判据标成 `overlaps=True`。
+
+    `min_width` = **工具条固有宽度 + 两边**（调用方用 `bar_min_window_width()` 算）。为什么要有它
+    （2026-10-20 明江真机：260×420 的窄选区，工具条右端那一排颜色圆点被窗口黑边切掉）：
+    窗口尺寸原来**只由截图算**，而工具条的宽度与截图无关（本机实测 1012px）——窄图必然算出一个
+    比工具条窄的窗口，`bar_layout` 把条夹到 `x=2` 之后右端就伸到窗口外面去了。
+    治本就是这条：**窗口宽度不得小于工具条需要的宽度**（明江给的三选一里的①）。
+    图像仍在画布里居中，多出来的宽度就是两侧留白。
     """
     strip = int(bar_h) + int(gap) * 2
     avail = (max(screen[0] - margin * 2, 64), max(screen[1] - strip - margin * 2, 64))
     scale = fit_scale(image_size, avail)
-    canvas = canvas_layout(image_size, scale, margin, reserve_bottom=strip)
+    canvas = canvas_layout(image_size, scale, margin, reserve_bottom=strip, min_width=min_width)
     return {"scale": scale, "canvas": canvas, "window": canvas["size"], "strip": strip}
 
 
@@ -659,18 +748,26 @@ def _outline(cr, bounds, rgba, width, dashes=None, offset: int = 0) -> None:
 
 
 def canvas_layout(image_size, scale=1.0, margin=CANVAS_MARGIN,
-                  reserve_bottom=0, reserve_top=0) -> dict:
+                  reserve_bottom=0, reserve_top=0, min_width=0) -> dict:
     """截图在画布里的位置：**居中 + 四周留白**（不是贴边画，那样看不出边界）。
 
     `reserve_bottom` / `reserve_top` 是给工具条/抽屉预留的带（上下各算一条，图像本身仍居中于
-    剩余空间）。
+    剩余空间）。`min_width` 是**窗口宽度下限**（窄图时让画布跟着窗口变宽，图像仍在里面居中）——
+    存在的理由见 `window_plan`。
     """
     img_w = max(int(round(image_size[0] * scale)), 1)
     img_h = max(int(round(image_size[1] * scale)), 1)
+    canvas_w = max(img_w + int(margin) * 2, int(min_width))
+    left = (canvas_w - img_w) // 2          # 图像**水平居中**：min_width 生效时不再固定等于 margin
     top = int(margin) + int(reserve_top)
-    return {"image": (int(margin), top, img_w, img_h), "scale": scale, "margin": int(margin),
-            "size": (img_w + int(margin) * 2,
+    return {"image": (left, top, img_w, img_h), "scale": scale, "margin": int(margin),
+            "size": (canvas_w,
                      img_h + int(margin) * 2 + int(reserve_top) + int(reserve_bottom))}
+
+
+def bar_min_window_width(bar_width: int, edge: int = BAR_EDGE) -> int:
+    """能让工具条**完整显示**的最小窗口宽度（`bar_layout` 会把条夹在 `[edge, wx-bw-edge]` 里）。"""
+    return max(int(bar_width), 0) + int(edge) * 2
 
 
 def bar_layout(canvas, bar_size, window_size, gap=BAR_GAP) -> dict:
@@ -1328,12 +1425,18 @@ class Annotator:
 
         shot_style.install()                        # 设计语言（跟随 GNOME 深浅色）
         bar_h = TOOL_BTN + shot_style.BAR_PAD * 2 + 6
-        plan = window_plan(self.size, self.screen, bar_h=bar_h)
-        self.plan = plan
-        self.scale = plan["scale"]                  # 给工具条留出那条带之后重新算的缩放
 
         win = Gtk.Window(title=f"capsplus 标注 — {self.size[0]}×{self.size[1]}")
         win.get_style_context().add_class("cp-window")
+
+        # **先建工具条、再算窗口尺寸**（顺序是这条修法的全部）：工具条的固有宽度与截图无关，
+        # 窗口宽度必须**不小于它**，否则窄选区下工具条右端会被窗口切掉（2026-10-20 真机）。
+        self._build_bar(Gtk, self._theme_colour(win, Gtk))
+        bar_w = self._bar_intrinsic_width()
+        plan = window_plan(self.size, self.screen, bar_h=bar_h,
+                           min_width=bar_min_window_width(bar_w))
+        self.plan = plan
+        self.scale = plan["scale"]                  # 给工具条留出那条带之后重新算的缩放
         win.set_default_size(*plan["window"])
 
         self.area = Gtk.DrawingArea()
@@ -1346,9 +1449,8 @@ class Annotator:
         self.area.connect("motion-notify-event", self._on_motion)
         self.area.connect("button-release-event", self._on_release)
 
-        self._build_bar(Gtk, self._theme_colour(win, Gtk))
         # 工具条**贴近截图但不遮挡**：默认放在图像下方那条预留带里（几何见 bar_layout）
-        layout = bar_layout(plan["canvas"], (self._bar_width(), bar_h), plan["window"])
+        layout = bar_layout(plan["canvas"], (bar_w, bar_h), plan["window"])
         self._bar.set_halign(Gtk.Align.CENTER)
         self._bar.set_valign(Gtk.Align.START)
         self._bar.set_margin_top(int(layout["y"]))
@@ -1402,8 +1504,27 @@ class Annotator:
         return shot_style.theme_colour(win, selected=selected)
 
     def _bar_width(self) -> int:
+        return self._bar_intrinsic_width()
+
+    def _bar_intrinsic_width(self) -> int:
+        """工具条**装进窗口**需要的宽度（含 CSS 的 padding / border）。
+
+        `get_preferred_width()[1]`（natural）就是它，实测对得上每一项：
+        **1026 = 33 个子控件 950 + 间距 2×32=64 + `.cp-bar` 的 padding 5×2 + border 1×2 = 950+64+12**
+        （2026-10-20 在 xvfb 真窗口里逐项量过；同一套算法在另一轮量到 1024 = 948+64+12，也对得上）。
+        ⚠ 别改成"只把子控件宽度加起来"（=1014）：那会**少算 CSS 那 12px**，工具条右端仍会被窗口切掉
+        6px —— 真窗口判据 `TestNarrowWindowInARealWindow` 抓到的就是这个。
+        """
         try:
-            return int(self._bar.get_preferred_width()[1])
+            natural = int(self._bar.get_preferred_width()[1])
+        except Exception:
+            natural = 0
+        if natural > 0:
+            return natural
+        try:                                    # 兜底：至少把按钮本身算全（不含 CSS 的量，宁可窄一点）
+            children = self._bar.get_children()
+            spacing = self._bar.get_spacing()
+            return sum(c.get_preferred_width()[1] for c in children) + spacing * max(0, len(children) - 1)
         except Exception:
             return 720
 
@@ -1413,6 +1534,7 @@ class Annotator:
         btn = Gtk.Button()
         btn.set_relief(Gtk.ReliefStyle.NONE)
         btn.set_tooltip_text(tip)
+        self._attach_hover_hint(btn, tip)
         # 图标颜色按**这个按钮自己的底色**挑（浅底深图标/深底浅图标）—— 主按钮底色是选中色，
         # 赌主题变量会得到"白图标 + 白底 = 空方块"（窗口图抓到过）。
         # 主按钮上的图标画粗一档：底色是"选中色"，细线在浅底上容易被看成一个空方块
@@ -1427,6 +1549,25 @@ class Annotator:
             btn.get_style_context().add_class(cls)
         btn.connect("clicked", callback)
         return btn
+
+    def _attach_hover_hint(self, btn, tip: str) -> None:
+        """把"鼠标停在这个按钮上"写进状态栏那条主行（**与悬浮提示同一句文案**，不另抄一份）。
+
+        明江 2026-10-20："有几个按钮不知道什么意思" —— 提示气泡要等一秒才弹，状态栏是即时的；
+        两条都从同一个 `tip` 来，所以不会一个说法一个样。移开就回到"当前工具"。
+        """
+        def enter(_w, _e):
+            self._hover_hint = tip
+            self.refresh_status()
+            return False
+
+        def leave(_w, _e):
+            self._hover_hint = ""
+            self.refresh_status()
+            return False
+
+        btn.connect("enter-notify-event", enter)
+        btn.connect("leave-notify-event", leave)
 
     def _build_bar(self, Gtk, fg):
         from capsplus import shot_style
@@ -1458,7 +1599,8 @@ class Annotator:
                 if first is None:
                     first = btn
                 btn.set_relief(Gtk.ReliefStyle.NONE)
-                btn.set_tooltip_text(TIPS.get(tool, tool))
+                btn.set_tooltip_text(tool_tip(tool))
+                self._attach_hover_hint(btn, tool_tip(tool))
                 surface = None
                 try:
                     from capsplus.shot_icons import render_icon
@@ -1485,7 +1627,8 @@ class Annotator:
             if color_first is None:
                 color_first = btn
             btn.set_relief(Gtk.ReliefStyle.NONE)
-            btn.set_tooltip_text(f"颜色：{name}")
+            btn.set_tooltip_text(colour_tip(name))
+            self._attach_hover_hint(btn, colour_tip(name))
             surface = swatch_surface(rgba, SWATCH - 8)
             if surface is not None:
                 btn.set_image(Gtk.Image.new_from_surface(surface))
@@ -1507,7 +1650,8 @@ class Annotator:
             if width_first is None:
                 width_first = btn
             btn.set_relief(Gtk.ReliefStyle.NONE)
-            btn.set_tooltip_text(f"线宽 {width}px")
+            btn.set_tooltip_text(width_tip(width))
+            self._attach_hover_hint(btn, width_tip(width))
             surface = width_dot_surface(width, WIDTH_DOT - 8, shot_style.readable_colour(btn, fg))
             if surface is not None:
                 btn.set_image(Gtk.Image.new_from_surface(surface))
@@ -1543,6 +1687,21 @@ class Annotator:
         for width, btn in getattr(self, "_widths", {}).items():
             self._set_active_class(btn, "dot", width == self.width)
 
+    def _sync_radio_buttons(self, tool=None, colour=None, width=None) -> None:
+        """把**快捷键**选中的工具/颜色/线宽同步到单选按钮上（不然按键改了状态、按钮还亮着旧的）。
+
+        按钮自己的 `toggled` 处理器会顺手 `set_tool/set_color/set_width` 并同步高亮，
+        所以这里只负责"按下那个键 = 按下那个按钮"这一件事（不重复实现一遍状态机）。
+        """
+        if tool and tool in getattr(self, "_buttons", {}):
+            self._buttons[tool].set_active(True)
+        if colour is not None:
+            for name, btn in getattr(self, "_swatches", {}).items():
+                if dict(COLORS).get(name) == colour:
+                    btn.set_active(True)
+        if width is not None and width in getattr(self, "_widths", {}):
+            self._widths[width].set_active(True)
+
     @staticmethod
     def _set_active_class(btn, kind: str, active: bool) -> None:
         """把"选中态"的 CSS 类加上或摘掉（基础类始终保持）。
@@ -1573,15 +1732,21 @@ class Annotator:
         self._menu = menu
 
     def refresh_status(self) -> None:
-        """状态栏：字号够大、对比度够，快捷键提示放这里（不再是微缩灰字）。"""
+        """状态栏：字号够大、对比度够，快捷键提示放这里（不再是微缩灰字）。
+
+        主行带"当前工具（键）"或"悬停的那个按钮"（`_hover_hint`），次要行带工具/颜色/线宽的键位
+        —— 两行都从 `TOOL_KEYS`/`COLOR_KEYS`/`WIDTH_KEYS` 现算，所以**不会和实现漂**。
+        """
         if getattr(self, "_status", None) is None:
             return
         from capsplus import shot_style
         selected = shape_label(self.selected) if self.selected is not None else ""
-        self._status.set_text(shot_style.status_text(self.focused, selected, self.message,
-                                                     picked=self.picked))
+        self._status.set_text(shot_style.status_text(
+            self.focused, selected, self.message, picked=self.picked,
+            tool=f"{TOOL_LABELS.get(self.tool, self.tool)}（{TOOL_KEYS.get(self.tool, '')}）",
+            hover=getattr(self, "_hover_hint", "")))
         if getattr(self, "_status_more", None) is not None:
-            self._status_more.set_text(shot_style.status_more(self.focused))
+            self._status_more.set_text(shot_style.status_more(self.focused, extra=tool_key_hint()))
 
     # ---- 提示条 / 面板刷新（只在有窗口时才碰 gi）----
     def refresh_hint(self) -> None:
@@ -1725,12 +1890,32 @@ class Annotator:
             self.area.queue_draw()
 
     def _on_key(self, _win, event):
-        """窗内键位：动作查 `key_command()`（**唯一一份定义**），这里只负责收尾。"""
+        """窗内键位：动作查 `key_command()`（**唯一一份定义**），这里只负责收尾。
+
+        没被 `key_command` 接手的键再试**工具/颜色/线宽**那三张表（`TOOL_KEYS`/`COLOR_KEYS`/
+        `WIDTH_KEYS`）—— 按钮提示里写着哪个键，这里就认哪个键（同一份表，不会对不上）。
+        """
         _Gtk, Gdk, _GLib = _gtk()
         name = Gdk.keyval_name(event.keyval) or ""
         ctrl = bool(event.state & Gdk.ModifierType.CONTROL_MASK)
         shift = bool(event.state & Gdk.ModifierType.SHIFT_MASK)
         action = key_command(name, ctrl=ctrl, shift=shift)
+        if action is None and not ctrl:
+            tool = tool_for_key(name)
+            colour = colour_for_key(name)
+            width = width_for_key(name)
+            if tool or colour is not None or width is not None:
+                if tool:
+                    self.set_tool(tool)
+                if colour is not None:
+                    self.set_color(colour)
+                if width is not None:
+                    self.set_width(width)
+                self._sync_bar_state()               # 高亮跟着键走（不然按了键看不出换了没）
+                self._sync_radio_buttons(tool, colour, width)
+                self.refresh_status()
+                self.area.queue_draw()
+                return True
         if action is None:
             return False                    # 没接手的键让 GTK 照常处理（别吞掉）
         if action == ACTION_NUDGE:

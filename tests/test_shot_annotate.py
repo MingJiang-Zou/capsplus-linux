@@ -867,6 +867,146 @@ class TestNewToolbarAndEditing(unittest.TestCase):
         self.assertIn("set_image", source, "工具按钮要画成图标")
         self.assertIn("set_tooltip_text", source, "图标要靠悬浮提示才认得出")
 
+    # ---- ② 窄选区：窗口宽度必须装得下工具条 ----
+    def test_narrow_selection_window_is_wide_enough_for_the_toolbar(self):
+        """② 窄图（260×420）时，窗口宽度必须 ≥ 工具条固有宽度 + 两边。
+
+        2026-10-20 真机：`--annotate` 一张 260×420 的图，窗口 288×510、而工具条固有宽度 **1012px**
+        ⇒ `bar_layout` 把条夹到 `x=2` 之后右端伸到窗口外面 **被窗口黑边切掉**（颜色圆点那排看不见）。
+        根因：窗口尺寸只由截图算，而工具条的宽度与截图无关。
+        """
+        screen = (1840, 920)                      # `screen_size()` 的形状（主屏减去边距）
+        # 本机实测的工具条宽度：950（33 个子控件）+ 64（间距）+ 12（.cp-bar 的 padding 5×2 + border 1×2）
+        bar_w = 1026
+        plan = AN.window_plan((260, 420), screen, bar_h=46,
+                              min_width=AN.bar_min_window_width(bar_w))
+        self.assertGreaterEqual(plan["window"][0], bar_w,
+                                f"窗口 {plan['window']} 装不下 {bar_w}px 的工具条")
+        bar = AN.bar_layout(plan["canvas"], (bar_w, 46), plan["window"])
+        self.assertGreaterEqual(bar["x"], 0, "工具条左端出界了")
+        self.assertLessEqual(bar["x"] + bar_w, plan["window"][0],
+                             f"工具条右端越出窗口（就是明江看到的那条切边）：{bar}")
+        self.assertFalse(AN.bar_overlaps_image({**bar, "w": bar_w, "h": 46}, plan["canvas"]),
+                         "变宽之后工具条还得在图像外面")
+
+    def test_wide_screen_keeps_the_old_behaviour(self):
+        """宽度下限只在"真装不下"时起作用：图本来就比工具条宽时，窗口尺寸与旧口径一致。"""
+        plan = AN.window_plan((1200, 600), (1840, 920), bar_h=46, min_width=1016)
+        self.assertEqual(plan["window"][0], 1200 + AN.CANVAS_MARGIN * 2,
+                         "图够宽时不该被 min_width 撑大")
+        self.assertEqual(plan["canvas"]["image"][0], AN.CANVAS_MARGIN,
+                         "图够宽时左边距还是 CANVAS_MARGIN")
+
+    def test_min_width_centres_the_image_and_bar_min_width_adds_both_edges(self):
+        plan = AN.window_plan((260, 420), (1840, 920), bar_h=46,
+                              min_width=AN.bar_min_window_width(760))
+        left, _top, w, _h = plan["canvas"]["image"]
+        self.assertEqual(w, 260)
+        self.assertGreater(left, AN.CANVAS_MARGIN, "变宽的画布里图像要居中，不是靠左")
+        self.assertEqual(left * 2 + w, plan["window"][0], "左右留白应当相等")
+        self.assertEqual(AN.bar_min_window_width(760), 760 + AN.BAR_EDGE * 2)
+
+    # ---- ③④ 每个按钮都有"是什么 + 快捷键"的提示；状态栏跟着显示 ----
+    def test_every_tool_tip_carries_name_key_and_meaning(self):
+        for tool in AN.TOOLS:
+            with self.subTest(tool=tool):
+                tip = AN.tool_tip(tool)
+                self.assertIn(AN.TOOL_LABELS[tool], tip, "提示里要有名字")
+                self.assertIn(AN.TOOL_KEYS[tool], tip, "提示里要有快捷键")
+                self.assertGreater(len(tip), len(AN.TOOL_LABELS[tool]) + 4,
+                                   f"只写了名字等于没说这是什么：{tip}")
+
+    def test_colour_and_width_tips_carry_their_keys(self):
+        for name, key in AN.COLOR_KEYS.items():
+            self.assertIn(key, AN.colour_tip(name), f"颜色 {name} 的提示里没有键")
+            self.assertIn(name, AN.colour_tip(name))
+        for width, key in AN.WIDTH_KEYS.items():
+            self.assertIn(key, AN.width_tip(width))
+            self.assertIn(str(width), AN.width_tip(width))
+
+    def test_eyedropper_is_discoverable_not_missing(self):
+        """③ 吸管**本来就在工具表里**（`shot_annotate.TOOLS`），缺的是"认得出"。
+
+        所以这条钉的是**发现性**：名字（吸管）+ 快捷键（I）+ 说明（取色、不改画面）三样都在提示里。
+        """
+        self.assertIn("eyedropper", AN.TOOLS)
+        tip = AN.tool_tip("eyedropper")
+        self.assertIn("吸管", tip)
+        self.assertIn("I", tip)
+        self.assertIn("颜色", tip)
+        from capsplus import shot_icons as SI
+        self.assertIn("eyedropper", SI.TOOL_ICONS, "图标表里也得有它（不然按钮是空的）")
+
+    def test_intrinsic_width_counts_the_css_padding_and_border(self):
+        """工具条宽度必须**含 CSS 的 padding/border**（少了那 12px 就会切边 —— 真窗口判据抓到过）。
+
+        纯逻辑那半：拿一个假 bar 走 `_bar_intrinsic_width()` 的两条路（有 natural 用它、
+        没有就用子控件之和兜底），断言不会算得比按钮本身还小。
+        """
+        class _FakeBtn:
+            def get_preferred_width(self):
+                return (10, 40)
+
+        class _FakeBar:
+            def __init__(self, natural):
+                self._natural = natural
+
+            def get_preferred_width(self):
+                if self._natural is None:
+                    raise RuntimeError("没有显示服务器")
+                return (self._natural, self._natural)
+
+            def get_spacing(self):
+                return 2
+
+            def get_children(self):
+                return [_FakeBtn(), _FakeBtn(), _FakeBtn()]
+
+        an = AN.Annotator.__new__(AN.Annotator)
+        an._bar = _FakeBar(1026)
+        self.assertEqual(an._bar_intrinsic_width(), 1026, "该用 GTK 报的 natural（含 CSS）")
+        an._bar = _FakeBar(None)                  # 拿不到时退回子控件之和：3×40 + 2×2 = 124
+        self.assertEqual(an._bar_intrinsic_width(), 124, "兜底要把按钮本身算全")
+
+    def test_key_table_has_no_duplicates_and_covers_everything(self):
+        """键位表**唯一一份**：工具/颜色/线宽的键互不重复，且每个按钮都能查到键。"""
+        keys = list(AN.TOOL_KEYS.values()) + list(AN.COLOR_KEYS.values()) + list(AN.WIDTH_KEYS.values())
+        self.assertEqual(len(keys), len(set(keys)), f"有键撞了：{keys}")
+        self.assertEqual(sorted(AN.TOOL_KEYS), sorted(AN.TOOLS), "每个工具都要有键")
+        self.assertEqual(len(AN.COLOR_KEYS), len(AN.COLORS))
+        self.assertEqual(len(AN.WIDTH_KEYS), len(AN.WIDTHS))
+        for tool, key in AN.TOOL_KEYS.items():
+            with self.subTest(tool=tool):
+                self.assertEqual(AN.tool_for_key(key), tool, "按提示里写的键要真能选中这个工具")
+                self.assertEqual(AN.tool_for_key(key.lower()), tool)
+
+    def test_key_hint_line_is_derived_from_the_table(self):
+        """键位提示那行必须**从表里现算**（别写成第二份真相）：表里改了，提示跟着改。"""
+        hint = AN.tool_key_hint()
+        for tool, key in AN.TOOL_KEYS.items():
+            self.assertIn(f"{key}={AN.TOOL_LABELS[tool]}", hint)
+        for name, key in AN.COLOR_KEYS.items():
+            self.assertIn(f"{key}={name}", hint)
+        self.assertIn(AN.tool_key_hint(), AN.hint_text(True),
+                      "一整条提示里也要带上工具键位（两处都读同一个函数）")
+
+    def test_colour_and_width_keys_resolve(self):
+        for name, key in AN.COLOR_KEYS.items():
+            self.assertEqual(AN.colour_for_key(key), dict(AN.COLORS)[name])
+        for width, key in AN.WIDTH_KEYS.items():
+            self.assertEqual(AN.width_for_key(key), width)
+        self.assertIsNone(AN.tool_for_key("q"))
+        self.assertIsNone(AN.colour_for_key("9z"))
+        self.assertIsNone(AN.width_for_key("z"))
+
+    def test_action_tips_keep_their_shortcut_in_the_text(self):
+        """动作类按钮（撤销/存盘/贴图…）的提示里也要有快捷键 —— 它们读的是同一份 `TIPS`。"""
+        from capsplus.shot_icons import TIPS
+        for icon, key in (("undo", "Ctrl+Z"), ("redo", "Ctrl+Y"), ("copy", "Enter"),
+                          ("save", "Ctrl+S"), ("pin", "F3"), ("close", "Esc")):
+            with self.subTest(icon=icon):
+                self.assertIn(key, TIPS[icon], f"{icon} 的提示里没有快捷键")
+
     # ---- 选中 / 手柄 / 拖动（纯逻辑）----
     def test_eight_handles_around_the_bounds(self):
         bounds = (100, 200, 60, 40)
@@ -1784,6 +1924,157 @@ class TestEyedropperPicksExactPixels(unittest.TestCase):
         an.press((-5, -5))
         self.assertEqual(an.color, before, "图外取色不该改颜色")
         self.assertEqual(an.picked, "")
+
+
+@unittest.skipUnless(not GUI_SKIP, f"跳过界面用例：{GUI_SKIP}")
+class TestNarrowWindowInARealWindow(unittest.TestCase):
+    """② 的**真窗口**判据：260×420 的窄图，窗口与工具条的**实际分配**都要装得下。
+
+    真机复现命令（明江给的，留在这里好复算）：
+        python3 -c "from PIL import Image; Image.new('RGB',(260,420),(240,240,245)).save('/tmp/narrow.png')"
+        capsplus-shot --annotate /tmp/narrow.png
+    修前：窗口 288×510、工具条 1012px ⇒ 右端（颜色圆点那排）越出窗口被切掉。
+    """
+
+    def test_window_and_bar_allocation_agree_for_a_narrow_image(self):
+        import gi
+        gi.require_version("Gtk", "3.0")
+        gi.require_version("GLib", "2.0")
+        from gi.repository import GLib
+        an = AN.Annotator(white_surface(260, 420), screen=(1840, 920),
+                          directory=temp_dir(), clip=lambda _d: (True, "s"))
+        state = {}
+
+        def build():
+            an._loop = GLib.MainLoop()
+            an._win = an._build()
+            an._win.show_all()
+            GLib.timeout_add(150, measure)
+            return False
+
+        def measure():
+            win_w = an._win.get_size()[0]
+            alloc = an._bar.get_allocation()
+            state["win"] = an._win.get_size()
+            state["bar_w"] = an._bar_intrinsic_width()
+            state["alloc"] = (alloc.x, alloc.y, alloc.width, alloc.height)
+            state["plan"] = an.plan["window"]
+            state["layout"] = dict(an._bar_layout)
+            an._win.destroy()
+            loop.quit()
+            return False
+
+        loop = GLib.MainLoop()
+        GLib.timeout_add(0, build)
+        fired = []
+        fallback = GLib.timeout_add(3000, lambda: (fired.append(1), loop.quit(), False)[2])
+        loop.run()
+        if not fired:
+            try:
+                GLib.source_remove(fallback)
+            except Exception:
+                pass
+        # 宽度必须与规划一致（这条是 ② 的全部）；高度会**多出状态栏那两行**（它单独占一层，
+        # 规划里算的是画布那条带），所以只要求 ≥
+        self.assertEqual(state["win"][0], state["plan"][0], "窗口实际宽度与规划不一致")
+        self.assertGreaterEqual(state["win"][1], state["plan"][1],
+                                "窗口实际高度比画布还小 —— 画布被裁了")
+        self.assertGreaterEqual(state["win"][0], state["bar_w"],
+                                f"窗口 {state['win']} 装不下 {state['bar_w']}px 的工具条")
+        x, _y, width, _h = state["alloc"]
+        self.assertGreaterEqual(x, 0, "工具条左端出界")
+        self.assertLessEqual(x + width, state["win"][0],
+                             f"工具条右端越出窗口 —— 正是明江看到的那条切边：{state['alloc']}")
+        self.assertGreaterEqual(width, state["bar_w"] - 4,
+                                f"工具条被压窄了：{state['alloc']} vs 固有 {state['bar_w']}px")
+        bar = {**state["layout"], "w": state["bar_w"], "h": 46}
+        self.assertFalse(AN.bar_overlaps_image(bar, an.plan["canvas"]), f"工具条压到图上：{bar}")
+
+
+@unittest.skipUnless(not GUI_SKIP, f"跳过界面用例：{GUI_SKIP}")
+class TestToolbarTipsAndStatusInARealWindow(unittest.TestCase):
+    """④ 在**真窗口**里逐按钮核对"是什么 + 快捷键"，并核对状态栏跟着走（2026-10-20）。
+
+    明江："工具栏有几个按钮不知道什么意思" —— 纯函数那几条只证明表是对的，这条证明**按钮上真挂上了**、
+    悬停/按键之后**状态栏真变了**。
+    """
+
+    def test_every_button_has_a_tip_with_its_key_and_the_status_follows(self):
+        import gi
+        gi.require_version("Gtk", "3.0")
+        gi.require_version("Gdk", "3.0")
+        gi.require_version("GLib", "2.0")
+        from gi.repository import Gdk, GLib
+        an = AN.Annotator(white_surface(200, 100), screen=(400, 300),
+                          directory=temp_dir(), clip=lambda _d: (True, "s"))
+        state = {}
+
+        def build():
+            an._loop = GLib.MainLoop()
+            an._win = an._build()
+            an._win.show_all()
+            groups = {"工具": an._buttons, "颜色": an._swatches,
+                      "线宽": an._widths, "动作": an._actions}
+            state["empty"] = [f"{g}/{n}" for g, btns in groups.items()
+                              for n, b in btns.items() if not (b.get_tooltip_text() or "").strip()]
+            state["missing_key"] = [f"{g}/{n}" for g, btns in groups.items()
+                                    for n, b in btns.items()
+                                    if (n in AN.TOOL_KEYS and AN.TOOL_KEYS[n]
+                                        not in b.get_tooltip_text())]
+            state["status"] = an._status.get_text()
+            state["more"] = an._status_more.get_text()
+            # 悬停一个"不认识"的按钮（吸管）⇒ 状态栏立刻说清它是什么、按什么键
+            an._hover_hint = an._buttons["eyedropper"].get_tooltip_text()
+            an.refresh_status()
+            state["hover_status"] = an._status.get_text()
+            an._hover_hint = ""
+            an.refresh_status()
+            # 按快捷键：工具 / 颜色 / 线宽三样都要跟着变，按钮也要亮成新的那个
+            class _Ev:
+                pass
+            for name, keyval in (("工具", Gdk.KEY_i), ("颜色", Gdk.KEY_4), ("线宽", Gdk.KEY_0)):
+                ev = _Ev()
+                ev.keyval = keyval
+                ev.state = 0
+                state[f"consumed_{name}"] = an._on_key(None, ev)
+            state["tool"] = an.tool
+            state["colour"] = an.color
+            state["width"] = an.width
+            state["eyedropper_active"] = an._buttons["eyedropper"].get_active()
+            state["blue_active"] = an._swatches["蓝"].get_active()
+            state["six_active"] = an._widths[6].get_active()
+            state["status_after_key"] = an._status.get_text()
+            state["more_has_keys"] = AN.tool_key_hint() in an._status_more.get_text()
+            an._win.destroy()
+            loop.quit()
+            return False
+
+        loop = GLib.MainLoop()
+        GLib.timeout_add(0, lambda: (build(), False)[1])
+        fired = []
+        fallback = GLib.timeout_add(3000, lambda: (fired.append(1), loop.quit(), False)[2])
+        loop.run()
+        if not fired:
+            try:
+                GLib.source_remove(fallback)
+            except Exception:
+                pass
+        self.assertEqual(state.get("empty"), [], "这些按钮没有悬浮提示（等于让人猜）")
+        self.assertEqual(state.get("missing_key"), [], "提示里没写快捷键")
+        self.assertIn("工具：矩形（R）", state.get("status", ""),
+                      f"状态栏要写清当前工具与快捷键：{state.get('status')}")
+        self.assertIn("悬停：吸管", state.get("hover_status", ""),
+                      f"悬停要能当场看明白那个按钮是什么：{state.get('hover_status')}")
+        self.assertIn("I", state.get("hover_status", ""))
+        for kind in ("工具", "颜色", "线宽"):
+            self.assertTrue(state.get(f"consumed_{kind}"), f"{kind} 的快捷键没被接手")
+        self.assertEqual((state.get("tool"), state.get("width")), ("eyedropper", 6))
+        self.assertEqual(state.get("colour"), dict(AN.COLORS)["蓝"])
+        self.assertTrue(state.get("eyedropper_active"), "按 I 之后吸管按钮没亮")
+        self.assertTrue(state.get("blue_active"), "按 4 之后蓝色圆点没亮")
+        self.assertTrue(state.get("six_active"), "按 0 之后线宽 6px 没亮")
+        self.assertIn("吸管（I）", state.get("status_after_key", ""))
+        self.assertTrue(state.get("more_has_keys"), "次要那行没带上工具/颜色/线宽的键位")
 
 
 if __name__ == "__main__":

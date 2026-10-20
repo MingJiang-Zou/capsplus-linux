@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import argparse
 import datetime
+import os
 import sys
 from pathlib import Path
 
@@ -78,7 +79,13 @@ def capture(x: int, y: int, w: int, h: int, out_path, *, timeout_ms: int = SF.CA
     三个注入点（`emit_fn` / `wait_fn` / `verify_fn`）就是为判据留的：单测里 stub 掉 D-Bus 与时钟，
     **没有真屏、没有扩展也能跑**，反例具型也能真的红。
     """
-    out = Path(out_path)
+    out = Path(out_path).expanduser()
+    # **转成绝对路径再交给 shell 扩展**（2026-10-20 实测踩到）：扩展是在 **gnome-shell 的进程里**
+    # 写文件的，相对路径按**它自己的 cwd**（本机是 `~`）解析 —— 于是
+    # `--capture 0 0 1400 900 --out A.png` 把图写到 `~/A.png`，而本进程还在原目录等 `A.png`，
+    # 3 秒后报"没等到产物"：**明明抓成功了却说失败**（当时用绝对路径绕过，根因在这里）。
+    # 只用 `abspath` 不用 `resolve()`：不追软链，免得把调用方给的路径改写掉。
+    out = Path(os.path.abspath(str(out)))
     if w <= 0 or h <= 0:
         return False, f"✗ 选区不合法：{w}×{h}（宽高必须为正）"
     try:

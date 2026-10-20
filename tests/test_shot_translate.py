@@ -36,6 +36,261 @@ def reply(text="译好了"):
     return json.dumps({"choices": [{"message": {"content": text}}]}).encode("utf-8")
 
 
+def reasoning_reply(reasoning="想" * 40, finish="length"):
+    """**真机上抓到的形状**（2026-10-20）：HTTP 200、`content` 空、思考全在 `reasoning_content`。
+
+    原样搬进判据里（不是编的）：本机 llama.cpp `qwen3.8-27b` 的实际响应就是
+    `choices[0].message.content = ""`、`reasoning_content` 有 134 个字、`finish_reason="length"`。
+    """
+    return json.dumps({"choices": [{"finish_reason": finish,
+                                    "message": {"content": "", "reasoning_content": reasoning}}]}
+                      ).encode("utf-8")
+
+
+class _HttpError(Exception):
+    """带状态码的假 HTTP 错误（urllib 的 `HTTPError.code` / requests 的 `.response.status_code`
+    两种形状都覆盖到 —— 判据两种各用一次）。"""
+
+    def __init__(self, code):
+        super().__init__(f"HTTP Error {code}")
+        self.code = code
+
+
+class TestThinkingIsTurnedOff(unittest.TestCase):
+    """① 关思考：**实测唯一有效的开关是 `chat_template_kwargs`**，判据直接抓请求体。
+
+    2026-10-20 真机（明江报"翻译无效"）：本机 12087 上换成推理模型后，`content` **恒为空**、
+    token 全花在 `reasoning_content` 里；`parse_completion` 读的是 `.content` ⇒ 翻译结果永远空白。
+    实测数据：
+      * 不关思考：`max_tokens=32` 全用光、`content=""`、`finish_reason=length`（3/3 复现）；
+      * `chat_template_kwargs={"enable_thinking":false}`：`reasoning_content` 空、22 token 出完整译文、
+        墙钟 0.43s（缓存命中）/0.78s（冷）——本机与阿里 token-plan **两个后端都认这个开关**；
+      * 提示词里加 `/no_think` **不管用**（实测照样 32 token 全思考、content 仍空），所以本文件里
+        不测它"有效"，只测"没把它当成办法"。
+    """
+
+    def test_local_request_carries_the_no_think_kwarg(self):
+        seen = {}
+
+        def post(url, data, headers, timeout=T.TIMEOUT_S):
+            seen["body"] = json.loads(data.decode())
+            return reply("译文")
+
+        result = T.translate_local("hello", post=post)
+        self.assertTrue(result["ok"])
+        self.assertEqual(seen["body"].get("chat_template_kwargs"), {"enable_thinking": False},
+                         "没发关思考开关 ⇒ 推理模型会把 token 全花在思考里、译文是空的")
+        self.assertEqual(seen["body"].get("max_tokens"), T.TEXT_MAX_TOKENS,
+                         "要给 max_tokens：不关思考时靠它兜住 runaway")
+
+    def test_cloud_request_carries_it_too(self):
+        seen = {}
+
+        def post(url, data, headers, timeout=T.TIMEOUT_S):
+            seen["body"] = json.loads(data.decode())
+            return reply("译文")
+
+        T.translate_cloud("hello", cloud=CLOUD, post=post)
+        self.assertEqual(seen["body"].get("chat_template_kwargs"), {"enable_thinking": False},
+                         "云端 deepseek-v4.1-flash 也是推理模型（实测 reasoning_tokens 149→0）")
+
+    def test_image_request_carries_it_too(self):
+        seen = {}
+        png = pathlib.Path(tempfile.mkdtemp(prefix="capsplus-tr-")) / "x.png"
+        png.write_bytes(b"\x89PNG\r\n\x1a\nfake")
+
+        def post(url, data, headers, timeout=T.TIMEOUT_S):
+            seen["body"] = json.loads(data.decode())
+            return reply("原文：a\n译文：b")
+
+        T.translate_image(str(png), cloud=CLOUD, post=post)
+        self.assertEqual(seen["body"].get("chat_template_kwargs"), {"enable_thinking": False})
+        self.assertEqual(seen["body"].get("max_tokens"), T.IMAGE_MAX_TOKENS)
+
+    def test_empty_content_becomes_an_explicit_reason_not_a_blank(self):
+        """空 content 必须**带原因**（认出推理模型这种形状），不许静默空白。"""
+        ans = T.translate_local("hello", post=lambda *a, **k: reasoning_reply())
+        self.assertFalse(ans["ok"])
+        self.assertIn("reasoning_content", ans["hint"], "要说清思考把 token 吃光了")
+        self.assertIn("enable_thinking", ans["hint"], "要给可复制的修法")
+        self.assertIn("/no_think", ans["hint"], "要顺带说清提示词那条路不管用（别让人白试）")
+        self.assertEqual(ans["text"], "")
+
+    def test_an_endpoint_that_rejects_the_kwarg_still_translates(self):
+        """对面不认 `chat_template_kwargs`（400）⇒ 去掉它重试一次，而不是整个翻译废掉。"""
+        calls = []
+
+        def post(url, data, headers, timeout=T.TIMEOUT_S):
+            body = json.loads(data.decode())
+            calls.append(bool(body.get("chat_template_kwargs")))
+            if body.get("chat_template_kwargs"):
+                raise _HttpError(400)
+            return reply("译文")
+
+        result = T.translate_local("hello", post=post)
+        self.assertTrue(result["ok"], "400 应该退化成『去掉开关再试一次』")
+        self.assertEqual(calls, [True, False], f"应当先带开关、被拒后不带：{calls}")
+        self.assertIn("不认", result["note"], "退化了要说出来（别让人以为一直是关思考在跑）")
+
+    def test_a_500_is_not_retried(self):
+        """只有 400（"不认这个字段"）才重试；500 这种服务端错误照原样报。"""
+        calls = []
+
+        def post(url, data, headers, timeout=T.TIMEOUT_S):
+            calls.append(1)
+            raise _HttpError(500)
+
+        result = T.translate_local("hello", post=post)
+        self.assertFalse(result["ok"])
+        self.assertEqual(len(calls), 1, "500 不该被重试（重试只会多花一次排队时间）")
+        self.assertIn("500", result["hint"])
+
+
+class TestTimeoutsAreMeasured(unittest.TestCase):
+    """① 超时：实测定的数字 + **超时与"端点不在"必须分开说**（排队不等于端点死了）。"""
+
+    def test_default_timeout_is_roomier_than_the_measured_queueing(self):
+        # 实测：服务端自己算一次翻译 0.39s，可被另一个会话排到 **63.7s** 墙钟 ⇒ 60s 会误报
+        self.assertGreaterEqual(T.TIMEOUT_S, 120, "默认超时要比实测排队的 63.7s 留足余量")
+        self.assertEqual(T.request_timeout(), T.TIMEOUT_S)
+
+    def test_env_can_raise_it(self):
+        os.environ[T.TIMEOUT_ENV] = "7"
+        self.addCleanup(lambda: os.environ.pop(T.TIMEOUT_ENV, None))
+        self.assertEqual(T.request_timeout(), 7)
+        os.environ[T.TIMEOUT_ENV] = "乱写"
+        self.assertEqual(T.request_timeout(), T.TIMEOUT_S, "写坏了要退回默认，不是变成 0")
+        os.environ[T.TIMEOUT_ENV] = "0"
+        self.assertEqual(T.request_timeout(), T.TIMEOUT_S)
+
+    def test_timeout_says_queueing_not_dead(self):
+        def post(url, data, headers, timeout=T.TIMEOUT_S):
+            self.assertEqual(timeout, T.request_timeout(), "传下去的必须是生效的那个超时")
+            raise TimeoutError("timed out")
+
+        result = T.translate_local("hello", post=post)
+        self.assertFalse(result["ok"])
+        self.assertIn("超时", result["hint"])
+        self.assertIn("排队", result["hint"], "要说清本机是串行的、可能只是被别人占着")
+        self.assertNotIn("没应答", result["hint"], "别把排队说成端点死了")
+
+
+class TestTranslateStatusProbe(unittest.TestCase):
+    """① `--translate-status` 要**做一次真往返**并按结果分类（原来只说"端点活着"）。"""
+
+    def _probe(self, payload_or_exc):
+        if isinstance(payload_or_exc, Exception):
+            def post(*_a, **_k):
+                raise payload_or_exc
+        else:
+            def post(*_a, **_k):
+                return payload_or_exc
+        return post
+
+    def test_alive_and_producing_text(self):
+        out = T.probe_local(post=self._probe(reply("你好")))
+        self.assertEqual(out["state"], T.PROBE_STATE_OK)
+        self.assertIn("你好", out["text"])
+
+    def test_alive_but_content_empty_is_a_flagged_state(self):
+        """这正是真机上的形状：HTTP 200、能连上、**出不了字** —— 不许报"活着"。"""
+        out = T.probe_local(post=self._probe(reasoning_reply()))
+        self.assertEqual(out["state"], T.PROBE_STATE_EMPTY)
+        self.assertIn("reasoning_content", out["detail"])
+
+    def test_timeout_state(self):
+        out = T.probe_local(post=self._probe(TimeoutError("slow")))
+        self.assertEqual(out["state"], T.PROBE_STATE_TIMEOUT)
+        self.assertLessEqual(T.PROBE_TIMEOUT_S, 10, "探活要秒回，不许拖着")
+
+    def test_down_state(self):
+        out = T.probe_local(post=self._probe(OSError("connection refused")))
+        self.assertEqual(out["state"], T.PROBE_STATE_DOWN)
+
+    def test_status_text_reports_all_four(self):
+        ok = T.describe(post=self._probe(reply("你好")))
+        self.assertIn("活着且能出字", ok)
+        empty = T.describe(post=self._probe(reasoning_reply()))
+        self.assertIn("活着但出不了字", empty)
+        self.assertIn("超时", T.describe(post=self._probe(TimeoutError("x"))))
+        self.assertIn("端点不在", T.describe(post=self._probe(OSError("refused"))))
+        # 关掉探活那条路只报端点通不通（离线/判据用）
+        self.assertIn("端点", T.describe(probe=False))
+
+
+class TestCloudCredentialFailover(unittest.TestCase):
+    """① 云端兜底要**真的能用**：第一把 401（`~/.bailian/config.json` 实测就是坏的）要自动换下一把。"""
+
+    def setUp(self):
+        self.dir = pathlib.Path(tempfile.mkdtemp(prefix="capsplus-tr-failover-"))
+        self.addCleanup(lambda: shutil.rmtree(self.dir, ignore_errors=True))
+        self.json_path = self.dir / "config.json"
+        self.cred_path = self.dir / "credentials.yaml"
+        self.json_path.write_text(json.dumps(
+            {"active_config": "token-plan",
+             "token-plan": {"base_url": "https://json.example.com", "api_key": "KEY-FROM-JSON"}}),
+            encoding="utf-8")
+        self.cred_path.write_text("version: 1\nrefs:\n  AL_TOKEN_PLAN_API_KEY: KEY-FROM-YAML\n",
+                                  encoding="utf-8")
+        self.addCleanup(lambda: os.environ.pop("CAPSPLUS_CLOUD_KEY", None))
+        os.environ.pop("CAPSPLUS_CLOUD_KEY", None)
+        self.json_cfg = T.cloud_config(str(self.json_path), credentials_path=str(self.cred_path))
+
+    def test_candidates_are_listed_in_priority_order_without_values(self):
+        cands = T.cloud_candidates(str(self.json_path), credentials_path=str(self.cred_path))
+        self.assertEqual([c["api_key"] for c in cands], ["KEY-FROM-JSON", "KEY-FROM-YAML"])
+        self.assertIn("bailian", cands[0]["source"])
+        self.assertIn("credentials.yaml", cands[1]["source"])
+        for cand in cands:
+            self.assertNotIn("KEY-FROM", cand["source"], "source 只能是标签，不能带值")
+
+    def test_a_401_from_the_first_credential_falls_through_to_the_next(self):
+        used = []
+
+        def post(url, data, headers, timeout=T.TIMEOUT_S):
+            key = headers.get("Authorization", "").replace("Bearer ", "")
+            used.append(key)
+            if key == "KEY-FROM-JSON":
+                raise _HttpError(401)                    # 实测就是这把 401
+            return reply("译文")
+
+        orig = T.cloud_candidates
+        with mock.patch.object(T, "cloud_candidates",
+                               lambda *a, **k: orig(str(self.json_path),
+                                                    credentials_path=str(self.cred_path))):
+            result = T.translate_cloud("hello", post=post)
+        self.assertTrue(result["ok"], "第二把是好的，就该成功 —— 别把 401 当『有凭据』")
+        self.assertEqual(used, ["KEY-FROM-JSON", "KEY-FROM-YAML"])
+        self.assertIn("401", result["note"], "换过凭据要说出来（不然没人知道第一把坏了）")
+
+    def test_all_credentials_401_reports_every_source_it_tried(self):
+        def post(*_a, **_k):
+            raise _HttpError(401)
+
+        orig = T.cloud_candidates
+        with mock.patch.object(T, "cloud_candidates",
+                               lambda *a, **k: orig(str(self.json_path),
+                                                    credentials_path=str(self.cred_path))):
+            result = T.translate_cloud("hello", post=post)
+        self.assertFalse(result["ok"])
+        self.assertIn("bailian", result["hint"])
+        self.assertIn("credentials.yaml", result["hint"])
+        self.assertIn("本地", result["hint"], "全坏要给下一步：切本机模型")
+        self.assertNotIn("KEY-FROM", result["hint"], "文案里不许出现凭据值")
+
+    def test_explicit_cloud_still_means_one_attempt(self):
+        """显式传 cloud（判据/调用方指定）时不许偷偷换成别的凭据。"""
+        calls = []
+
+        def post(*_a, **_k):
+            calls.append(1)
+            raise _HttpError(401)
+
+        result = T.translate_cloud("hello", cloud=CLOUD, post=post)
+        self.assertFalse(result["ok"])
+        self.assertEqual(len(calls), 1)
+
+
 class TestBaseUrlNormalisation(unittest.TestCase):
     def test_site_root_gets_the_compatible_path(self):
         self.assertEqual(T.normalize_base_url("https://x.aliyuncs.com"),
@@ -447,7 +702,13 @@ class TestCredentialSources(unittest.TestCase):
         """**假凭据 fixture**：任何产出的文字里都不许出现它的值（含片段）。"""
         os.environ["CAPSPLUS_CLOUD_KEY"] = self.FAKE
         messages = []
-        messages.append(T.describe())
+        # `probe=False`：这条判据查的是"值有没有漏出去"，不该真去连网络/真模型
+        #（`--translate-status` 默认会真跑一次小往返，那条另有判据 `TestTranslateStatusProbe`）。
+        messages.append(T.describe(probe=False))
+        # 真走一遍"带探活"的分支（`--translate-status` 的默认形状），但**用桩把网络封住**
+        messages.append(T.describe(post=lambda *a, **k: json.dumps(
+            {"choices": [{"finish_reason": "length",
+                          "message": {"content": None, "reasoning_content": "想" * 40}}]}).encode()))
         messages.append(T.cloud_config(str(self.json_path),
                                        credentials_path=str(self.cred_path))["source"])
         messages.append(str(T.resolve_backend(local_probe=lambda: False)))

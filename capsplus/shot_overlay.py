@@ -763,13 +763,13 @@ class Overlay:
         """
         if frame is None:
             return None
-        key = (idx, id(frame), tuple(area))
+        key = (id(frame), tuple(area))
         cached = getattr(self, "_scaled_cache", None)
         if cached is None:
             cached = self._scaled_cache = {}
-        hit = cached.get(key)
-        if hit is not None:
-            return hit
+        hit = cached.get(idx)
+        if hit is not None and hit[0] == key:
+            return hit[1]
         cairo = _cairo()
         aw, ah = max(1, int(area[2])), max(1, int(area[3]))
         surface = cairo.ImageSurface(cairo.FORMAT_ARGB32, aw, ah)
@@ -779,7 +779,10 @@ class Overlay:
             cr.scale(aw / fw, ah / fh)
             cr.set_source_surface(frame, 0, 0)
             cr.paint()
-        self._scaled_cache = {key: surface}
+        # **每块屏留自己那一份**（不是只留最新一份）：拖选区时三块屏要一起重画，
+        # 只留一份的话每次重画都会把另外两块屏的图重新缩一遍（实测缩一次 36ms，
+        # 三块屏 108ms/帧 ⇒ 正是"框选特别卡"）。每份 ≈ 屏逻辑尺寸 ×4 字节（1920×1080 ≈ 8.3MB）。
+        cached[idx] = (key, surface)
         return surface
 
     def _frame_for(self, idx: int):
@@ -852,40 +855,33 @@ class Overlay:
         return True
 
     def _on_motion_event(self, _widget, event, idx):
-        """鼠标移动：**只重画该重画的那一块**（性能体检 B3）。
+        """鼠标移动：**指针动就重画**（不按键也要跟手）。
 
-        原来是 `invalidate_rect(None, ...)` = **每块屏整幅重画**，而指针一动就来一次；
-        整幅重画实测 p50 ≈ 18 ms（已超过 60Hz 一帧的 16.7ms），三块屏还要各来一遍。
-        现在：算出"放大镜旧位置 ∪ 新位置"这一小块，只让**指针所在那块屏**重画它。
+        2026-10-20 真机事故（明江："十字线不跟鼠标走、要按着拖才跟"）：上一批的"性能体检 B3"
+        把这里改成对 GdkWindow 调 **子区域** `invalidate_rect(dirty, False)` —— 而 GTK3 对
+        **直接打在 GdkWindow 上的子区域失效不发 `draw` 信号**（只有整幅 `invalidate_rect(None,…)`
+        才发）。于是第一次移动走"整幅"那条路（画得出来），之后每次移动都走脏矩形那条路 ⇒
+        **一次都不重画**，十字线冻在第一次的位置上；而拖动时走的是 `moved != ACTION_IGNORE`
+        的整幅那条路，所以"按着拖反而跟手"。
+        实测（真机 ydotool 连移 30 次，探针记录）：MOTION 690 次 / REDRAW 689 次 / **DRAW 只有 30 次**
+        （还都在起止两头），两次抓屏逐像素差 **0.0000%**。
+        另：`tests/test_shot_overlay.TestMotionOnlyRedrawsADirtyRect` 当时是绿的 —— 它拿假窗口断言
+        "调没调那个 API、参数多小"，而不是"draw 有没有发生、像素有没有变"，所以拦不住。
+
+        现在回到 `GtkWidget.queue_draw()`（GTK 的正确入口，实测 40/40 次都发 draw），
+        并把代价压在图本身：预缩放缓存后整幅重画的 p50 = **0.87ms**（见 `_scaled_frame`），
+        60Hz 一帧 16.7ms 里占 5%，**不需要**再省那块脏矩形。
+        选区变了（`moved != ACTION_IGNORE`）才需要三块屏一起重画（压暗带/读数整片都变）。
         """
-        before = self._pointer_dirty_rect(idx)
+        prev = self.pointer[0] if self.pointer else None
         moved = self.on_motion(idx, (int(event.x), int(event.y)))
-        after = self._pointer_dirty_rect(idx)
         if moved != ACTION_IGNORE:
-            # 拖选区/新起选区时，压暗带与读数整片都变了 —— 只重画指针那一小块会**留残影**
-            # （脏矩形省法只适用于"指针动、选区不变"这一种情况）
-            self._redraw()
-            return True
-        if before and after:                     # 两个小矩形的并集（旧位置也要重画，不然留残影）
-            x0 = min(before[0], after[0]); y0 = min(before[1], after[1])
-            x1 = max(before[0] + before[2], after[0] + after[2])
-            y1 = max(before[1] + before[3], after[1] + after[3])
-            dirty = (x0, y0, x1 - x0, y1 - y0)
+            self._redraw()                     # 选区变了：每块屏的压暗带与读数都变了
         else:
-            dirty = None
-        if dirty is None:
-            self._redraw()                                  # 算不出脏矩形就整幅（宁可慢也别花屏）
-        else:
-            self._redraw(dirty=dirty, idx=idx)
+            self._redraw(idx=idx)              # 只有指针那块屏变
+            if prev is not None and prev != idx:
+                self._redraw(idx=prev)         # 换屏：旧那块屏上留着的准线要擦掉
         return True
-
-    def _pointer_dirty_rect(self, idx):
-        """指针附近需要重画的那一小块（放大镜盒 + 准线，用窗口坐标）。"""
-        if idx >= len(self.windows) or not self.pointer or self.pointer[0] != idx:
-            return None
-        x, y = self.pointer[1]
-        size = MAG_SIZE + 2 * MAG_GAP
-        return (max(0, int(x - MAG_GAP)), max(0, int(y - MAG_GAP)), size, size)
 
     def _on_release_event(self, _widget, _event, idx):
         self.on_release()
@@ -925,19 +921,18 @@ class Overlay:
         self.rect = nudge_rect(self.rect, dx, dy, self.union)
         return True
 
-    def _redraw(self, dirty=None, idx=None):
-        """整幅重画（`dirty=None`）或只重画一小块（给 B3 的省法）。"""
-        if dirty is not None and idx is not None and idx < len(self.windows):
-            win = self.windows[idx]
-            gdk_win = win.get_window()
-            if gdk_win is not None:
-                _Gtk, Gdk, _GLib = _gtk()
-                x, y, w, h = dirty
-                gdk_win.invalidate_rect(Gdk.Rectangle(x=x, y=y, width=int(w), height=int(h)), False)
-                return
-        for win in self.windows:
+    def _redraw(self, idx=None):
+        """让窗口重画：`idx=None` = 全部窗口，给了 `idx` = 只有那一块屏。
+
+        ⚠ **必须走 `GtkWidget.queue_draw()`**，不许回退成 `GdkWindow.invalidate_rect(rect, False)`
+        （子区域那条不发 `draw`，见 `_on_motion_event` 的实测）。反例：把这里换回
+        `win.get_window().invalidate_rect(...)` ⇒ `tests/test_shot_overlay` 的
+        `TestMotionActuallyRepaints` 必红（真窗口 + 真像素）。
+        """
+        targets = self.windows if idx is None else self.windows[idx:idx + 1]
+        for win in targets:
             if win.get_window() is not None:
-                win.get_window().invalidate_rect(None, False)
+                win.queue_draw()
 
 
 def select_region(frames, monitors=None, on_confirm=None) -> tuple:

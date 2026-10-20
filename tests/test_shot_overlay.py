@@ -1033,82 +1033,198 @@ class _Ev:
 
 
 @unittest.skipUnless(not GUI_SKIP, f"跳过界面用例：{GUI_SKIP}")
-class TestMotionOnlyRedrawsADirtyRect(unittest.TestCase):
-    """鼠标移动**只重画一小块**（性能体检 B3）。
+class TestMotionActuallyRepaints(unittest.TestCase):
+    """⑤ 指针一动就必须**真的重画**（明江真机："十字线不跟鼠标走、要按着拖才跟"）。
 
-    原来每个 motion 事件都对**每块屏** `invalidate_rect(None, ...)`（整幅重画）—— 整幅实测
-    p50 ≈ 18 ms，已经超过 60Hz 一帧；三块屏还要各来一遍。判据：指针在同一块屏里动 ⇒ 只让
-    **那块屏**重画"放大镜旧位置 ∪ 新位置"那一小块，不许出现整幅 `None`。
-    反例：改回整幅重画 → 必红。
+    病根（2026-10-20 实测，两层证据）：
+      * **真机探针**：`ydotool` 连移 30 次指针 ⇒ 遮罩进程里 MOTION **690** 次、REDRAW **689** 次，
+        可 `draw` 信号只发了 **30** 次（还都在起止两头）；两次抓屏逐像素差 **0.0000%**。
+      * **隔离实验**（xvfb，本文件那个 `gtk_draw_probe` 形状）：对 GdkWindow 调
+        **子区域** `invalidate_rect(rect, False)` 40 次 ⇒ `draw` **1** 次；换
+        `GtkWidget.queue_draw_area()` / `queue_draw()` / 整幅 `invalidate_rect(None,…)` ⇒ **40/40**。
+      ⇒ GTK3 对"直接打在 GdkWindow 上的子区域失效"**不发 draw**，而上一批的"脏矩形省法"正好走这条路；
+      拖动时走的是整幅那条路，所以现象是"按着拖反而跟手"。
+    ⚠ 上一批的判据（`TestMotionOnlyRedrawsADirtyRect`）当时是**绿的**：它拿假窗口断言
+    "调没调那个 API、参数多小"，不问"draw 到底有没有发生、像素有没有变" —— 所以它拦不住，
+    这一版把它换成"真窗口 + 真像素"那一条（`TestMotionMovesTheCrosshairForReal`）。
     """
 
-    class _FakeGdkWindow:
-        def __init__(self):
-            self.calls = []
-
-        def invalidate_rect(self, rect, clear):
-            self.calls.append(None if rect is None else
-                              (rect.x, rect.y, rect.width, rect.height))
-
     class _FakeWin:
+        """假窗口：记账的是 **`queue_draw()`**（GTK 的正确入口），不是 `invalidate_rect`。"""
+
         def __init__(self):
-            self.gdk = TestMotionOnlyRedrawsADirtyRect._FakeGdkWindow()
-            self.visible = True
+            self.draws = 0
 
         def get_window(self):
-            return self.gdk
+            return object()                  # 只看有没有窗口，不碰内容
+
+        def queue_draw(self):
+            self.draws += 1
 
     @staticmethod
-    def _overlay_only(count=2):
-        """只要"重画范围"这部分行为：`on_motion` 换成一个只做记账的桩。
-
-        真实 `on_motion` 里还有拖拽/吸附等状态，本判据不管那些（它们各有自己的判据）；
-        但**指针记账**要保留，因为脏矩形就是按指针算的。
-        """
+    def _overlay(count=2):
+        """只管"重画打给谁"这部分行为：`on_motion` 换成一个只做记账的桩（保留指针记账）。"""
         ov = OV.Overlay.__new__(OV.Overlay)
-        ov.windows = [TestMotionOnlyRedrawsADirtyRect._FakeWin() for _ in range(count)]
+        ov.windows = [TestMotionActuallyRepaints._FakeWin() for _ in range(count)]
         ov.pointer = None
 
         def on_motion(idx, xy):
             ov.pointer = (idx, xy)
-            return OV.ACTION_IGNORE         # **纯指针移动**（选区不变）才走脏矩形省法
+            return OV.ACTION_IGNORE         # **纯指针移动**（选区不变）
         ov.on_motion = on_motion
         return ov
 
-    def _overlay(self, count=2):
-        return self._overlay_only(count)
-
-    def test_motion_inside_one_monitor_invalidates_a_small_rect_on_that_monitor(self):
+    def test_motion_redraws_the_pointer_window(self):
         ov = self._overlay()
         ov.pointer = (0, (400, 300))
         ov._on_motion_event(None, _Ev(0, 410, 305), 0)
-        calls0 = ov.windows[0].gdk.calls
-        self.assertTrue(calls0, "没让窗口重画")
-        self.assertNotIn(None, calls0, "整幅重画了（每动一下重画整屏，代价 p50 ≈ 18ms）")
-        x, y, w, h = calls0[-1]
-        self.assertLessEqual(w * h, (OV.MAG_SIZE + 2 * OV.MAG_GAP) ** 2 + 64,
-                             f"脏矩形太大：{w}×{h}")
-        self.assertEqual(ov.windows[1].gdk.calls, [], "另一块屏不该跟着重画")
+        self.assertEqual(ov.windows[0].draws, 1, "指针动了却没让那块屏重画")
 
-    def test_moving_to_another_monitor_still_repaints_the_new_one(self):
+    def test_the_other_screens_are_not_repainted_for_a_pointer_move(self):
+        """指针在同一块屏里动 ⇒ 只有那块屏重画（别的屏内容没变，别白烧 CPU）。"""
         ov = self._overlay()
         ov.pointer = (0, (400, 300))
-        ov._on_motion_event(None, _Ev(0, 500, 300), 1)
-        self.assertTrue(ov.windows[1].gdk.calls, "换屏之后新那块屏要重画")
-        self.assertTrue(all(c is None or True for c in ov.windows[1].gdk.calls))
+        ov._on_motion_event(None, _Ev(0, 410, 305), 0)
+        self.assertEqual(ov.windows[1].draws, 0, "另一块屏不该跟着重画")
 
-    def test_unknown_pointer_falls_back_to_full_repaint(self):
-        """拿不准就整幅 —— 宁可慢一点，也不能花屏。"""
+    def test_moving_to_another_monitor_repaints_both(self):
+        """换屏：新那块屏要画准线，**旧那块屏上留着的那条也要擦掉**。"""
         ov = self._overlay()
-        ov.pointer = None
-        before = (2, 2, 80, 80)
+        ov.pointer = (0, (400, 300))
+        ov._on_motion_event(None, _Ev(1, 20, 300), 1)
+        self.assertEqual(ov.windows[1].draws, 1, "换屏后新那块屏要重画")
+        self.assertEqual(ov.windows[0].draws, 1, "旧那块屏上的准线没擦（会留一条白线）")
 
-        def on_motion(_idx, _xy):            # 桩：不更新指针 ⇒ 脏矩形算不出来
-            return OV.ACTION_IGNORE
+    def test_drag_repaints_every_screen(self):
+        """拖选区时压暗带整片都变 ⇒ 每块屏都要重画。"""
+        ov = self._overlay()
+        ov.pointer = (0, (100, 100))
+
+        def on_motion(idx, xy):
+            ov.pointer = (idx, xy)
+            return OV.ACTION_UPDATE         # 正在拖选区
         ov.on_motion = on_motion
-        ov._on_motion_event(None, _Ev(0, 10, 10), 0)
-        self.assertIn(None, ov.windows[0].gdk.calls)
-        self.assertEqual(before, (2, 2, 80, 80))
+        ov._on_motion_event(None, _Ev(0, 140, 160), 0)
+        self.assertEqual([w.draws for w in ov.windows], [1, 1], "拖选区时该每块屏都重画")
+
+    def test_motion_never_uses_the_platform_window_invalidate_path(self):
+        """静态：`_redraw` **代码里**不许回到 `GdkWindow.invalidate_rect`（子区域那条不发 draw）。
+
+        ⚠ 只扫**去掉文档字符串之后的代码**：`_redraw` 的注释里正是靠提到 `invalidate_rect`
+        来说明"为什么不许用它"，扫全文会自伤（这一版第一遍就是这么红的）。
+        """
+        import ast
+        import textwrap
+        tree = ast.parse(textwrap.dedent(inspect.getsource(OV.Overlay._redraw)))
+        node = tree.body[0]
+        if (node.body and isinstance(node.body[0], ast.Expr)
+                and isinstance(getattr(node.body[0], "value", None), ast.Constant)
+                and isinstance(node.body[0].value.value, str)):
+            node.body = node.body[1:]                       # 摘掉 docstring
+        code = ast.unparse(node)
+        self.assertIn("queue_draw", code)
+        self.assertNotIn("invalidate_rect", code,
+                         "子区域 invalidate_rect 在 GTK3 里不发 draw —— 十字线会冻住（实测）")
+
+
+@unittest.skipUnless(not GUI_SKIP, f"跳过界面用例：{GUI_SKIP}")
+class TestMotionMovesTheCrosshairForReal(unittest.TestCase):
+    """⑤ 的**真路径**判据：真 `Gtk.Window` + 真 `_on_draw` + 真 `_on_motion_event` ⇒ 像素必须变。
+
+    反例具型（2026-10-20 实测红过）：把 `_redraw()` 里那行换回
+    `win.get_window().invalidate_rect(Gdk.Rectangle(0, 0, 8, 8), False)`（子区域失效）
+    ⇒ 本判据红在第一条断言：`AssertionError: 1 not greater than 1 : 第一次移动没触发 draw`。
+    ⚠ 判据动**两次**是**照历史代码的形状**设计的：出事那版里第一次移动走"整幅"那条路（画得出来）、
+    第二次才走脏矩形那条路 ⇒ 只动一次会**假绿**。这是这次事故最关键的一条。
+
+    ⚠ 两个环境事实（实测，别再踩）：
+      1. 必须跑**真主循环**（`GLib.MainLoop` + `timeout_add` 分阶段）：只用
+         `Gtk.main_iteration_do(False)` 空转**不会**把 `queue_draw()` 变成一次 draw
+         （实测：初始 1 次，queue_draw 后还是 1 次；真主循环里才涨到 3 次）。
+      2. 读像素必须在 draw 落地之后（所以每一阶段之间隔 150ms）。
+    """
+
+    W, H = 240, 160
+
+    def test_two_pointer_moves_repaint_and_the_crosshair_follows(self):
+        import gi
+        gi.require_version("Gtk", "3.0")
+        gi.require_version("Gdk", "3.0")
+        from gi.repository import Gtk, GLib, Gdk
+        # 纯色帧：准线（白 α=0.35 压在压暗带上）在纯色底上最好认，像素断言不用挑颜色
+        frame = cairo.ImageSurface(cairo.FORMAT_ARGB32, self.W, self.H)
+        cr = cairo.Context(frame)
+        cr.set_source_rgb(0.5, 0.5, 0.5)
+        cr.paint()
+        ov = OV.Overlay(monitors=[(0, 0, self.W, self.H)])
+        ov.frames = [SFR.Frame((0, 0, self.W, self.H), frame)]
+        win = Gtk.OffscreenWindow()
+        win.set_default_size(self.W, self.H)
+        seen = {"draws": 0}
+
+        def on_draw(widget, cr_):
+            seen["draws"] += 1
+            return ov._on_draw(widget, cr_, 0)
+        win.connect("draw", on_draw)
+        ov.windows = [win]
+        state = {}
+
+        def sampler():
+            pixbuf = Gdk.pixbuf_get_from_window(win.get_window(), 0, 0, self.W, self.H)
+            data, stride, n = pixbuf.get_pixels(), pixbuf.get_rowstride(), pixbuf.get_n_channels()
+
+            def px(x, y):
+                off = y * stride + x * n
+                return tuple(data[off + i] for i in range(3))
+            return px
+
+        def stage_build():
+            win.show_all()
+            GLib.timeout_add(150, stage_move_first)
+            return False
+
+        def stage_move_first():
+            state["before"] = seen["draws"]
+            ov._on_motion_event(win, _Ev(0, 60, 40), 0)
+            GLib.timeout_add(150, stage_sample_first)
+            return False
+
+        def stage_sample_first():
+            state["draws_first"] = seen["draws"]
+            px = sampler()
+            state["first_new"] = sum(px(5, 40))
+            state["first_old"] = sum(px(5, 120))
+            ov._on_motion_event(win, _Ev(0, 180, 120), 0)      # ★ 第二次：旧代码在这里就不重画了
+            GLib.timeout_add(150, stage_sample_second)
+            return False
+
+        def stage_sample_second():
+            state["draws_second"] = seen["draws"]
+            px = sampler()
+            state["second_new"] = sum(px(5, 120))
+            state["second_old"] = sum(px(5, 40))
+            win.destroy()
+            loop.quit()
+            return False
+
+        loop = GLib.MainLoop()
+        GLib.timeout_add(0, stage_build)
+        fired = []
+        fallback = GLib.timeout_add(5000, lambda: (fired.append(1), loop.quit(), False)[2])
+        loop.run()
+        if not fired:
+            try:
+                GLib.source_remove(fallback)
+            except Exception:
+                pass
+        self.assertNotIn(1, fired, "判据自己超时了（窗口/主循环没起来）")
+        self.assertGreater(state["draws_first"], state["before"], "第一次移动没触发 draw")
+        self.assertGreater(state["draws_second"], state["draws_first"],
+                           "第二次移动没触发 draw —— 正是『十字线冻住』那条路")
+        self.assertGreater(state["second_new"], state["first_old"] + 10,
+                           f"新位置的准线没画出来：{state['second_new']} vs {state['first_old']}")
+        self.assertLess(state["second_old"], state["first_new"] - 10,
+                        f"旧位置的准线没擦掉（留残影）：{state['second_old']} vs {state['first_new']}")
 
 
 @unittest.skipUnless(HAVE_CAIRO, "没有 pycairo：这条要真建 surface")
@@ -1153,11 +1269,12 @@ class TestFrameIsPreScaledOnce(unittest.TestCase):
 class TestDraggingRepaintsTheWholeBand(unittest.TestCase):
     """拖选区时**必须整幅重画**：压暗带整片都变，只重画指针那一小块会留残影。
 
-    （这是我上一轮做脏矩形省法时留下的隐患，性能体检时抓出来的。）
+    这一条与 `TestMotionActuallyRepaints` 是一对：指针动（选区不变）只重画指针那块屏；
+    拖选区时每块屏都得重画。两条都用假窗口记账 `queue_draw()`（真像素那条另有判据）。
     """
 
-    def test_drag_triggers_a_full_repaint_not_a_dirty_rect(self):
-        ov = TestMotionOnlyRedrawsADirtyRect._overlay_only()
+    def test_drag_repaints_every_screen_not_just_the_pointer_one(self):
+        ov = TestMotionActuallyRepaints._overlay()
         ov.pointer = (0, (100, 100))
 
         def on_motion(idx, xy):
@@ -1165,5 +1282,5 @@ class TestDraggingRepaintsTheWholeBand(unittest.TestCase):
             return OV.ACTION_UPDATE         # 正在拖选区
         ov.on_motion = on_motion
         ov._on_motion_event(None, _Ev(0, 140, 160), 0)
-        self.assertIn(None, ov.windows[0].gdk.calls,
-                      "拖选区时只重画了脏矩形 —— 压暗带会留残影")
+        self.assertEqual([w.draws for w in ov.windows], [1, 1],
+                         "拖选区时压暗带整片都变，每块屏都得重画（不然留残影）")

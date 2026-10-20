@@ -222,23 +222,27 @@ SECONDARY_KEYS = ("F2 翻译", "F3 贴图", "F4 OCR", "Ctrl+Y 重做",
 
 
 def status_text(focused: bool = True, selected: str = "", message: str = "",
-                picked: str = "") -> str:
-    """状态栏**主行**：消息 · 选中了什么 · 常用键（大一点）。
+                picked: str = "", tool: str = "", hover: str = "") -> str:
+    """状态栏**主行**：消息 · 当前工具（或鼠标悬停的那个按钮）· 选中了什么 · 常用键（大一点）。
 
+    `tool` / `hover` 由 `shot_annotate` 用**它自己那份表**算好传进来，这里不另抄一份键位：
+    明江说"工具栏有几个按钮不知道什么意思" ⇒ 悬停在哪个按钮上，状态栏就把那个按钮的
+    "名字 + 快捷键"写出来，光靠图标认不出的按钮（比如吸管）也能当场看明白（2026-10-20）。
     ⚠ 与 `status_more()` 分两档显示（lead："太密、层次没出来"）：常用键给主行，其余键收成次要那行。
     """
     parts = []
     if message:
         parts.append(message)
+    parts.append(f"悬停：{hover}" if hover else (f"工具：{tool}" if tool else ""))
     parts.append(f"已选：{selected}" if selected else "未选中标注（点一下标注就能拖/改）")
     if picked:                                   # 吸管取到的颜色（提取颜色那条功能）
         parts.append(f"取色 {picked}")
     if not focused:
         parts.append("窗口没有焦点：F2/F3/F4 现在**不会**生效 —— 点一下窗口再按")
     parts.append("　·　".join(PRIMARY_KEYS))
-    return "　·　".join(parts)
+    return "　·　".join(p for p in parts if p)
 
 
-def status_more(focused: bool = True) -> str:
-    """状态栏**次要那行**：其余键（小一号、暗一档）。"""
-    return "　·　".join(SECONDARY_KEYS)
+def status_more(focused: bool = True, extra: str = "") -> str:
+    """状态栏**次要那行**：其余键（小一号、暗一档），外加 `extra`（工具/颜色/线宽的键位）。"""
+    return "　·　".join(p for p in ("　·　".join(SECONDARY_KEYS), extra) if p)

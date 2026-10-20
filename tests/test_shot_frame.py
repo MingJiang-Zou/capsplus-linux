@@ -16,6 +16,7 @@
 * `TestLogContract`：扩展改了 journal 格式而解析器没跟上 → 红（这是跨语言契约，不是自说自话）。
 """
 
+import os
 import pathlib
 import datetime
 import shutil
@@ -231,6 +232,31 @@ class TestCaptureOrchestration(unittest.TestCase):
         ok, msg = SC.capture(0, 0, 10, 10, self.out, emit_fn=emit_fn)
         self.assertFalse(ok, "半张图必须当场报错，不能拿出去当截图用")
         self.assertIn("IEND", msg)
+
+    def test_relative_out_path_is_made_absolute_before_it_reaches_the_shell(self):
+        """相对路径必须在**本进程**里转成绝对路径（2026-10-20 实测踩到）。
+
+        扩展是在 gnome-shell 的进程里写文件的，相对路径按**它的 cwd** 解析：
+        真机 `--capture 0 0 1400 900 --out A.png` 实测把图写到 `~/A.png`，而本进程还在原目录等
+        `A.png` ⇒ 报"3.0s 内没等到抓帧的产物"，**其实抓成功了**（当时用绝对路径绕过，根因在这里）。
+        判据：等产物的那条路径必须是绝对路径，且与调用方指的那个文件是同一个。
+        """
+        seen = {}
+        rel = os.path.relpath(str(self.dir / "rel.png"), os.getcwd())
+
+        def wait_fn(path, ms):
+            seen["path"] = path
+            return False, ms
+
+        ok, msg = SC.capture(0, 0, 10, 10, rel, emit_fn=lambda: None,
+                             wait_fn=wait_fn, timeout_ms=50)
+        self.assertFalse(ok, "桩没有造出文件，本来就该失败（这条只看路径）")
+        self.assertTrue(os.path.isabs(seen["path"]),
+                        f"相对路径原样拿去等产物了：{seen['path']}")
+        self.assertEqual(seen["path"], os.path.abspath(str(self.dir / "rel.png")),
+                         "转出来的绝对路径指错了地方")
+        self.assertIn(os.path.abspath(str(self.dir / "rel.png")), msg,
+                      "报错文案里的产物路径也得是绝对路径（它才是本进程在等的那个）")
 
     def test_degenerate_rect_never_reaches_the_bus(self):
         ok, _ = SC.capture(0, 0, 0, 10, self.out, emit_fn=lambda: self.calls.append("emit"))
