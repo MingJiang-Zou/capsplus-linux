@@ -18,7 +18,10 @@
 
 from __future__ import annotations
 
+import os
 import re
+import subprocess
+import sys
 import time
 from pathlib import Path
 
@@ -159,9 +162,99 @@ def parse_pin_log(text: str) -> list:
     return _parse_marked(text, "pin result=")
 
 
+# ------------------------------------------------------- 失败必须出声（桌面通知）
+
+# 为什么要通知（2026-10-20）：`Caps+F1` 那条路是 keyd 的 `command(...)` 起的进程，stdout/stderr
+# 落在 journal 里没人看。扩展没加载 / 抓帧超时的**唯一现象**就是"按了没反应"，于是明江只能靠
+# 反复重登来试探（他原话：「老是要重登 感觉也不好吧」）。所以失败时除了 stderr，还得**弹一下**，
+# 并且通知里必须写"下一步跑什么"，不然只是把"没反应"换成"看不懂"。
+NOTIFY_APP = "capsplus"
+NOTIFY_TITLE = "Capslock+ 截图没成"
+
+# 同一进程里同一条失败只喊一次：抓帧失败后调用方可能连着念两遍话术，别弹两条一样的通知。
+_notified: set = set()
+
+
+def _notify_allowed() -> bool:
+    """现在该不该弹桌面通知 —— 三条闸，任何一条不满足都不弹。
+
+    * `CAPSPLUS_NOTIFY=0`：开发/脚本里显式关掉；
+    * 进程里已经 import 了 `unittest`：这是单测，**绝不许碰屏幕**（跑一次全量能踩出十几条通知，
+      和仓库里 `CAPSPLUS_GUI` 那条纪律同源：界面类的副作用默认不许发生）；
+    * stderr 是终端：人在看着，话术已经打在屏幕上了，再弹窗只是打断他干活。
+    """
+    if os.environ.get("CAPSPLUS_NOTIFY") == "0":
+        return False
+    if "unittest" in sys.modules:
+        return False
+    try:
+        if sys.stderr is not None and sys.stderr.isatty():
+            return False
+    except (AttributeError, ValueError):        # 被替换成怪对象（测试夹具）时当作"不是终端"
+        pass
+    return True
+
+
+def _send_notification(title: str, body: str, *, timeout_ms: int = 6000) -> None:
+    """发一条桌面通知：GIO 优先，没有 gi 才退回 `notify-send`（别为一个通知引新依赖）。
+
+    GIO 这条路是 `Gio.DBusProxy` 直接调 `org.freedesktop.Notifications.Notify`：不建 Application、
+    不接管进程生命周期，一次同步调用就完事。**注意 gi 必须迟到导入** —— 本模块要被"没装
+    python3-gi"的 CI 导入（`tests/test_no_gi_smoke.py`），顶层裸写 `import gi` 会让整套测试
+    在收集阶段就崩。
+    任何异常都吞掉：通知发不出去不该比失败本身更严重，更不许因此让 capsplus 返回非 0。
+    """
+    try:
+        from gi.repository import Gio, GLib                     # noqa: WPS433（迟到导入，见上）
+        bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
+        proxy = Gio.DBusProxy.new_sync(
+            bus, Gio.DBusProxyFlags.NONE, None,
+            "org.freedesktop.Notifications", "/org/freedesktop/Notifications",
+            "org.freedesktop.Notifications", None)
+        proxy.call_sync(
+            "Notify",
+            GLib.Variant("(susssasa{sv}i)",
+                         (NOTIFY_APP, 0, "", title, body, [], {}, timeout_ms)),
+            Gio.DBusCallFlags.NONE, 3000, None)
+        return
+    except Exception:                                            # noqa: BLE001（没有 gi / 没有 GUI）
+        pass
+    try:
+        subprocess.run(["notify-send", "-a", NOTIFY_APP, title, body],
+                       capture_output=True, timeout=3)
+    except Exception:                                            # noqa: BLE001
+        pass
+
+
+def notify_failure(text: str, *, title: str = NOTIFY_TITLE, sender=None, force=False) -> bool:
+    """把一次失败喊出声；返回**是否真的发了**（单测就靠这个返回值断言）。
+
+    `text` 是给通知栏看的短话（一句话 + 一个能跑的动作），完整话术仍旧走 stderr ——
+    通知栏放不下五条排查建议。
+    """
+    if not (force or _notify_allowed()):
+        return False
+    key = (title, text)
+    if key in _notified:
+        return False
+    _notified.add(key)
+    try:
+        (sender or _send_notification)(title, text)
+    except Exception:                                            # noqa: BLE001
+        # 通知这条路自己坏了，也不能把"报告失败"这个正事带崩（更不许让 capsplus 变非 0）
+        pass
+    return True
+
+
 def timeout_report(out_path, waited_ms: int, journal_hint: str = "", what: str = "抓帧",
                    log_grep: str = "shot") -> str:
-    """超时话术：**必须可操作**（明江讨厌被打断，给他能自己跑的一条命令，而不是"失败了"）。"""
+    """超时话术：**必须可操作**（明江讨厌被打断，给他能自己跑的一条命令，而不是"失败了"）。
+
+    这里顺带**发一条桌面通知**（`notify_failure`）：明江是按 `Caps+F1` 触发的，那条路是 keyd
+    起的进程，stdout/stderr 谁都不看 —— 只打一行 `✗ …` 等于什么都没发生，他只会再来一句
+    "截图又没反应"。抓帧 / 贴图 / 清空贴图三条失败路径都过这个函数，所以通知挂在这里而不是
+    调用方（挂在调用方会漏掉其中一条，也容易漏掉后来新加的那条）。
+    """
     lines = [
         f"✗ {waited_ms / 1000:.1f}s 内没等到 {what} 的产物 {out_path}",
         "  按可能性排序的三条：",
@@ -171,6 +264,10 @@ def timeout_report(out_path, waited_ms: int, journal_hint: str = "", what: str =
         f"   3) 信号没人订/{what}抛了异常：{journal_hint or 'journalctl --user -n 200'} "
         f"| grep '{LOG_MARK} {log_grep}'（成功与失败都会留一行）",
     ]
+    notify_failure(
+        f"{what}没等到产物（{waited_ms / 1000:.1f}s）⇒ Caps 热键会没反应。"
+        f"在仓目录跑 `sh tools/ext-bench.sh` 自检（不用重登）",
+        title=f"Capslock+ {what}没成")     # 标题带上具体动作：贴图和抓帧是两条不同的排查路
     return "\n".join(lines)
 
 

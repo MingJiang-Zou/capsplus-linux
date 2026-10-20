@@ -1,22 +1,39 @@
-# capsplus raise-browser 扩展的**登录同步**：oneshot，每次登录把仓里的 extension.js/metadata.json
-# 拷进 ~/.local/share/gnome-shell/extensions，并保证 uuid 在 enabled-extensions 里。
+# capsplus raise-browser 扩展的**登录校验**：oneshot，每次登录比对仓内与部署副本的 md5，
+# 顺带看 uuid 在不在 enabled-extensions 里。**一个字节都不写**。
 #
-# 为什么要有它：GNOME Shell 只在启动时扫描用户扩展目录，改过代码后 disable/enable 不会重新 import
-# （状态卡在 ERROR，2026-10-16 实测）⇒ 唯一生效路径是重登。这个 unit 让"重登"成为**唯一**要做的事，
-# 不必再手工 cp，也不会出现"仓里已修、机器上还是坏的"这种错位。
+# 为什么是"校验"而不是"同步"（2026-10-20 真事故）：原先这里是 `install-extension.sh --quiet`，
+# 也就是每次登录都 `cp` 一遍。而本 unit 是 After=graphical-session.target，正好与 gnome-shell
+# 扫描扩展目录撞在同一时刻，于是 shell 读到了**拷贝中的半截文件**：
+#     gnome-shell: Extension raise-browser@capsplus.example:
+#       TypeError: malformed UTF-8 character sequence at offset 8190
+# （8190 ≈ 8192-2 = 一个汉字被切在两半；两份文件本身都合法，坏的只是那一刻的时序）
+# ⇒ 扩展 import 失败 ⇒ 抓帧通道没有 ⇒ 按 Caps+F1 完全没反应、只能重登。
+# 所以现在：**写入只发生在安装侧**（`capsplus ext sync` / `sh tools/install-extension.sh --sync`），
+# 登录这一侧只负责"发现不一致就说出来"（stderr + 桌面通知 + 非 0 退出码，unit 会红在面板上）。
 #
-# install.sh 不主动 enable 它（动 systemctl --user enable 属于自启决策）。要装就：
+# unit 名沿用 capsplus-extension-sync.service 没有改：`packaging/capsplus.target` 的 Wants=
+# 与笔记本里的账目都指向这个名字，改名只会让下一轮排查多一次"这个名字怎么没了"。
+# 语义已经从 sync 变成 verify，文件名里的 sync 指的是"扩展同步这件事"。
+#
+# 为什么不在这里判"shell 里到底加载了没"：本 unit 跑在 graphical-session.target 之后，
+# 那一刻 gnome-shell 可能还没起来，`gnome-extensions info` 会报连不上 —— 拿它判红就是**假红**。
+# 加载是否成功交给 `sh tools/ext-bench.sh`（隔离 headless shell，不用重登）与 `capsplus status`。
+#
+# 装机/自启只有一条路（2026-10-20 统一入口）：`capsplus install` 会渲染本文件、daemon-reload、
+# 并 enable `capsplus.target` —— 本 unit 由那个 target 的 Wants= 带起来（不再单独 enable，
+# 免得"两个开关各管一半"）。手动排查时才用：
 #   sed "s#@REPO_DIR@#$HOME/project/private/capsplus-linux#" \
 #       packaging/capsplus-extension-sync.service > ~/.config/systemd/user/capsplus-extension-sync.service
-#   systemctl --user daemon-reload && systemctl --user enable capsplus-extension-sync.service
+#   systemctl --user daemon-reload && systemctl --user start capsplus.target
 [Unit]
-Description=capsplus raise-browser 扩展登录同步
+Description=capsplus raise-browser 扩展登录校验（只读，不写文件）
 After=graphical-session.target
 
 [Service]
 Type=oneshot
 RemainAfterExit=yes
-ExecStart=@REPO_DIR@/tools/install-extension.sh --quiet
+# --verify 只校验；非 0 就退出码红在 `systemctl --user status` 与面板上（"失败不静默"）
+ExecStart=@REPO_DIR@/tools/install-extension.sh --verify --quiet
 
 [Install]
-WantedBy=graphical-session.target
+WantedBy=capsplus.target

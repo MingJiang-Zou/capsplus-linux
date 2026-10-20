@@ -19,10 +19,12 @@
 * 产物必须先写 `<out>.part` 再 rename —— 否则调用方会读到半张图。
 """
 
+import os
 import pathlib
 import re
 import sys
 import unittest
+from unittest import mock
 
 REPO = pathlib.Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO))
@@ -251,3 +253,74 @@ def _function_body(code: str, header: str) -> str:
             if depth == 0:
                 return code[start:idx + 1]
     raise AssertionError(f"{header} 的花括号没配平")
+
+
+class TestFailureIsLoud(unittest.TestCase):
+    """C 条：失败必须**出声**（`Caps+F1` 是 keyd 起的进程，stderr 没人看）。
+
+    抓帧超时 / 贴图失败 / 清空贴图失败三条路都过 `timeout_report`，所以通知挂在那里；
+    单测把发送函数换掉，只断言"该不该发 + 发的是什么话"。**绝不真发** ——
+    这台机是明江的干活机器，弹窗就是打断他。
+    """
+
+    def setUp(self):
+        self.sent = []
+        self._orig_allowed = SF._notify_allowed
+        self._orig_send = SF._send_notification
+        self._orig_notified = set(SF._notified)
+        SF._notify_allowed = lambda: True
+        SF._send_notification = lambda title, body, **kw: self.sent.append((title, body))
+        SF._notified.clear()
+
+    def tearDown(self):
+        SF._notify_allowed = self._orig_allowed
+        SF._send_notification = self._orig_send
+        SF._notified.clear()
+        SF._notified.update(self._orig_notified)
+
+    def test_capture_timeout_notifies_with_an_action(self):
+        SF.timeout_report("/tmp/x.png", 3000)
+        self.assertEqual(len(self.sent), 1, "抓帧超时没弹通知 ⇒ 又回到『按了没反应』那种静默")
+        title, body = self.sent[0]
+        self.assertIn("caps", title.lower(), "通知标题得让人知道是谁发的")
+        self.assertIn("抓帧", title, "标题要写清是哪件事没成（抓帧 / 贴图排查路径不同）")
+        self.assertIn("ext-bench", body, "通知里必须写下一步跑什么（不带动作的通知等于没通知）")
+        self.assertIn("没反应", body, "要说出人实际看到的现象，他才能对上号")
+        self.assertNotIn("\n", body, "通知栏放不下整段话术：完整五条仍旧走 stderr")
+
+    def test_pin_timeout_says_which_operation_failed(self):
+        SF.timeout_report("/tmp/ack", 3000, what="贴图", log_grep="pin")
+        self.assertEqual(len(self.sent), 1)
+        self.assertIn("贴图", self.sent[0][1])
+
+    def test_same_failure_only_speaks_once(self):
+        SF.timeout_report("/tmp/x.png", 3000)
+        SF.timeout_report("/tmp/x.png", 3000)
+        self.assertEqual(len(self.sent), 1, "同一条失败弹两遍 = 骚扰")
+
+    def test_the_guard_blocks_in_tests_and_when_disabled(self):
+        """闸门本身要有牙：单测进程里不弹（`unittest` 已在 sys.modules），`CAPSPLUS_NOTIFY=0` 也不弹。"""
+        # 这里必须调**原函数**：setUp 把 SF._notify_allowed 换成了恒真的替身（用来测文案）
+        self.assertFalse(self._orig_allowed(),
+                         "单测进程里居然允许弹窗 —— 跑一次全量会给明江刷一屏通知")
+        with mock.patch.dict(os.environ, {"CAPSPLUS_NOTIFY": "0"}):
+            self.assertFalse(self._orig_allowed())
+
+    def test_a_terminal_means_someone_is_watching(self):
+        """stderr 是终端 ⇒ 话术已经打在屏幕上了，别弹窗。"""
+        fake_tty = mock.Mock()
+        fake_tty.isatty.return_value = True
+        saved = sys.modules.pop("unittest")
+        try:
+            with mock.patch.object(SF.sys, "stderr", fake_tty), \
+                 mock.patch.dict(os.environ, {"CAPSPLUS_NOTIFY": "1"}):
+                self.assertFalse(self._orig_allowed(), "人在终端前看着的时候还弹窗 = 打断他")
+        finally:
+            sys.modules["unittest"] = saved
+
+    def test_a_broken_sender_cannot_break_the_report(self):
+        """通知自己坏了也不许把"报告失败"带崩（`capsplus-shot` 的退出码不该因此变）。"""
+        def boom(*_a, **_kw):
+            raise RuntimeError("没有通知守护进程")
+        self.assertTrue(SF.notify_failure("随便一条", sender=boom, force=True))
+        self.assertIn("没等到", SF.timeout_report("/tmp/y.png", 1200))
