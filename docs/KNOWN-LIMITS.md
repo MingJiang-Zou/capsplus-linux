@@ -614,8 +614,13 @@ r = searchParams.get("q")?.trim() ?? e.get("prompt")
 - **真机验法**（我这边不许动 `/etc/keyd`，只能他按）：设置页第③页 → 点 `capl / 1` 那行 →
   编辑条填 `C-c` → 「改这一格」→「应用」→ 按住 Caps 按 `1` 应触发复制；`f1` 同理。
   不想要了就选中那行点「恢复默认」，再「应用」。
-- **还没跟上的一处**：`README.md` / `README.template.md` 里那张"组合键 → 功能"表仍只列**真实绑定**
-  （`KEY_TABLE_NOTES` 生成的），没提空位与数字/F 键 —— 这次没改（文件不在本轮写范围内）。
+- **还没跟上的一处**：`README.md` 里那张"组合键 → 功能"表仍只列**真实绑定**（`KEY_TABLE_NOTES` 生成的），
+  没提空位与数字/F 键 —— 这次没改（文件不在本轮写范围内）。
+  ⚠ 2026-10-20 更正（Echo，防第二份真相）：那张表现在是 `tools/gen-readme.py` 的**生成区**，
+  夹在 `<!-- BEGIN/END GENERATED: key-table:* -->` 之间 —— **只能改 `capsplus/mapping_data.py` 再跑生成器**，
+  别在 README 里手改（下一次生成会把它修回）。`README.template.md` 已退役（它与 README 各写各的，
+  实测真跑一次生成会删掉 105 行手写正文）；原件在 `/tmp/attic-20261020/README.template.md`，
+  也可 `git show 96af83d:README.template.md` 取回。
 
 ## 「先 Caps+Z 再 N」这种两段组合：keyd 有机制，但**本仓现在配不出来**（2026-10-19 读 man，未真机实测）
 
