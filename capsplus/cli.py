@@ -474,10 +474,13 @@ def up(stream=None) -> int:
 
 def down(stream=None) -> int:
     stream = stream or sys.stdout
+    # 先数一遍再停：停完再数必然数不到，回一句"本来就没在跑"会让人以为根本没起来过
+    pids = _tray_pids()
     if _unit_installed("capsplus.target") and _has_user_manager():
         _systemctl_user("stop", "capsplus.target")
-    pids = _tray_pids()
-    for pid in pids:
+    # 单元之外的托盘（autostart 时代遗留的、或用户自己手起的）也收掉 —— 否则 stop 之后
+    # 图标还在，用户会以为"关不掉"
+    for pid in _tray_pids():
         try:
             os.kill(pid, signal.SIGTERM)
         except OSError:
