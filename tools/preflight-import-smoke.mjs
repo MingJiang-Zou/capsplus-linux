@@ -68,6 +68,7 @@ function stubbify(src) {
 }
 
 let dir;
+let failed = null;
 try {
     const raw = readFileSync(target);
     // 先按严格 UTF-8 解一次：半截文件在这里就会现形（也是真事故的第一现场）
@@ -89,8 +90,15 @@ try {
     }
     console.log(`SMOKE_OK 带桩 import 通过：default 是类，enable/disable 都在（桩掉 ${specs.length} 个 shell 侧 import）`);
 } catch (e) {
-    console.error(`SMOKE_FAIL ${e.name}: ${e.message}`);
+    failed = e;
+}
+
+// ⚠ **清场要在 process.exit() 之前**（2026-10-20 实测踩到）：写在 `finally` 里不成立 ——
+//   `process.exit()` 立刻终止进程，`finally` 根本轮不到执行。于是**每一条失败路径**都留一个
+//   `/tmp/capsplus-smoke-*`：本仓为这类事吃过亏（`/tmp/capsplus-extjs-*` 一天攒了 141 个），
+//   所以这里显式先清、再决定退出码。
+if (dir) rmSync(dir, { recursive: true, force: true });
+if (failed) {
+    console.error(`SMOKE_FAIL ${failed.name}: ${failed.message}`);
     process.exit(1);
-} finally {
-    if (dir) rmSync(dir, { recursive: true, force: true });   // 中间产物跑完即清
 }

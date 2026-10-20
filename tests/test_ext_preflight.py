@@ -189,6 +189,47 @@ class TestNodeGates(unittest.TestCase):
             self.assertTrue(any(not ok for ok, _ in rows), rows)
 
 
+@unittest.skipIf(NODE is None, "本机没有 node：import 冒烟跑不了")
+class TestSmokeCleansUpAfterItself(unittest.TestCase):
+    """冒烟脚本**两条路**都不许留下 `/tmp/capsplus-smoke-*`。
+
+    2026-10-20 实测踩到：清场原先写在 `finally` 里，而失败路径走的是 `catch { … process.exit(1) }`
+    —— `process.exit()` 立刻终止进程，`finally` 根本轮不到执行 ⇒ 每一条失败路径留一个临时目录
+    （跑几轮全量单测就攒了 85 个）。本仓为这类事吃过亏（`/tmp/capsplus-extjs-*` 一天 141 个），
+    所以这条必须**有判据**，不能只写在注释里。
+    """
+
+    GLOB = "capsplus-smoke-*"
+
+    def _left_behind(self):
+        parent = pathlib.Path(tempfile.gettempdir())
+        return {p.name for p in parent.glob(self.GLOB)}
+
+    def test_success_path_leaves_nothing(self):
+        before = self._left_behind()
+        EP.check_import_smoke(EXT_DIR / "extension.js", NODE)
+        self.assertEqual(self._left_behind() - before, set(), "成功那次留下了临时目录")
+
+    def test_failure_path_leaves_nothing(self):
+        before = self._left_behind()
+        with tempfile.TemporaryDirectory() as tmp:
+            bad = pathlib.Path(tmp) / "extension.js"
+            bad.write_text("export default class A { disable() {} }\n", encoding="utf-8")
+            rows = EP.check_import_smoke(bad, NODE)
+            self.assertTrue(any(not ok for ok, _ in rows), "夹具该让冒烟红")
+        self.assertEqual(self._left_behind() - before, set(),
+                         "失败那次留下了临时目录（process.exit 会跳过 finally，清场要写在它之前）")
+
+    def test_half_char_failure_path_leaves_nothing(self):
+        """UTF-8 那一路（TextDecoder fatal 抛异常）也要清干净。"""
+        before = self._left_behind()
+        with tempfile.TemporaryDirectory() as tmp:
+            bad = pathlib.Path(tmp) / "extension.js"
+            bad.write_bytes("export default class A {}\n// 汉".encode("utf-8")[:-2])
+            EP.check_import_smoke(bad, NODE)
+        self.assertEqual(self._left_behind() - before, set())
+
+
 # --------------------------------------------------------------------- 端到端：真的不写
 
 class TestSyncRefusesToWrite(unittest.TestCase):

@@ -359,6 +359,73 @@ class TestTableAndWholeRun(unittest.TestCase):
         self.assertIn("--no-screen", rows[5][1])
 
 
+class TestScratchDirIsCleanedUp(unittest.TestCase):
+    """`run_all` 自建的临时目录必须自己收掉，并且别把死了的绝对路径留在表里。
+
+    2026-10-20 实测踩到：第一版每跑一次就 `mkdtemp` 一个 `/tmp/capsplus-verify-*` 从不回收，
+    跑几轮全量单测攒了 35 个。本仓为这类事吃过亏（`/tmp/capsplus-extjs-*` 一天 141 个）。
+    """
+
+    GLOB = "capsplus-verify-*"
+
+    def _left_behind(self):
+        parent = pathlib.Path(__import__("tempfile").gettempdir())
+        return {p.name for p in parent.glob(self.GLOB)}
+
+    def _rows(self, out_dir):
+        seen = {"emitted": False}
+
+        def journal():
+            return READY_GOOD + (PROBE_LINE if seen["emitted"] else "")
+
+        return EV.run_all(
+            journal_fn=journal, unit_fn=lambda: (EV.PASS, "ok"),
+            owned_fn=lambda: (EV.PASS, "ok"), emit_fn=lambda: seen.update(emitted=True),
+            capture_fn=lambda x, y, w, h, out: (pathlib.Path(out).write_bytes(b"x") or True, "ok"),
+            monitor_fn=lambda: [(0, 0, 100, 100)],
+            pixel_fn=lambda _p: (bytes([1, 2, 3, 4, 5, 6, 7, 8]), 2, 1),
+            pin_fn=lambda _p: (True, "x"), clear_fn=lambda: (True, "x"),
+            sleep_fn=lambda _s: None,
+            mask_runner=lambda _a: cp([], 0, "MASK_OK ok\n"),
+            which=lambda n: "/usr/bin/" + n, no_screen=True, out_dir=out_dir)
+
+    def test_self_built_dir_is_removed(self):
+        before = self._left_behind()
+        rows = self._rows(None)
+        self.assertEqual(len(rows), 7)
+        self.assertEqual(self._left_behind() - before, set(),
+                         "run_all 自建的临时目录没被收掉")
+
+    def test_caller_supplied_dir_is_kept(self):
+        """`--keep DIR` 那一侧必须**留住**（调用方给的目录不归我们删）。"""
+        import tempfile
+        with tempfile.TemporaryDirectory(prefix="capsplus-verify-keep-") as keep:
+            rows = self._rows(pathlib.Path(keep))
+            self.assertEqual(len(rows), 7)
+            self.assertTrue(pathlib.Path(keep).exists(), "调用方给的目录被删了")
+
+    def test_failure_detail_has_no_dead_absolute_path(self):
+        """红的行里不许留着已经删掉的 `/tmp/...` 路径（那比只给文件名更误导人）。"""
+        seen = {"emitted": False}
+
+        def journal():
+            return READY_GOOD + (PROBE_LINE if seen["emitted"] else "")
+
+        rows = EV.run_all(
+            journal_fn=journal, unit_fn=lambda: (EV.PASS, "ok"),
+            owned_fn=lambda: (EV.PASS, "ok"), emit_fn=lambda: seen.update(emitted=True),
+            capture_fn=lambda x, y, w, h, out: (False, f"✗ 5.0s 内没等到产物 {out}"),
+            monitor_fn=lambda: [(0, 0, 100, 100)],
+            pixel_fn=lambda _p: (b"", 0, 0),
+            pin_fn=lambda _p: (True, "x"), clear_fn=lambda: (True, "x"),
+            sleep_fn=lambda _s: None,
+            mask_runner=lambda _a: cp([], 0, "MASK_OK ok\n"),
+            which=lambda n: "/usr/bin/" + n, no_screen=True, out_dir=None)
+        self.assertEqual(rows[4][0], EV.FAIL)
+        self.assertNotIn("capsplus-verify-", rows[4][1],
+                         f"红行里留着已经删掉的临时路径：{rows[4][1]}")
+
+
 class TestScriptShape(unittest.TestCase):
     SCRIPT = REPO / "tools" / "verify-after-login.sh"
 

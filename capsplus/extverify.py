@@ -330,7 +330,15 @@ def run_all(*, journal_fn=None, unit_fn=None, owned_fn=None, emit_fn=None,
                   "--signal", BUS_NAME + ".Probe"], timeout=10)
     rows.append(probe_roundtrip_state(journal_fn, emit_fn, sleep_fn=sleep_fn))
 
-    tmp = Path(out_dir) if out_dir else Path(tempfile.mkdtemp(prefix="capsplus-verify-"))
+    # 中间产物的落点：调用方给了就用它（`--keep DIR` 走这条），没给就自建**并自己清掉**。
+    # ⚠ 为什么要强调"自己清"（2026-10-20 实测踩到）：第一版每跑一次就 `mkdtemp` 一个
+    #   `/tmp/capsplus-verify-*` 且从不回收 —— 跑全量单测几轮就攒了 35 个。本仓为这类事吃过亏
+    #   （`/tmp/capsplus-extjs-*` 一天 141 个），所以"谁建的谁清"写进代码，并且有判据钉住。
+    own_tmp = None
+    if out_dir is None:
+        own_tmp = Path(tempfile.mkdtemp(prefix="capsplus-verify-"))
+        out_dir = own_tmp
+    tmp = Path(out_dir)
     tmp.mkdir(parents=True, exist_ok=True)
     png = None
     if capture_fn is None:
@@ -376,6 +384,13 @@ def run_all(*, journal_fn=None, unit_fn=None, owned_fn=None, emit_fn=None,
         rows.append(mask_state(runner=mask_runner, which=which))
     else:
         rows.append(mask_state())
+
+    if own_tmp is not None:
+        # 自建的临时目录由自己收掉；顺手把行里那些已经失效的绝对路径抹成文件名
+        # （留着"死了的路径"比给文件名更误导人）。
+        rows = [(state, detail.replace(str(own_tmp) + "/", "").replace(str(own_tmp), ""))
+                for state, detail in rows]
+        shutil.rmtree(own_tmp, ignore_errors=True)
     return rows
 
 
