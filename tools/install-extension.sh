@@ -20,8 +20,13 @@
 #       TypeError: malformed UTF-8 character sequence at offset 8190
 #   （8190 ≈ 8192-2 = 一个汉字被切在两半；两份文件本身都合法，坏的只是那一刻的时序）
 #   ⇒ 扩展 import 失败 ⇒ 抓帧通道没有 ⇒ 按 Caps+F1 完全没反应、只能重登。
-#   现在两头都堵上：sync 侧原子落盘（同目录临时名 + rename）且"内容相同就不写"，
-#   登录侧只做 md5 比对 —— 稳态下登录根本不碰这些文件，连被读到半截的机会都没有。
+#   现在三头都堵上：sync 侧**先预检**（文件本身是坏的就不写）、再原子落盘（同目录临时名 + rename）
+#   且"内容相同就不写"；登录侧只做 md5 比对 —— 稳态下登录根本不碰这些文件，连被读到半截的机会都没有。
+#
+# `--sync` 是**预检闸门**后的写：`sh tools/preflight-extension.sh` 红（退出 1）或环境不齐（退出 2）
+# 时**一个字节都不写**（连目标目录都不建），退出码原样透传。预检查：合法 UTF-8（能报坏在第几字节）、
+# metadata.json 合法且 uuid 对得上、`export default class` 形态、`node --check` 解析、
+# 带 mock Shell 的 import 冒烟。反例具型见 docs/SHOT-TOOL.md 第三节。
 #
 # ⚠ 装/同步完仍需**注销重登一次**才生效：GNOME 只在启动时扫描用户扩展目录，
 #   `ReloadExtension` 上游已废弃（实测返回 deprecated and does not work），
@@ -30,9 +35,10 @@
 #   —— 重登是最后一步，不是排查手段。
 #
 # 用法：
-#   sh tools/install-extension.sh            # = --sync
+#   sh tools/install-extension.sh            # = --sync（先预检，红了不写）
 #   sh tools/install-extension.sh --verify   # 只校验（登录 unit 用它）
 #   sh tools/install-extension.sh --quiet    # 给 oneshot 用：成功不说话
+#   CAPSPLUS_NOTIFY=0 sh tools/install-extension.sh   # 失败也不弹桌面通知（反例举证/CI 用）
 set -eu
 
 UUID="raise-browser@capsplus.example"
@@ -65,6 +71,9 @@ md5_of() { md5sum < "$1" | cut -d' ' -f1; }
 notify() {
     _title="$1"
     _body="$2"
+    # `CAPSPLUS_NOTIFY=0` 关掉（与 capsplus/shot_frame.py 同一套开关）。为什么要有：反例举证时
+    # 脚本会**故意**让预检红，那时不该把弹窗拍到明江屏幕上 —— 他不欠我们一次打扰。
+    [ "${CAPSPLUS_NOTIFY:-1}" = 0 ] && return 0
     if command -v gdbus >/dev/null 2>&1; then
         if gdbus call --session --dest org.freedesktop.Notifications \
                --object-path /org/freedesktop/Notifications \
@@ -147,6 +156,24 @@ if [ "$MODE" = verify ]; then
 fi
 
 # ---------------------------------------------------------------------- --sync：写入（唯一允许写的地方）
+
+# ------------------------------------------------- 部署前预检（强制闸门，在**任何写入之前**）
+# 为什么是闸门而不是提示（2026-10-20）：坏文件进了扩展目录 ⇒ shell import 失败 ⇒ 进 ERROR 态
+# ⇒ Wayland 下**只能注销重登**才能恢复。原子落盘只堵住"被读到写一半"，堵不住"写进去的本身是坏的"。
+# 闸门放在 `mkdir -p "$DST_DIR"` **之前**：连目录都不建，"一个字节都不写"才是可核对的事实。
+# 退出码原样透传（0 绿 / 1 红 / 2 环境不齐）—— 调用方（keyd、人手、CI）靠它判。
+# ⚠ **只管 --sync 这一侧**：登录 unit 走的是 `--verify`，那条路必须又轻又稳 ——
+#   把 node 依赖压到登录路径上，会让"这台机没装 node"变成一个假的登录红。
+_pre_rc=0
+sh "$REPO_DIR/tools/preflight-extension.sh" --ext-dir "$SRC_DIR" || _pre_rc=$?
+if [ "$_pre_rc" != 0 ]; then
+    warn ""
+    warn "✗ 预检没过（退出码 $_pre_rc）⇒ **不部署**：部署目录一个字节都没写。"
+    warn "  修好上面标 ✗ 的那几行再跑一次；只想看结论、不写文件：sh tools/preflight-extension.sh"
+    notify "capsplus 扩展预检没过" "坏文件没进扩展目录（部署副本保持原样）⇒ Caps 热键不会因此坏掉。修好仓内 extension.js 再跑 sh tools/install-extension.sh --sync"
+    exit "$_pre_rc"
+fi
+
 mkdir -p "$DST_DIR"
 
 # ⚠ 必须**原子落盘**（先在同目录写临时名，再 rename）：同目录 rename 是原子的，

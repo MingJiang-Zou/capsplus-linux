@@ -26,6 +26,16 @@
 #   ③ 判词不在这里写第二遍：解析走 `python3 -m capsplus.extcheck --bench-log`（那边能单测：
 #      把日志喂给 bench_verdict 就行，不用真起 shell）。
 #
+# ⛔ **绝对不许在本自检里抓帧**（2026-10-20 实测，别试第二遍）：
+#   headless 的 mutter 不做 mode setting（日志里就是 `using no mode setting`）⇒ stage 是 0×0 ⇒
+#   `Shell.Screenshot.screenshot_area` 建不出纹理：
+#     CRITICAL: cogl_texture_2d_new_with_size: assertion 'width >= 1' failed
+#     WARNING : Failed to take screenshot: Failed to create 0x0 texture
+#   而且**它会把 shell 带走**：同一时刻内核日志里出现 libcairo 段错误、gnome-shell 直接退出
+#   （dmesg 实测：`pool-N[TID]: segfault at 0 … in libcairo.so.2`；两次尝试两次都中，退出码 139）。
+#   shell 一死，这次自检后面所有的判词都失去意义 ⇒ 抓帧**只**能在真会话里验
+#   （`tools/verify-after-login.sh` 第 ⑤ 项）。详见 docs/SHOT-TOOL.md 第三节。
+#
 # 依赖：gnome-shell（本机图形栈）+ dbus-run-session + python3。CI 上没有图形栈，所以 CI 只做
 # `sh -n` 与判词单测，不真跑（真跑了也只会得到"没起来"的红）。
 #

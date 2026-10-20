@@ -845,6 +845,19 @@ class TestBenchScriptShape(unittest.TestCase):
         self.assertNotIn("not a constructor", text, "sh 里在重复实现判词")
         self.assertNotIn("启用失败", text, "sh 里在重复实现判词")
 
+    def test_bench_never_grabs_a_frame(self):
+        """**headless 里抓帧会杀掉 shell**（2026-10-20 实测，内核日志里是 libcairo 段错误）。
+
+        这不是风格问题：`screenshot_area` 在 0×0 的 stage 上建不出纹理，事故现场是
+        `Failed to take screenshot: Failed to create 0x0 texture` + gnome-shell 退出码 139。
+        shell 一死，这次自检后面所有判词都失去意义 —— 所以「自检里冒出一个 CaptureArea」
+        必须是一条**会红的**判据，而不是只写在注释里的一句提醒。
+        """
+        code = sh_code(self.SCRIPT.read_text(encoding="utf-8"))
+        for forbidden in ("CaptureArea", "M_CAPTURE", "screenshot_area", "shot_capture"):
+            self.assertNotIn(forbidden, code,
+                             f"自检里出现了 {forbidden}：headless 抓帧会把 shell 打挂")
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

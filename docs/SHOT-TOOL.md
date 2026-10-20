@@ -80,27 +80,38 @@ capsplus-shot --region | --capture X Y W H --out FILE | --pin FILE
 
 ## 三、改了扩展之后怎么让它生效（**这条最容易白折腾**）
 
-| 动作 | 实测结果（2026-10-19） |
+### （1）为什么必须重登：平台事实与实测证据（2026-10-19 / 20）
+
+| 动作 | 实测结果 |
 | --- | --- |
 | `gnome-extensions disable` + `enable`（磁盘上已是新代码） | **不会重新 import**：journal 里依旧是旧代码的 `ready default=…`，新代码的 `ready capture=…` 一次都没出现 |
-| 注销重登 | shell 重新扫描扩展目录并重新加载 ⇒ 新代码生效 |
+| `org.gnome.Shell.Extensions.ReloadExtension`（D-Bus 方法） | **上游已废弃**，实测原话 `ReloadExtension is deprecated and does not work` |
+| Alt+F2 → `r` | 那是 X11 的老路；Wayland 下没有这一手 |
+| 隔离的 headless shell（自检） | 能验"**文件能不能加载**"，**不能**把新代码送进正在用的那个会话 |
+| 注销重登 / 重启 shell | **唯一**能让新代码生效的手段 |
+
+另外三条形状上的事实（免得再去试）：
+
+- shell 进程就是 systemd user 单元 `org.gnome.Shell@ubuntu.service`（本机实测 `active (running)`）。
+  **重启它 = 断掉这个会话里所有应用的显示连接 ≈ 注销** —— 代价必须写清，它不是"轻量重载"。
+- `gnome-shell --headless` 有（隔离自检靠它）；`--nested` 已经没有了；`mutter` 二进制**没装**
+  （所以"自己再起一个 mutter 试试"这条也不成立）。
+- 判据（怎么确认新代码真的在跑）：journal 里出现**本次 `enable()` 打的**那行
+  `[raise-browser] ready capture=on pin=on …`；只有 `ready default=…` ⇒ 还是旧代码，**要注销重登**。
 
 复现（别用 `journalctl | grep raise-browser` 裸查：你**自己命令行里的字符串**也会被算进去，
-只认 gnome-shell 进程写的行）：
+只认 gnome-shell 进程写的行 —— 用 `_COMM=gnome-shell` 过滤最稳）：
 
     DST=~/.local/share/gnome-shell/extensions/raise-browser@capsplus.example
     cp extensions/raise-browser@capsplus.example/{metadata.json,extension.js} "$DST/"
     TS=$(date -Is); gnome-extensions disable raise-browser@capsplus.example; sleep 1
     gnome-extensions enable raise-browser@capsplus.example; sleep 2
-    journalctl --user --since "$TS" --no-pager | grep "gnome-shell\[" | grep raise-browser
-
-判据：出现 `[raise-browser] ready capture=on pin=on promisified=true …` ⇒ 新代码在跑；
-只有 `ready default=…` ⇒ 还是旧代码，**要注销重登**。
+    journalctl --user --since "$TS" -b _COMM=gnome-shell --no-pager | grep raise-browser
 
 **装/校验/自检是三条命令，别再照上面那两行 `cp` 手搓**（2026-10-20 收口）：
 
 ```bash
-capsplus ext sync     # = sh tools/install-extension.sh --sync   写：原子落盘 + md5 校对（唯一写文件的地方）
+capsplus ext sync     # = sh tools/install-extension.sh --sync   先预检、再原子落盘（唯一写文件的地方）
 capsplus ext verify   # = sh tools/install-extension.sh --verify 只校验：md5 + enabled 列表，一个字节都不写
 capsplus ext bench    # = sh tools/ext-bench.sh                  在隔离 headless shell 里自检**能不能加载**（不用重登）
 ```
@@ -108,6 +119,117 @@ capsplus ext bench    # = sh tools/ext-bench.sh                  在隔离 headl
 三者的分工与各自的退出码语义见 `docs/KNOWN-LIMITS.md`「扩展的部署 / 校验 / 自检」一节。
 顺带记一笔旧坑（**已修**）：2026-10-19 那个 `[ "$1" = "--quiet" ]` 在 `set -eu` 下无参调用会
 `parameter not set` 直接退出；现在参数解析改成 `for _arg in "$@"`，无参运行安全。
+
+### （2）ERROR 态：只能重启 shell，而且它**不吭声**
+
+2026-10-20 事故的原始证据（在本机 journal 里原样躺着，`--since`/`-b` 都能捞到）：
+
+    $ journalctl --user -b _COMM=gnome-shell --no-pager | grep raise-browser
+    10月 20 17:35:34 <主机名> gnome-shell[7532]: Extension raise-browser@capsplus.example:
+      TypeError: malformed UTF-8 character sequence at offset 8190
+
+- `offset 8190 ≈ 8192-2` = **一个三字节汉字被切在两半**。成因是登录同步脚本与 gnome-shell
+  抢同一个文件：shell 读到了 `cp` 到一半的 `extension.js`（两份文件本身都合法，坏的只是那一刻的时序）。
+- 扩展一旦进 ERROR 态，**四个读数同时变**：`gnome-extensions info` 报 `状态: ERROR`；
+  总线名 `NameHasOwner` 回 `(false,)`；`gdbus call …Probe` 回 `ServiceUnknown`；
+  **用户看到的唯一现象是"Caps 热键没反应"**。此时 `disable/enable` 救不回来 —— 只能重启 shell。
+- 怎么分辨"文件真坏了"还是"只差一次重登"：跑 `sh tools/ext-bench.sh`。
+  **它绿 = 文件没问题、只差一次重登；它红 = 文件真坏了**（判词在 `capsplus/extcheck.py`）。
+  2026-10-20 那次就是"文件早已修好、shell 里还抱着坏的那份 import"—— bench 绿、真会话 ERROR。
+
+**怎么避免（两道闸，缺一不可）**
+
+1. **部署前预检**（`sh tools/preflight-extension.sh`，`--sync` 的**强制闸门**）：合法 UTF-8（报出坏在
+   第几字节）、`metadata.json` 合法且 uuid 对得上、**行首**的 `export default class`、`node --check`
+   解析、带 **mock Shell** 的 import 冒烟。**红了就一个字节都不写**（连目标目录都不建），退出码非 0
+   （1 = 有红，2 = 环境不齐，**两者都不放行** —— 预检失败时"放行"是最坏的默认值）。
+   反例具型与"没写进去"的逐字节证据见本节末。
+2. **原子落盘**（`--sync` 侧）：同目录临时名 + `rename`，且**内容相同就不写**；登录侧只做 md5 比对
+   —— 稳态下登录**根本不碰**这些文件，连"被读到半截"的机会都没有。
+
+### （3）无痛开发台：隔离 headless shell 能验什么、不能验什么（2026-10-20 实测）
+
+`sh tools/ext-bench.sh`（= `capsplus ext bench`）起了个隔离的 `dbus-run-session` + `gnome-shell --headless`，
+**不碰明江正在用的会话**。实测它能做到的与做不到的：
+
+| 能验 | 原始读数 |
+| --- | --- |
+| 扩展能不能加载、通道挂没挂上 | `EXT_OK（1s）`；日志 `[raise-browser] ready capture=on pin=on clear=on toolbar+menu+modal=on promisified=true default=microsoft-edge.desktop windows=0 on-current=0` |
+| 总线名有没有主 | `gdbus call …NameHasOwner io.github.capsplus.RaiseBrowser` → `(true,)` |
+| 信号通道通不通（Probe 往返） | `gdbus emit --session --object-path /io/github/capsplus/RaiseBrowser --signal io.github.capsplus.RaiseBrowser.Probe` → 日志多一行 `[raise-browser] probe default=… windows=0 on-current=0` |
+| 贴图 + 清贴图 | `pin result=ok path=… at=100,100 w=200 h=150 left=1 ms=14`，ack `count=1\nx=100\ny=100\nw=200\nh=150`；清空 `pin result=clear-all cleared=1 left=0`，ack `cleared=1\nleft=0` |
+
+| 不能验 | 为什么（都是实测，不是推测） |
+| --- | --- |
+| **抓帧** | headless 的 mutter 不做 mode setting（日志里就是 `using no mode setting`）⇒ stage 0×0 ⇒ `CRITICAL: cogl_texture_2d_new_with_size: assertion 'width >= 1' failed` / `WARNING: Failed to take screenshot: Failed to create 0x0 texture`。**而且它会把 shell 带走**：同一时刻内核日志出现 `pool-N[TID]: segfault at 0 … in libcairo.so.2`，gnome-shell 直接退出（退出码 139；两次尝试两次都中）。⇒ 抓帧**只**能在真会话里验（`tools/verify-after-login.sh` 第 ⑤ 项），并且**绝对不许**往 `ext-bench.sh` 里加抓帧（`tests/test_raise_browser.py::TestBenchScriptShape::test_bench_never_grabs_a_frame` 会红） |
+| `gdbus call …Probe`（**当方法调**） | 本机 GJS 导出不了 D-Bus 对象（`register_object` 只剩原始 C 绑定，vtable 是 C 结构、JS 造不出来）⇒ `UnknownMethod`「对象在路径处不存在」。能用的形态是"**发**信号 + 读日志"与 `NameHasOwner` |
+| 真多屏 / USB / 输入设备 / keyd 热键 | 隔离会话里没有那些东西 |
+| 真置顶、真焦点、真合成器路径 | 没有真显示器就没有真正的合成行为；hang/卡顿/抢焦点这类只有在真会话里才看得见 |
+
+原始证据（shell 日志、`probe.out`、dmesg 段错误、两次对照实验）留在
+`~/.dsh/work/2026-10-20-扩展开发回路/evidence-04*.txt`。
+
+### （4）工程规矩：新功能优先做在 Python/GTK 侧，扩展里只加"shell 特权原语"
+
+**规矩**：改一行 Python 是**秒级热更新**（重起进程即可、绝大多数还能单测），改一行 `extension.js`
+要**注销重登**。所以 —— 新功能优先做在 Python/GTK 侧；扩展里**只加"非在 mutter 进程里做不可"的
+特权原语**（抓帧、真置顶的 actor、`Meta.Window.activate()` 这类）。
+
+组成数字（2026-10-20 量，方法：按**花括号配平**算每个顶层符号的真实行数，class 内按方法行数；
+`extension.js` 共 **988** 行 —— 空行 54、纯注释 175、代码 759）：
+
+| 块 | 行数 | 占全文件 |
+| --- | --- | --- |
+| 贴图 + 工具条 UI（**最近三批反复改的就是这块**） | 439 | **44%** |
+| D-Bus 接线（`_enableInternal` 的 5 条订阅 + `own_name`、`enable`/`disable`） | 135 | 14% |
+| 抓帧 `captureArea` 等（**真·特权原语**） | 117 | **12%** |
+| 窗口激活 `raiseBrowser` 等（**真·特权原语**） | 63 | **6%** |
+| 其余（头注、共享常量、零散工具） | 234 | 24% |
+| 合计 | 988 | 100% |
+
+读法：**真正非 shell 不可的只有 ~18%**（抓帧 12% + 激活 6%）；而 **44% 是贴图与工具条的
+UI / 布局 / 状态机** —— 那部分里"谁可见、点到哪个按钮、宽限多久"**本来就不需要 shell 特权**。
+本仓其实已经把其中几条抠成了**纯函数**（`pinVisibilityPlan` / `toolbarGeometry` / `hitButton` /
+`hoverPlan`），而且**正因为是纯函数，它们的判据现在就是靠 node 直接跑、不重登**
+（`tests/test_raise_pin_ui.py`）。所以这条规矩不是空话，是**接着已经走通的那条路往下走**：
+把"决策"整层搬到 Python（改它不用重登、能进单测），扩展里只留"照单执行 actor 操作"。
+
+### （5）需要重登时的最小代价流程（三步，别再靠"试试看"）
+
+```bash
+# ① 预检：全绿才继续（红了**一个字节都没写**，什么都不会坏）
+sh tools/preflight-extension.sh
+
+# ② 同步 + 重登：sync 自己会再预检一遍（闸门），然后注销重登一次
+sh tools/install-extension.sh --sync
+#    改 Python 侧的文件不需要这一步
+
+# ③ 自证：一条命令、七项 PASS/FAIL 表、不用鼠标
+sh tools/verify-after-login.sh          # 加 --no-screen 就不会有那张小图闪一下
+```
+
+第 ③ 步取代了"按一下 Caps+F1 看看行不行"——它给的是七项读数（shell 单元 / 本次开机的 ready 行 /
+总线名有主 / Probe 往返 / 真抓一帧 200×150 且非纯色 / 贴图+清贴图 / 遮罩起停），
+判词在 `capsplus/extverify.py`（那边能单测，**不碰真屏**）。
+
+### （6）预检的反例具型：红了之后**真的**一个字节都没写
+
+"校验失败必须不写任何东西"这句话必须能核。做法是造一个**假仓 + 假 HOME**（部署副本放在假 HOME 里），
+把三种真出过的故障分别注入假仓，然后真跑 `install-extension.sh --sync`，逐字节比对部署副本：
+
+| 反例 | 注入方式 | 预检红在哪 | 部署副本 |
+| --- | --- | --- | --- |
+| 半截汉字 | 把某个三字节汉字只留第一个字节（文件其余完好） | `extension.js 不是合法 UTF-8：第 94 字节处（invalid continuation byte）` | size/md5/mtime **三项全同** |
+| 语法错 | UTF-8 合法，尾上挂一个坏函数 | `node --check` 失败 + import 冒烟 `SyntaxError` | 三项全同 |
+| 导出形态错 | 把**真那一行**的 `export default` 去掉 | 行首声明检查红 + import 冒烟 `default 导出不是类/函数（是 undefined）` | 三项全同 |
+
+三种都在真跑里核过：`sync` 退出码 1、部署副本的每个文件 `size/md5/mtime` 与跑之前**逐字节一致**。
+判据是 `tests/test_ext_preflight.py::TestSyncRefusesToWrite`（同样的三种反例 + 正例"完好源应该写得进去"），
+现场原始输出在 `~/.dsh/work/2026-10-20-扩展开发回路/evidence-01*.txt`。
+
+⚠ 顺带一个**假绿**教训（写在这里防复发）：导出形态那道闸**不能**用裸子串 `"export default class" in src`
+—— 本文件的注释里就写着这个字样，于是"把真那一行删掉"也能判绿。判据必须**钉在行首**
+（`^[ \t]*export\s+default\s+class\s+\w`）。这次是 import 冒烟先抓到的，但闸本身也修了。
 
 ## 三·五、第 2 步：选区遮罩（capsplus 侧，不需要重登）
 
@@ -292,6 +414,13 @@ screenshotUIGroup / keyboardBox 放到所有窗口之上，`layout.js` 的注释
 
 ## 五、怎么再验一遍
 
+    # 0) 扩展这条线的三步（改了 extension.js 才需要走完）
+    sh tools/preflight-extension.sh        # 预检（只读，红了说明文件本身坏了）
+    sh tools/install-extension.sh --sync   # 写（先预检、再原子落盘）
+    sh tools/ext-bench.sh                  # 不用重登：隔离 headless shell 里验"能不能加载"
+    #    前三条都绿了才值得注销重登
+    sh tools/verify-after-login.sh         # 重登之后：七项 PASS/FAIL 表（加 --no-screen 不碰屏幕）
+
     # 1) 纯逻辑判据（不需要真屏、不需要扩展、无头 CI 也能跑）
     python3 -m unittest tests.test_shot_frame tests.test_shot_extension -v
 
@@ -307,8 +436,12 @@ screenshotUIGroup / keyboardBox 放到所有窗口之上，`layout.js` 的注释
 
 | 判据文件 | 钉什么 |
 | --- | --- |
+| `tests/test_ext_preflight.py` | **部署前预检**：UTF-8（含"半截汉字报在第几字节"）/ metadata / 行首 `export default class`（含"注释里的字样不许算"）/ `node --check` / import 冒烟；**以及端到端"预检红了 --sync 一个字节都不写"**（假仓+假 HOME，三种反例 + 正例）|
+| `tests/test_ext_verify.py` | **登录后自证**的七项判词：每项正例与反例（注入依赖、不碰真屏）；「抓帧超时**不**换 region 重试」；「遮罩回调抛异常 ⇒ FAIL 而不是假绿」；xvfb 姿势（`CAPSPLUS_GUI=1` / `GDK_BACKEND=x11` / `-u WAYLAND_DISPLAY`）|
 | `tests/test_shot_frame.py` | 信号实参 / 等产物 / 超时话术 / journal 解析 / 选区几何 / 落盘命名 |
 | `tests/test_shot_extension.py` | 扩展形状：`screenshot_area` 实参个数、7 实参订阅、`.part`→rename、禁止 flash 动画、`addTopChrome`、`can_focus: false`、ack 受 `if (ackPath)` 管、`timeout_add` 三实参、成员名与 Python 常量逐字一致 |
+| `tests/test_raise_browser.py` | 信号发送方 / `bench_verdict` 判词 / `ext-bench.sh` 的形状（含 **`test_bench_never_grabs_a_frame`**：自检里不许出现抓帧 —— headless 抓帧会把 shell 打挂）|
+| `tests/test_raise_pin_ui.py` | 贴图工具条的可达性（纯函数在 node 里真跑）与扩展 JS 语法 |
 | `tests/test_shot_overlay.py` | 事件口径 / 几何 / 遮罩**像素**（选区内全透明、外压暗）/ 无动画 / 真事件走一遍（xvfb） |
 | `tests/test_shot_draw_smoke.py` | **绘制面**：真 cairo 上下文逐个调全部绘制函数（不存在的方法/参数不兼容一次拦住）/ 取色读数**像素**（色样==取样色、`#RRGGBB` 有墨）/ 真 draw 处理器走到读数 / 全仓 `cr.*` 与 gi 引用逐个 `hasattr` 真对象 |
 | `tests/test_shot_annotate.py` | 撤销重做 / 坐标换算 / 四种图元的像素结果（含马赛克"块内一致"）/ 存盘 / 剪贴板命令 |

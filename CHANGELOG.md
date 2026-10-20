@@ -7,6 +7,49 @@ GitHub 仓库的 Releases 页。版本号唯一落点是 `capsplus/__init__.py` 
 
 ---
 
+## 未发布 —— 扩展开发回路：部署前预检 + 登录后自证 + 无痛自检
+
+主题：**把"改一行 extension.js 就要注销重登一次"从日常变成最后一步**。这一轮的主诉是明江原话
+「当前这个工具是当成正式项目去做的，老是要重登 感觉也不好吧」——那天他先后 3 次因为改扩展而重启/重登。
+
+### 2026-10-20 事故：坏文件进了扩展目录 ⇒ ERROR 态 ⇒ 只能注销重登
+
+**现象**：登录后按 Caps+F1 完全没反应。`gnome-extensions info` 报 `状态: ERROR`；
+总线名 `NameHasOwner` 回 `(false,)`。journal 里的原始证据：
+
+    10月 20 17:35:34 gnome-shell[7532]: Extension raise-browser@capsplus.example:
+      TypeError: malformed UTF-8 character sequence at offset 8190
+
+**原因**：`offset 8190 ≈ 8192-2` = 一个三字节汉字被切在两半 —— 登录同步脚本与 gnome-shell
+抢同一个文件，shell 读到了 `cp` 到一半的 `extension.js`。而 Wayland 下**没有就地重载**：
+`ReloadExtension` 上游已废弃（实测回 `deprecated and does not work`），`disable/enable` 不会重新
+import ⇒ 只能注销重登。
+
+**修复**（三道闸，各自有判据）：
+
+| 闸 | 落点 | 判据 |
+| --- | --- | --- |
+| **部署前预检**（新） | `tools/preflight-extension.sh` + `capsplus/extpreflight.py`：合法 UTF-8（报坏在第几字节）/ metadata / **行首** `export default class` / `node --check` / 带 mock Shell 的 import 冒烟。是 `--sync` 的**强制闸门**，红了**一个字节都不写**（连目标目录都不建）| `tests/test_ext_preflight.py`（含三种反例 + "逐字节没被写"的端到端）|
+| 原子落盘（上一轮） | `install-extension.sh --sync`：同目录临时名 + `rename`、内容相同就不写 | 同上 + `test_raise_browser.py` 的脚本形状判据 |
+| **登录后自证**（新） | `tools/verify-after-login.sh` + `capsplus/extverify.py`：七项 PASS/FAIL 表（shell 单元 / 本次开机 ready 行 / 总线名有主 / Probe 往返 / 真抓一帧 200×150 且非纯色 / 贴图+清贴图 / 遮罩起停）| `tests/test_ext_verify.py`（每项正反例、注入依赖、不碰真屏）|
+
+### 2026-10-20 实测：无痛自检（`ext-bench.sh`）能验什么、不能验什么
+
+`dbus-run-session` + `gnome-shell --headless` 里**能**验：扩展加载（`ready capture=on pin=on …`）、
+总线名有主（`(true,)`）、Probe 往返（发信号 → 日志多一行）、贴图 + 清贴图（ack 文件回来）。
+
+**不能**验抓帧 —— 而且它会把 shell 打挂：headless 的 mutter 不做 mode setting ⇒ stage 0×0 ⇒
+`Failed to take screenshot: Failed to create 0x0 texture`，同一时刻内核日志出现
+`pool-N[TID]: segfault at 0 … in libcairo.so.2`（进程退出码 139，两次尝试两次都中）。
+⇒ 抓帧只能在真会话里验；`ext-bench.sh` 也补了"绝不许抓帧"的判据
+（`test_bench_never_grabs_a_frame`）。
+
+### 工程规矩（写进 `docs/SHOT-TOOL.md` 第三节）
+
+新功能优先做在 **Python/GTK 侧**（改 Python 是秒级热更新），扩展里只加"**shell 特权原语**"。
+依据（`extension.js` 988 行，按花括号配平量）：贴图 + 工具条 UI **439 行 = 44%**（正是反复改的那块）、
+D-Bus 接线 135 行 = 14%、抓帧 117 行 = 12%、窗口激活 63 行 = 6% ⇒ **真正非 shell 不可的只有 ~18%**。
+
 ## 未发布 —— 一处管理：一条命令装 / 起 / 查 / 修
 
 主题：**把这套工具的"装、起、停、查、修"从五处收成一处**。这一轮的主诉不是功能缺失，是
@@ -116,6 +159,36 @@ focus-out"这个事实**才注入（下限 120ms、上限兜底 400ms，见下�
 | 出字延迟 | 5.59 秒真人中文语音 → **273ms**（含 HTTP 往返） |
 | 识别服务常驻 | **RSS 408MB**、**不占 GPU**（本机 4070S 的 12G 已被别的常驻服务吃到 11.5G） |
 | 底噪 / 语音能量 | 房间底噪 **RMS≈19、峰值 108**；语音 **RMS≈4330、峰值 27611**（差约 200 倍） |
+
+### 2026-10-20 —— 「语音转文字几乎不可用，只可以是短语音，识别率有点低」
+
+明江的原话。三件事查下来都不是服务端与设备的问题，**全是客户端自己身上**，而且**录音过程中屏幕上
+什么都没有** —— 所以他只能靠感觉描述，我们只能靠猜。这一轮把它们都量出来、并摆到台面上。
+
+| 症状 | 根因 | 改前 → 改后（同一段真人语音 `test_wavs/zh.wav`） |
+| --- | --- | --- |
+| 只可以是短语音 | `MAX_MS=20000` 是客户端自造的上限，到点**静默截断** | 同一句重复 10 次（57.1s）：旧参数在 **11.5s** 停、识别 26 字；新参数录满 **57.1s**、识别 **130 字**（13 字×10，一字不差）。服务端两次都 HTTP 200 |
+| 一句话被切成两半 | 尾静音**固定 700ms**，正好卡在"换气"与"说完了"之间 | 含 900ms 句中停顿那段（12.1s）：旧参数 **5.8s** 判停、只送出 5.3s；新参数录完 **12.1s**，识别 26 字＝两遍全须全尾 |
+| 首字常丢 | 句首与句尾共用一个 150ms pad | 前置静音 150ms：pad=150 → 「**放**时间…」；pad=300 → 「开饭时间…」（首字在了，"饭"是模型自己的错） |
+
+- **参数**（`e3a2325`）：上限 60s 且到点**四处出声**（decoding 事件 / review 弹窗顶栏 / `voice.log` /
+  `status`）；尾静音自适应 `min(2400, 1200 + 每说满 1s +100ms)`；句首 300ms、句尾 250ms 分开留。
+- **录音期看得见**：牌子（`CAPSPLUS_VOICE_BADGE=1`，默认关是因为 Wayland 抢焦点）每秒刷
+  `● 录音中 3.2s · 电平 RMS 412 / 峰 3000 · 有声（门限 150）`；没开牌子也能从 `status` 的
+  `录音中读数` 行与 `voice.log` 的 `voice_progress`（每 5s 限流一行，只有状态量）看到。
+  读的是同一帧的 RMS/峰值/门限（`Recorder.live()`），时间轴与 VAD 共用 `vad.frames`，两处不会漂。
+- **`capsplus-voice meter --live`**：实时把 RMS/峰值刷在同一行，条子半程＝当前门限；与 `meter`
+  同一条 arecord 命令、同一个测量函数。判读只有一处（`voice_osd.level_verdict`），牌子与它共用。
+- **术语替换表**（`capsplus/data/voice_glossary.tsv` + `~/.local/share/capsplus/`）：SenseVoice
+  **没有热词入口**（`OfflineRecognizer` 上没有 hotwords），所以用确定性后处理兜专名错字。
+  三条护栏：ASCII 键要词边界、中文键 ≥2 字、最长优先且改完即止不级联。
+- **五种失败各自带下一步**：服务不在→`systemctl --user start voice-svc`、超时→重启并看日志、
+  无 arecord→装 alsa-utils、设备被占→`pactl set-default-source`（`HINTS["device-busy"]` 过去
+  **是从没被用到的死文案**，设备被占时走的是 `no-data`，指的下一步方向是错的）、太短/没说话→
+  "对着麦克风说完整一句"（**不许**报成"麦克风坏了"）。
+- **判据**：新增 `tests/test_voice_glossary.py`(18) / `test_voice_progress.py`(30) /
+  `test_voice_failure_hints.py`(11)，`test_voice_asr.py` +3、`test_voice_portability.py` +2。
+  13 条反例具型逐条真红过、脚本在 `~/.dsh/scripts/capsplus-voice/fixtures/progress-and-glossary/red.sh`。
 
 ### 三条护栏（这次真正的工程量在这儿）
 
