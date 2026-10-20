@@ -285,6 +285,75 @@ class TestPort(unittest.TestCase):
             self.assertEqual(A.port(), A.DEFAULT_PORT)
 
 
+class TestKeepLastIsOptIn(unittest.TestCase):
+    """诊断留证（`CAPSPLUS_VOICE_KEEP_LAST=1`）—— 默认**不落盘**，开了才有上限地留。
+
+    为什么值得有判据（2026-10-20）：明江说"识别不准"时我们手里没有音频，
+    只能凭现象猜；这个开关就是为"下次能拿真音频复盘"装的。它同时踩两条线：
+    落盘用户说的话（隐私）与磁盘上界（清理），所以默认关 + 上限 + 只清自己的文件，
+    三条都得钉住，不能只钉一条。
+    """
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.state = Path(self._tmp.name)
+        self._patch = mock.patch.dict(os.environ, {"CAPSPLUS_STATE_DIR": str(self.state)})
+        self._patch.start()
+        self.addCleanup(self._patch.stop)
+        self.addCleanup(os.environ.pop, A.KEEP_LAST_ENV, None)
+
+    def _run(self):
+        server, seen, patch = with_stub("ok")
+        self.addCleanup(stop_stub, server, patch)
+        return A.recognize(pcm_silence(200)), seen
+
+    def test_default_writes_nothing(self):
+        self._run()
+        self.assertEqual(list(self.state.glob("*.wav")), [],
+                         "默认落盘 = 把用户说的话存在磁盘上，必须显式开")
+
+    def test_enabled_keeps_the_exact_bytes_that_were_sent(self):
+        os.environ[A.KEEP_LAST_ENV] = "1"
+        result, seen = self._run()
+        kept = sorted(self.state.glob(A.KEEP_LAST_GLOB))
+        self.assertEqual(len(kept), 1, f"该留一份：{kept}")
+        self.assertEqual(kept[0].read_bytes()[:4], b"RIFF")
+        self.assertEqual(len(kept[0].read_bytes()), seen[0]["len"],
+                         "留的必须是**真正送出去**的那串字节，不是重新拼的")
+        self.assertEqual(len(kept[0].read_bytes()), result.body_bytes)
+
+    def test_kept_file_is_private(self):
+        os.environ[A.KEEP_LAST_ENV] = "1"
+        self._run()
+        kept = sorted(self.state.glob(A.KEEP_LAST_GLOB))[0]
+        mode = kept.stat().st_mode & 0o777
+        self.assertEqual(mode, 0o600, f"用户说的话只给自己读，实际权限 {oct(mode)}")
+
+    def test_runs_are_capped_and_only_ours_are_removed(self):
+        """上限清理：多跑几次只留最新的 N 份；状态目录里**别人的文件一个都不许动**。"""
+        keep = self.state / "voice.log"
+        keep.write_text("老日志", encoding="utf-8")
+        stranger = self.state / "voice.sock.bak"
+        stranger.write_text("别动我", encoding="utf-8")
+        wav = A.pcm_to_wav(pcm_silence(30))
+        for _ in range(A.KEEP_LAST_LIMIT + 3):
+            A.keep_last_wav(wav)
+        kept = sorted(self.state.glob(A.KEEP_LAST_GLOB))
+        self.assertEqual(len(kept), A.KEEP_LAST_LIMIT, f"上界没生效：{len(kept)} 份")
+        self.assertTrue(keep.exists(), "清理把状态目录里的日志删了 —— 只能删自己那个模式")
+        self.assertTrue(stranger.exists(), "清理把不认识的文件删了")
+        self.assertEqual(keep.read_text(encoding="utf-8"), "老日志")
+
+    def test_names_sort_in_time_order(self):
+        """文件名按名字排就是时间序（清理按最旧的删，靠的就是这条）。"""
+        wav = A.pcm_to_wav(pcm_silence(20))
+        first = A.keep_last_wav(wav)
+        second = A.keep_last_wav(wav)
+        self.assertTrue(first and second)
+        self.assertLess(first, second, f"后写的必须排在后面：{first} / {second}")
+
+
 class TestAgainstRealServiceWhenPresent(unittest.TestCase):
     """本机起着 voice-svc 时**真打一次**：契约是活的，桩对不上就红在这儿。"""
 

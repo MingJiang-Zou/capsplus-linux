@@ -325,6 +325,140 @@ class TestReadFrames(unittest.TestCase):
             self.assertEqual(P.read_frames(a, limit=3, timeout=0.5), [])
 
 
+class TestLevelsAndTruncationReachTheUser(unittest.TestCase):
+    """录音**结束后**的两个可感知出口：电平进了 status，截断进了事件与 status。
+
+    为什么单独立类（2026-10-20）：`voice_vad` / `voice_levels` 里算得再对，只要这两条没接到
+    worker 的出口上，明江看到的仍然是"识别率低"和"我后半句没了" —— 判据必须钉在**看得见的地方**。
+    全程假麦克风 + 假识别服务 + 不弹窗（`CAPSPLUS_VOICE_UI=0`）。
+    """
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self._patch = mock.patch.dict(os.environ, {
+            "CAPSPLUS_STATE_DIR": self._tmp.name,
+            "CAPSPLUS_VOICE_UI": "0",
+        })
+        self._patch.start()
+        self.addCleanup(self._patch.stop)
+        self.addCleanup(self._tmp.cleanup)
+
+    def _run(self, pcm: bytes, params=None):
+        from capsplus import voice_inject as INJ
+        from capsplus import voice_vad as V
+
+        server, port, _seen = start_stub(reply={"ok": True, "text": "电平要看得见", "ms": 5})
+        self.addCleanup(close_stub, server)
+        os.environ["CAPSPLUS_ASR_PORT"] = str(port)
+        srv = W.Server(params=params or V.VadParams(max_ms=4000),
+                       popener=lambda argv, **kw: self._proc(pcm),
+                       run_command=lambda argv, **kw: type("R", (), {"returncode": 0,
+                                                                    "stderr": b""})(),
+                       review_ui=False)
+        srv.probe = lambda: INJ.Probe(wl_copy="/bin/true")
+        events: list = []
+        srv.broadcast = events.append
+        session = srv._ensure_session()
+        session.start_recording()
+        self.assertTrue(session.wait_done(20), "会话没走完")
+        return srv, session, events
+
+    @staticmethod
+    def _proc(pcm):
+        proc = FakeProc([])
+        proc.stdout = FakeStream(pcm)
+        return proc
+
+    def test_status_carries_the_segment_levels(self):
+        srv, session, _events = self._run(SPEECH_PCM)
+        frame = srv._status_frame()
+        self.assertTrue(frame.get("level"), f"status 里没有电平那一行：{frame.get('level')!r}")
+        for key in ("rms=", "peak=", "voiced_rms=", "gain="):
+            self.assertIn(key, frame["level"], f"电平行少了 {key}：{frame['level']}")
+        self.assertEqual(frame["level"], session.level_summary)
+        self.assertEqual(frame.get("truncated"), "", "没截断时不许挂截断提示")
+
+    def test_log_gets_one_level_line_per_utterance(self):
+        self._run(SPEECH_PCM)
+        log = P.log_path().read_text(encoding="utf-8")
+        # 日志行前面带 ISO 时间戳（`P.log_line` 加的），所以按"行内出现"匹配
+        lines = [ln for ln in log.splitlines() if " voice_level " in ln]
+        self.assertEqual(len(lines), 1, f"每次录音该有且只有一行 voice_level：{log}")
+        for key in ("rms=", "peak=", "voiced_rms=", "gain=", "gate="):
+            self.assertIn(key, lines[0], f"日志行少了 {key}：{lines[0]}")
+
+    def test_hitting_the_limit_is_announced_not_silent(self):
+        import math
+        import struct
+
+        # 6 秒连续有声、上限 4 秒 → 必然 max_duration
+        n = 16000 * 6
+        pcm = struct.pack("<%dh" % n, *[int(6000 * math.sin(2 * math.pi * 220 * i / 16000))
+                                        for i in range(n)])
+        srv, session, events = self._run(pcm)
+        notes = [e.get("note", "") for e in events if e.get("state") == "decoding"]
+        self.assertTrue(notes, f"没看到 decoding 事件：{events}")
+        self.assertIn("上限", notes[0], f"decoding 的说明里必须写明是到上限了：{notes[0]}")
+        self.assertIn("截断", notes[0])
+        self.assertTrue(srv._status_frame().get("truncated"),
+                        f"status 里也得有这条：{srv._status_frame()}")
+        self.assertTrue(session.truncation)
+        log = P.log_path().read_text(encoding="utf-8")
+        self.assertIn("truncated ", log, "日志里也要留一条，事后才查得出")
+
+
+class TestMeterIsSideEffectFree(unittest.TestCase):
+    """`capsplus-voice meter` 只量麦克风：**不动会话、不写 socket、不弹窗**（交付要求如此）。
+
+    它跑在**客户端进程**里（`capsplus-voice` → `voice_worker.py meter`），所以判据直接调
+    `W.cmd_meter` 这一层：不经过 `Server`，也就不该有任何一条会话事件。
+    """
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self._patch = mock.patch.dict(os.environ, {
+            "CAPSPLUS_STATE_DIR": self._tmp.name,
+            "CAPSPLUS_VOICE_SOCK": str(Path(self._tmp.name) / "voice.sock"),
+        })
+        self._patch.start()
+        self.addCleanup(self._patch.stop)
+        self.addCleanup(self._tmp.cleanup)
+
+    def _run_meter(self, pcm: bytes) -> str:
+        import contextlib
+        import io
+
+        raw = Path(self._tmp.name) / "probe.pcm"
+        raw.write_bytes(pcm)
+        buf = io.StringIO()
+        with mock.patch.dict(os.environ, {"CAPSPLUS_VOICE_METER_PCM": str(raw)}):
+            with contextlib.redirect_stdout(buf):
+                code = W.cmd_meter(1.0)
+        self.assertEqual(code, 0, f"meter 返回 {code}：{buf.getvalue()}")
+        return buf.getvalue()
+
+    def test_reads_a_file_and_prints_the_six_numbers(self):
+        out = self._run_meter(SPEECH_PCM)
+        for label in ("RMS", "分位", "过门帧", "底噪", "当前门限", "建议增益"):
+            self.assertIn(label, out, f"meter 输出少了「{label}」：{out}")
+
+    def test_no_socket_and_no_session_side_effects(self):
+        self._run_meter(SPEECH_PCM)
+        self.assertFalse(P.socket_path().exists(), "meter 建了 socket = 动到会话了")
+        self.assertFalse(P.ping()[0], "meter 把 worker 拉起来了")
+
+    def test_missing_input_is_an_error_not_a_crash(self):
+        with mock.patch.dict(os.environ, {"CAPSPLUS_VOICE_METER_PCM": "/nonexistent/x.pcm"}):
+            import contextlib
+            import io
+
+            buf = io.StringIO()
+            with contextlib.redirect_stderr(buf):
+                code = W.cmd_meter(1.0)
+        self.assertEqual(code, 1, "读不到输入该返回 1，不是抛出去")
+        self.assertIn("meter", buf.getvalue())
+
+
 class TestWorkerEndToEnd(unittest.TestCase):
     """整链路：假麦克风 → VAD → 假识别服务 → 假上屏。**不开窗、不打键**。"""
 
@@ -556,7 +690,11 @@ class TestRecordingStateBroadcast(unittest.TestCase):
 
 
 class TestWatchdogRule(unittest.TestCase):
-    """90s 兜底时限**不许**咬到正在弹窗里改字的用户（改完按 Enter 却被丢 = 静默丢文本）。"""
+    """整链路兜底时限**不许**咬到正在弹窗里改字的用户（改完按 Enter 却被丢 = 静默丢文本）。
+
+    时限本身是 `W.MAX_SESSION_S`，用例一律**相对它**写，别再抄一个"100 秒"进来
+    （2026-10-20 提高这个值时，抄死的数字当场变红 —— 那次红得对，但红的是用例不是实现）。
+    """
 
     class Fake:
         def __init__(self, state, done=False, age=100.0):
@@ -568,10 +706,21 @@ class TestWatchdogRule(unittest.TestCase):
             return self._done
 
     def test_stuck_recording_session_is_abandoned(self):
-        import time as _t
-
         fake = self.Fake("recording")
-        self.assertTrue(W.should_abandon(fake, now=fake.started_at + 100.0))
+        self.assertTrue(W.should_abandon(fake, now=fake.started_at + W.MAX_SESSION_S + 1.0),
+                        "卡住的会话必须被丢掉，否则 socket 再也不接单")
+
+    def test_limit_leaves_room_for_a_full_length_recording(self):
+        """兜底时限必须**大于**一次录音的上限 + 一次识别的余量。
+
+        60s 录音（`voice_vad.MAX_MS`）刚落地时，90s 的兜底只剩 30s 给识别 + 起进程；
+        真机一次慢识别就够把还在弹窗里等人的会话判死。这条把两个数字绑在一起：
+        谁再改其中一个，这里会先红。
+        """
+        from capsplus import voice_vad as V
+
+        self.assertGreaterEqual(W.MAX_SESSION_S, V.MAX_MS / 1000.0 + 60.0,
+                                "兜底时限要留够「录满上限 + 识别 + 人的反应时间」")
 
     def test_review_is_never_abandoned_however_old(self):
         fake = self.Fake("review")
@@ -585,6 +734,8 @@ class TestWatchdogRule(unittest.TestCase):
     def test_inside_the_limit_it_waits(self):
         fake = self.Fake("decoding")
         self.assertFalse(W.should_abandon(fake, now=fake.started_at + 10.0))
+        self.assertFalse(W.should_abandon(fake, now=fake.started_at + W.MAX_SESSION_S - 1.0),
+                         "差一秒还不该动手")
 
 
 class TestGuardHasTeeth(unittest.TestCase):

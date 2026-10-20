@@ -31,6 +31,7 @@ import io
 import json
 import os
 import socket
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -46,6 +47,15 @@ DEFAULT_LANG = "zh"
 RECOGNIZE_TIMEOUT_S = 20.0      # 本机实测 5.5s 音频识别约 0.3s，20s 是"服务在解码但很慢"的上限
 HEALTH_TIMEOUT_S = 1.5
 MAX_BODY_BYTES = 8 * 1024 * 1024   # daemon 侧硬上限：超过它直接回 bad-size
+
+# ── 诊断留证：把最近送识别的 WAV 留一份（默认**关**）──────────────────────────
+# 为什么要有（2026-10-20）：明江抱怨"识别不准"时，我们没有音频可复盘 ——
+# 能看的只有 `voice.log` 里那行状态（`noise_rms=… gate=…`），它连"当时说了什么"都不该有。
+# 于是每次只能靠复述现象去猜。开了这个开关，最近的音频就躺在状态目录里，直接拿去服务上重跑。
+# 默认关的理由：这是**用户说的话**，落盘要用户自己点头（0o600，只给本人读）。
+KEEP_LAST_ENV = "CAPSPLUS_VOICE_KEEP_LAST"
+KEEP_LAST_LIMIT = 5            # 留几份。60s 一段 = 32KB/s × 60 = 1.9MB，5 份上界约 10MB
+KEEP_LAST_GLOB = "voice-last-*.wav"
 
 # 错误码 → 人话下一步（照 capsplus/extcheck.py 的 HINTS 口径：状态必须带动作，不让人再翻文档）
 HINTS = {
@@ -133,6 +143,57 @@ def pcm_to_wav(pcm: bytes, sample_rate: int = 16000, channels: int = 1,
     return buf.getvalue()
 
 
+def keep_last_enabled() -> bool:
+    """`CAPSPLUS_VOICE_KEEP_LAST=1` 才落盘。别的值一律按关（写文件这种事不许"猜着开"）。"""
+    return os.environ.get(KEEP_LAST_ENV) == "1"
+
+
+def keep_last_wav(wav: bytes) -> str:
+    """把这次送识别的 WAV 留一份，返回落点（关着 / 写不进去时返回 ""）。
+
+    文件名带**纳秒尾数**，按名字排就是时间序 —— **清理只认这个模式**（`voice-last-*.wav`），
+    绝不碰状态目录里别的东西。超过 `KEEP_LAST_LIMIT` 份就把最旧的删掉：
+    这是个**上限**而不是"攒着看历史"，攒多了一个是占盘，一个是留了一堆用户说过的话。
+    写失败只返回 ""：诊断留证失败不许影响识别本身。
+
+    时间戳只读**一次钟**（`time_ns`），再用它同时算"秒"和"纳秒尾数"：
+    早先分两次读（`strftime()` 一次、`time_ns()` 一次），跨秒那一瞬间会拼出
+    `…-190748-995971` 和 `…-190748-089322` 这种**名字顺序与时序相反**的一对，
+    清理按最旧的删就删错文件了（2026-10-20 GUI 口径跑出来的真 bug）。
+    """
+    from .voice_proto import state_dir
+
+    try:
+        directory = state_dir()
+        directory.mkdir(parents=True, exist_ok=True)
+        now_ns = time.time_ns()
+        stamp = time.strftime("%Y%m%d-%H%M%S", time.localtime(now_ns / 1_000_000_000))
+        path = directory / f"voice-last-{stamp}-{now_ns % 1_000_000_000:09d}.wav"
+        path.write_bytes(wav)
+        path.chmod(0o600)                    # 用户说的话：只给本人读
+        for old in sorted(directory.glob(KEEP_LAST_GLOB))[:-KEEP_LAST_LIMIT]:
+            try:
+                old.unlink()
+            except OSError:
+                pass
+        return str(path)
+    except OSError:
+        return ""
+
+
+def read_audio_file(path: str) -> bytes:
+    """读一个音频文件 → 裸 PCM。`RIFF` 开头就按 WAV 解（`wave` 读头，不写死 44 字节）。
+
+    给 `capsplus-voice meter` 的对照口与 `KEEP_LAST` 留下的 wav 复盘用。
+    """
+    with open(path, "rb") as handle:
+        data = handle.read()
+    if data[:4] != b"RIFF":
+        return data
+    with wave.open(io.BytesIO(data), "rb") as w:
+        return w.readframes(w.getnframes())
+
+
 def _request(url: str, body: bytes | None = None, timeout: float = RECOGNIZE_TIMEOUT_S):
     """发一次 HTTP 请求，返回 (状态码, 文本) 或抛 OSError/URLError 由调用方归码。"""
     req = urllib.request.Request(url, data=body, method="POST" if body is not None else "GET")
@@ -147,6 +208,8 @@ def recognize(pcm: bytes, *, sample_rate: int = 16000, lang_code: str | None = N
     if not pcm and wav_bytes is None:
         return AsrResult(code="no_pcm", message="没有 PCM", hint=_hint("no_pcm"))
     wav = wav_bytes if wav_bytes is not None else pcm_to_wav(pcm, sample_rate)
+    if keep_last_enabled():
+        keep_last_wav(wav)                  # 诊断留证：默认不做，失败也不影响识别
     if len(wav) > MAX_BODY_BYTES:
         return AsrResult(code="bad_size", message=f"{len(wav)} 字节超过服务上限",
                          hint=_hint("bad_size"), body_bytes=len(wav))

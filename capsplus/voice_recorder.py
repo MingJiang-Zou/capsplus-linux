@@ -11,12 +11,16 @@
 
 状态机只有四个状态，全在 `voice_proto.STATES` 里：
 
-    idle → recording →（有声→静音 700ms / 录满 20s / 用户再按一次）→ decoding → review → idle
+    idle → recording →（有声→静音 1200ms 起、越说越长 / 录满 60s / 用户再按一次）→ decoding → review → idle
 
 采集口径（本机 2026-10-17 实测，别改回别的写法）：
 
     arecord -f S16_LE -r 16000 -c 1        # 走 PipeWire 默认源，实测可用
     parecord 的同参数写法报「参数过多」⇒ 不用它
+
+电平（2026-10-20 加）：每段录音在交出去之前量一次电平并把"实际施加的增益"一起交给上层，
+这样 `voice.log` / `capsplus-voice status` 里能回答"这次说话有多响"，而不是只有"底噪多少"。
+增益默认 1.0（不加），理由与上界都在 `voice_levels` 的模块 docstring 里（实测数字，别凭感觉改）。
 """
 
 from __future__ import annotations
@@ -27,6 +31,7 @@ import subprocess
 import threading
 from dataclasses import dataclass
 
+from . import voice_levels as L
 from . import voice_vad as V
 from .voice_proto import STATES, log_line
 
@@ -42,7 +47,7 @@ HINTS = {
                "`pactl set-default-source <你的 Mic source>` 再试",
 }
 
-# 录音期最多再等这么多秒：VAD 的 20s 上限只按"收到的帧"计时，
+# 录音期最多再等这么多秒：VAD 的 60s 上限只按"收到的帧"计时，
 # 管道一直不给数据（设备被占、权限没给）时靠这条兜底，别把线程吊死。
 DEADLINE_GRACE_S = 3.0
 
@@ -53,10 +58,14 @@ class Recording:
 
     `error` 非空 = 采集本身没成（没装 arecord / 设备打不开），与"录到了但没说话"是两回事，
     上层的提示文案要分开写，别把"没说话"报成"麦克风坏了"。
+
+    `levels` 是**送识别前**那段的电平画像（`voice_levels.Levels`）：只有状态量，没有内容。
+    判不成语音时为 None（那会儿也没什么好量的）。
     """
     pcm: bytes = b""
     vad: V.VadResult | None = None
     error: str = ""
+    levels: L.Levels | None = None
 
     @property
     def ok(self) -> bool:
@@ -74,6 +83,18 @@ def arecord_argv(params: V.VadParams = V.VadParams(), device: str | None = None)
     return argv
 
 
+def capture_argv(seconds: float, params: V.VadParams = V.VadParams(),
+                 device: str | None = None) -> list[str]:
+    """`capsplus-voice meter` 用的采集命令：同一条 arecord 口径 + `-d 秒数`（录完自己退出）。
+
+    `-d` 必须插在末尾那个 `-` **之前**（`-` 是"写到标准输出"的位置参数，
+    放它后面的东西 arecord 还认，但读起来像 bug —— 别给下一个人埋这个坑）。
+    """
+    argv = arecord_argv(params, device)
+    argv[-1:-1] = ["-d", str(max(1, int(round(seconds))))]
+    return argv
+
+
 class Recorder:
     """一次一个录音会话（照 Qbar 的 worker 线程写法：线程只负责读管道，UI 靠回调）。
 
@@ -87,6 +108,9 @@ class Recorder:
                  on_result=None, on_error=None, popener=None, argv=None,
                  device: str | None = None):
         self.p = params or V.VadParams()
+        # 增益每次开录现读一次环境（worker 常驻，不重读就永远用第一次那个值）
+        self.gain = L.gain_from_env()
+        self.levels: L.Levels | None = None
         self.on_state = on_state
         self.on_result = on_result
         self.on_error = on_error
@@ -217,7 +241,8 @@ class Recorder:
             self._fail("no-data", why)
             return
         result = self._finalize(event)
-        self._deliver(Recording(pcm=self._trim(pcm, result), vad=result))
+        seg, levels = self._prepare(self._trim(pcm, result), result)
+        self._deliver(Recording(pcm=seg, vad=result, levels=levels))
 
     def _drain_stderr(self, proc, sink: list[str]) -> None:
         try:
@@ -256,6 +281,21 @@ class Recorder:
         if not result.has_speech:
             return b""
         return V.trim_pcm(pcm, self.vad.speech_span_frames(), self.p)
+
+    def _prepare(self, seg: bytes, result: V.VadResult) -> tuple[bytes, L.Levels | None]:
+        """裁剪出来的语音段 →（真正送识别的 PCM，电平画像）。
+
+        量的是**加增益之前**那段：`Levels.gain` 记下实际施加的倍数，复盘时先看原生电平多少，
+        才答得了"到底是我说得轻还是链路把声音弄小了"。
+        """
+        if not seg:
+            return seg, None
+        levels = L.measure(seg, self.p, self.vad)
+        if self.gain > 1.0:
+            seg = L.apply_gain(seg, self.gain)
+        levels.gain = self.gain
+        self.levels = levels
+        return seg, levels
 
     def _deliver(self, rec: Recording) -> None:
         """回 idle 并交产物。回调里抛的异常只记日志 —— 录音链不许因为 UI 而断。"""

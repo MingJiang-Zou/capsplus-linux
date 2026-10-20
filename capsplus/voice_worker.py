@@ -11,7 +11,7 @@
 
 一条 utterance 的完整链路（`state` 事件就按这几步广播）：
 
-    Caps+M → recording ─(VAD 尾静音 700ms / 录满 20s / 用户再按一次)→ decoding
+    Caps+M → recording ─(VAD 自适应尾静音 1200ms 起 / 录满 60s / 用户再按一次)→ decoding
            → (识别 ok) review ─(弹窗里 Enter)→ 上屏 → idle
                      ↘ (识别失败 / 没说话)  提示 → idle
            → (UI 不可用) 跳过 review，**直接**按上屏后端注入 → idle
@@ -67,13 +67,18 @@ if str(REPO) not in sys.path:
 
 from capsplus import voice_asr as ASR            # noqa: E402
 from capsplus import voice_inject as INJ         # noqa: E402
+from capsplus import voice_levels as L           # noqa: E402
 from capsplus import voice_proto as P            # noqa: E402
 from capsplus import voice_vad as V              # noqa: E402
 from capsplus.voice_recorder import Recording, Recorder  # noqa: E402
 
 SPAWN_RETRY_S = 1.5              # 自起 worker 后等多久它开始监听
 SPAWN_POLL_S = 0.08
-MAX_SESSION_S = 90.0             # 整条链路的兜底时限：卡住也要退出并释放 socket
+# 整条链路的兜底时限：卡住也要退出并释放 socket。
+# 2026-10-20 从 90s 提到 180s：录音上限本身已经是 60s（`voice_vad.MAX_MS`），
+# 90s 只够"录满 60s + 识别 5s"，一次慢识别就会把**还在弹窗里等用户按 Enter 的会话**判死。
+# review 期本来就不超时（`should_abandon`），这条兜底只管卡住 —— 留一倍余量。
+MAX_SESSION_S = 180.0
 HISTORY_KEEP = 12
 SESSION_TICK_MS = 1000           # 主循环看门狗的节拍（`should_abandon` 每秒问一次）
 
@@ -288,6 +293,19 @@ def verdict_line(diag: dict, clip_diag: dict | None = None) -> str:
     return " ".join(parts)
 
 
+def truncation_hint(vad) -> str:
+    """"录满上限被截断"的提示文案（空串 = 没截断）。
+
+    为什么要一条**专门**的文案：旧行为是到了 `MAX_MS` 就静默收尾，用户只知道"我后半句没了"，
+    查不出是设备、服务还是这个上限（明江 2026-10-20 的原话就是「只可以是短语音」）。
+    现在这句话会同时出现在：`decoding` 事件、review 弹窗顶部、`voice.log`、`status` 的能量门行。
+    """
+    if vad is None or vad.stop_reason != "max_duration":
+        return ""
+    return (f"录到 {int(vad.total_ms / 1000)}s 上限就截断了，后半句没录上"
+            f" —— 说完一句就再按一次 Caps+M")
+
+
 class Session:
     """一次 utterance 的现场。`state` 的写入只有一个出口：`_set_state`（顺手广播 + 记历史）。"""
 
@@ -296,6 +314,8 @@ class Session:
         self.state = "idle"
         self.recorder: Recorder | None = None
         self.vad_summary = ""
+        self.level_summary = ""        # 本次语音段的 RMS/峰值/增益（只有状态量，无内容）
+        self.truncation = ""           # 录满上限时的提示（空串 = 没截断）
         self.asr_summary = ""
         self.inject_summary = ""
         self.inject_diag: dict = {}       # 注入那一刻的状态量（纯数据，无文本）
@@ -390,6 +410,10 @@ class Session:
             return
         if rec.vad is not None:
             self.vad_summary = rec.vad.summary()
+        if rec.levels is not None:
+            # 电平进日志与 status：下次抱怨"识别不准"时，这一行能直接回答"是不是说得太轻"。
+            self.level_summary = rec.levels.describe()
+            P.log_line(f"voice_level {self.level_summary}")
         if not rec.ok:
             # 采集/判定没过：**不冒充"识别中"**，直接报错回 idle
             code = rec.error or (rec.vad.drop_reason if rec.vad is not None else "no_audio")
@@ -397,7 +421,12 @@ class Session:
             self.server.broadcast(P.error_event(str(code), note, self._drop_hint(code)))
             self._set_state("idle", note=note)
             return
-        self._set_state("decoding", note=f"送识别 {len(rec.pcm)} 字节")
+        self.truncation = truncation_hint(rec.vad)
+        note = f"送识别 {len(rec.pcm)} 字节"
+        if self.truncation:
+            P.log_line(f"truncated {self.truncation}")
+            note += f"（{self.truncation}）"
+        self._set_state("decoding", note=note)
         # 识别 HTTP 走后台线程（判据 B 锁死：这个 target 里从此不许出现任何 GTK）
         threading.Thread(target=self._decode_and_review, args=(rec,), daemon=True).start()
 
@@ -446,6 +475,9 @@ class Session:
         from capsplus import voice_osd
         self._set_state("review", note=f"待确认 {len(self.text)} 字")
         ui = voice_osd.VoiceUi(on_finish=self._on_review_outcome)
+        if self.truncation:
+            # 必须**在** post_text 之前：`_show_review` 建窗时才去读那行提示（晚设就被默认标题盖掉）
+            ui.set_review_hint(self.truncation)
         ui.post_text(self.text)                    # 建窗前的事件进排队，build 时补上
         outcome = ui.open_review()
         if outcome is None:
@@ -807,6 +839,8 @@ class Server:
             note = session.vad_summary or ""
         return P.state_event(state, note=note, pid=os.getpid(),
                              vad=session.vad_summary if session else "",
+                             level=session.level_summary if session else "",
+                             truncated=session.truncation if session else "",
                              asr=session.asr_summary if session else "",
                              inject=session.inject_summary if session else "",
                              diag=dict(self.last_inject_diag),
@@ -1018,6 +1052,11 @@ def cmd_status() -> int:
         print(f"  状态     : {frame.get('state')}  {frame.get('note', '')}")
         if frame.get("vad"):
             print(f"  能量门   : {frame['vad']}")
+        if frame.get("level"):
+            # 只有 RMS/峰值/增益：回答"这次说话有多响"，一个内容字符都没有
+            print(f"  电平增益 : {frame['level']}")
+        if frame.get("truncated"):
+            print(f"  截断提示 : {frame['truncated']}")
         if frame.get("asr"):
             print(f"  上次识别 : {frame['asr']}")
         if frame.get("inject"):
@@ -1058,12 +1097,81 @@ def cmd_status() -> int:
                               if voice_osd.badge_enabled() else "关（Wayland 下不抢焦点的唯一做法）"))
     p_ = V.params_from_env()
     print(f"能量门参数 : frame={p_.frame_ms}ms gate=max({p_.gate_floor:.0f}, "
-          f"{p_.gate_multiple:.0f}×底噪) 尾静音={p_.silence_stop_ms}ms "
-          f"最长={p_.max_ms}ms 最短有声={p_.min_voiced_ms}ms")
+          f"{p_.gate_multiple:.0f}×底噪) 尾静音={p_.silence_stop_ms}~"
+          f"{p_.silence_stop_max_ms}ms（每说满 1s 多容忍 {p_.silence_grow_per_s}ms）"
+          f" 最短有声={p_.min_voiced_ms}ms")
+    # 上限单独一行：它是"只能录短语音"那个症状的直接答案，别混在上一条里被看漏
+    print(f"录音上限   : {p_.max_ms}ms（{p_.max_ms / 1000:.0f}s）—— 到点强制收尾，"
+          f"弹窗与日志里都会写明「截断」，不再静默；要改就 CAPSPLUS_VOICE_MAX_MS")
+    print(f"前后留手   : 句首 {p_.trim_pad_head_ms}ms / 句尾 {p_.trim_pad_tail_ms}ms"
+          f"（句首留得多是因为弱起音容易不过门，实测见 voice_vad.TRIM_PAD_HEAD_MS）")
+    print(f"电平与增益 : 增益 {L.gain_from_env():.2f}×（{L.GAIN_ENV}）"
+          f" —— 量一遍用 `capsplus-voice meter`")
     notes = V.env_notes()
     if notes:
         print(f"  环境变量覆盖: {' '.join(notes)}")
     return 0
+
+
+def meter_source(seconds: float, params: V.VadParams) -> tuple[bytes, str]:
+    """`meter` 的音频从哪来 →（裸 PCM，来源说明）。
+
+    默认真读麦克风（**不经过录音会话**：不建 `Recorder`、不碰 socket、不弹窗、不送识别）。
+    `CAPSPLUS_VOICE_METER_PCM=<文件>` 改成读文件：CI 没有麦克风也要能跑同一套统计，
+    另外拿 `CAPSPLUS_VOICE_KEEP_LAST=1` 留下的 wav 复盘时也走这条路。
+    """
+    import subprocess
+
+    path = os.environ.get("CAPSPLUS_VOICE_METER_PCM")
+    if path:
+        return ASR.read_audio_file(path), f"文件 {path}"
+    from capsplus.voice_recorder import ARECORD, capture_argv
+    import shutil
+    if shutil.which(ARECORD) is None:
+        raise FileNotFoundError(f"PATH 里没有 {ARECORD}：sudo apt install alsa-utils")
+    argv = capture_argv(seconds, params)
+    proc = subprocess.run(argv, capture_output=True, timeout=seconds + 10)
+    if not proc.stdout:
+        detail = proc.stderr.decode("utf-8", "replace").strip()[:200] or f"rc={proc.returncode}"
+        raise OSError(f"没采到数据（{detail}）："
+                      f"`pactl list short sources` 看默认源在不在，或 CAPSPLUS_VOICE_DEVICE 指定一个")
+    return proc.stdout, f"麦克风（{argv[0]}，{seconds:g}s）"
+
+
+def cmd_meter(seconds: float = 3.0) -> int:
+    """`capsplus-voice meter [秒数]`：只量电平，不动会话、不写 socket、不弹窗。
+
+    存在的理由（2026-10-20）："识别率低"这句话可以指三件完全不同的事 ——
+    ① 说话太轻（语音段 RMS 低）；② 底噪太高（门限被抬得很高，弱起音过不去）；
+    ③ 模型/音频格式问题。没有这个命令，三种只能靠猜；有了它，明江对着麦克风说一句就知道是哪一种。
+    """
+    params = V.params_from_env()
+    try:
+        pcm, source = meter_source(seconds, params)
+    except (OSError, ValueError) as exc:
+        print(f"meter: {exc}", file=sys.stderr)
+        return 1
+    levels = L.measure(pcm, params)
+    print(f"麦克风电平（{source}，只读：不动会话、不写 socket、不弹窗）")
+    for line in L.report_lines(levels, params):
+        print(line)
+    print(f"  对照     : 本机真人语音基准 RMS≈{L.TARGET_VOICED_RMS:.0f}、"
+          f"底噪 RMS≈11~19（2026-10-20 实测）")
+    return 0
+
+
+def meter_seconds(argv: list[str]) -> float:
+    """`meter [秒数]`：默认 3 秒。参数不合法就**报错退出**而不是偷偷按 3 秒跑。"""
+    raw = argv[1] if len(argv) > 1 else ""
+    if not raw:
+        return 3.0
+    try:
+        value = float(raw)
+    except ValueError:
+        raise ValueError(f"秒数要是个数字，收到 {raw!r}")
+    if not 1.0 <= value <= 30.0:
+        raise ValueError(f"秒数要在 1~30 之间（收到 {value:g}）：量一次电平不需要更久")
+    return value
 
 
 def main(argv: list[str]) -> int:
@@ -1078,7 +1186,14 @@ def main(argv: list[str]) -> int:
         return cmd_stop()
     if cmd == "status":
         return cmd_status()
-    print(f"用法：capsplus-voice toggle|start|stop|status（serve 是内部用的）", file=sys.stderr)
+    if cmd == "meter":
+        try:
+            return cmd_meter(meter_seconds(argv))
+        except ValueError as exc:
+            print(f"meter: {exc}", file=sys.stderr)
+            return 2
+    print(f"用法：capsplus-voice toggle|start|stop|status|meter [秒数]（serve 是内部用的）",
+          file=sys.stderr)
     return 2
 
 

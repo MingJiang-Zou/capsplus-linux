@@ -246,6 +246,7 @@ class VoiceUi:
         self.title = title
         self.mode = "recording"
         self.note = LABELS["recording"]
+        self._review_hint = ""            # review 页顶栏的覆盖文案（`set_review_hint`）
         self.text = ""
         # 窗口真实生命周期：**纯数据**时间线（条目只有 {kind, us}），注入方与诊断都读它。
         self.timeline: list[dict] = []
@@ -270,6 +271,15 @@ class VoiceUi:
 
     def post_text(self, text: str) -> None:
         self._emit(("text", text_for_display(text)))
+
+    def set_review_hint(self, hint: str) -> None:
+        """review 页顶部那行字的**一次性覆盖**（默认是 `LABELS["review_title"]`）。
+
+        给"录满上限被截断"这种**必须被看见**的情况用（2026-10-20）：文本本身是对的，
+        少的只是后半句 —— 用户必须知道"不是我没说清楚，是它录到 60s 就停了"，
+        否则下次还会以为识别不准。**必须在 `post_text()` 之前调**：建窗那一刻才读这个值。
+        """
+        self._review_hint = hint
 
     def post_error(self, code: str, message: str = "", hint: str = "") -> None:
         self._emit(("error", code, message, hint))
@@ -505,11 +515,11 @@ class VoiceUi:
 
     def _show_review(self) -> None:
         self.mode = "review"
-        self.note = LABELS["review_title"]
+        self.note = self._review_hint or LABELS["review_title"]
         if not self._window:
             return
         self._apply_mode(window_plan("review"))
-        self._label.set_text(LABELS["review_title"])
+        self._label.set_text(self.note)
         self._buffer_text(self.text)
         self._window.show_all()
         # review 才允许 present()/grab_focus()，而且**只对自己的控件**

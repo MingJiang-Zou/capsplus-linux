@@ -12,6 +12,12 @@
   ② 喂真人语音（sherpa-onnx 自带的 `test_wavs/zh.wav` 的 PCM）→ 必须判**有语音**。
 两条都是拿**真实音频字节**跑的，不是拿假想的正弦波糊弄。
 
+2026-10-20 又补了两条同等的判据（明江原话「语音转文字几乎不可用，只可以是短语音，且识别率有点低」）：
+  ③ 一句话中间的**正常停顿**（900ms）不许把它切成两半 —— 尾静音门槛自适应，见
+     `Vad.silence_stop_frames_now()`；
+  ④ 句首**弱起音**不许被 trim 切掉 —— 前后 pad 分开，句首 300ms，见 `TRIM_PAD_HEAD_MS`。
+两条的反例具型（把 700ms / 150ms 塞回去必须红）都在 `tests/test_voice_vad.py`。
+
 参数一律集中在 `VadParams`（默认值就是本机实测调出来的），调用方别自己抄数字。
 """
 
@@ -31,10 +37,28 @@ NOISE_PERCENTILE = 0.25        # 开头窗口取 25 分位而不是均值：用�
 GATE_FLOOR = 150.0             # 硬下限：底噪再低也不许把门降到 150 以下
 GATE_MULTIPLE = 4.0            # 门 = 4 × 底噪 RMS
 GATE_CEILING = 1000.0          # 硬上限：见下面 `energy_gate()` 的实测理由
-SILENCE_STOP_MS = 700          # 尾静音 700ms 判停
-MAX_MS = 20000                 # 一次最多录 20s
+# 尾静音判停改成**自适应**（2026-10-20 实测，见 `silence_stop_ms_for()`）：
+#   基础 1200ms，每说满 1 秒再多容忍 100ms，封顶 2400ms。
+# 为什么不能再是固定 700ms：明江真机日志 `~/.local/state/capsplus/voice.log`
+#   18:44:00 采集 3s → 3 字、18:44:09 → 4 字，都是**说到一半被 endpoint 掐掉**；
+#   同一段话按 Caps+M 手动收尾能录 12s → 47 字。中文一句话中间的换气停顿普遍 300~800ms，
+#   700ms 的门槛正好卡在"正常停顿"和"说完了"之间，于是每句都被切成两半。
+SILENCE_STOP_MS = 1200         # 基础尾静音（自适应起点）
+SILENCE_STOP_MAX_MS = 2400     # 自适应上界 = 基础 × 2：再长就轮到"说完半天不出字"了
+SILENCE_GROW_PER_S = 100       # 每说满 1 秒有声，容忍的停顿再多 100ms
+# 60s（2026-10-20 实测）：本机 voice-svc 127.0.0.1:18090 吃 60s 音频 HTTP 200、4.9s 出结果
+#   ⇒ 20s 这条上限**纯属客户端自造**，与服务端能力无关。真实长句（一口气报 3 个型号 + 参数）
+#   20s 根本不够，而超了之后旧行为是**静默截断**，用户只看到"我的后半句没了"。
+MAX_MS = 60000                 # 一次最多录 60s（超了有可见提示，见 voice_worker）
 MIN_VOICED_MS = 200            # 有声总时长不足 200ms = 当"没说话"丢掉
-TRIM_PAD_MS = 150              # 交给 ASR 前，语音段前后各留一点（辅音头尾会被切掉）
+# 交给 ASR 前前后各留多少。**前后分开**（2026-10-20 A/B，见 `tests/test_voice_vad.py`
+#   `TestTrimPadKeepsTheFirstSyllable`）：句首比句尾金贵得多 ——
+#   同一段真人音频（sherpa 参考 `test_wavs/zh.wav`）、8 种前置静音、
+#   前置静音 ≥100ms 的那 7 组：头部 pad 150 → 丢首字 5/7，300 → 丢 0/7；
+#   再往上（400 / 500 / 800）一个都不多救 ⇒ 300 是拐点，取它不做无谓的加长。
+#   句尾只需要盖住尾辅音，250ms 够（原值 150 也不丢字，只是没道理比句首少一半）。
+TRIM_PAD_HEAD_MS = 300         # 句首留 300ms：弱起音（"开"的 k 音）本身就可能不过门
+TRIM_PAD_TAIL_MS = 250         # 句尾留 250ms：盖住收音的尾辅音
 
 
 @dataclass(frozen=True)
@@ -49,9 +73,12 @@ class VadParams:
     gate_multiple: float = GATE_MULTIPLE
     gate_ceiling: float = GATE_CEILING
     silence_stop_ms: int = SILENCE_STOP_MS
+    silence_stop_max_ms: int = SILENCE_STOP_MAX_MS
+    silence_grow_per_s: int = SILENCE_GROW_PER_S
     max_ms: int = MAX_MS
     min_voiced_ms: int = MIN_VOICED_MS
-    trim_pad_ms: int = TRIM_PAD_MS
+    trim_pad_head_ms: int = TRIM_PAD_HEAD_MS
+    trim_pad_tail_ms: int = TRIM_PAD_TAIL_MS
 
     @property
     def frame_samples(self) -> int:
@@ -67,7 +94,15 @@ class VadParams:
 
     @property
     def silence_stop_frames(self) -> int:
+        """基础尾静音帧数。**判定不用它**（用 `Vad.silence_stop_frames_now()` 的自适应值），
+        留着是给 status / 单测表达"起点"用。"""
         return max(1, int(round(self.silence_stop_ms / self.frame_ms)))
+
+    @property
+    def silence_stop_max_frames(self) -> int:
+        """自适应上界帧数。上界比基础值小时按基础值算 —— 打错的环境变量不该让判停变成"永不"或"立刻"。"""
+        return max(self.silence_stop_frames,
+                   int(round(max(self.silence_stop_ms, self.silence_stop_max_ms) / self.frame_ms)))
 
     @property
     def max_frames(self) -> int:
@@ -78,19 +113,27 @@ class VadParams:
         return max(1, int(round(self.min_voiced_ms / self.frame_ms)))
 
     @property
-    def trim_pad_frames(self) -> int:
-        return max(0, int(round(self.trim_pad_ms / self.frame_ms)))
+    def trim_pad_head_frames(self) -> int:
+        return max(0, int(round(self.trim_pad_head_ms / self.frame_ms)))
+
+    @property
+    def trim_pad_tail_frames(self) -> int:
+        return max(0, int(round(self.trim_pad_tail_ms / self.frame_ms)))
 
 
 # 环境变量 → 字段。真机上不用改代码就能调门限（`capsplus-voice status` 会把生效值打出来）。
 ENV_KEYS = {
     "CAPSPLUS_VOICE_MAX_MS": ("max_ms", int),
     "CAPSPLUS_VOICE_SILENCE_MS": ("silence_stop_ms", int),
+    "CAPSPLUS_VOICE_SILENCE_MAX_MS": ("silence_stop_max_ms", int),
+    "CAPSPLUS_VOICE_SILENCE_GROW_MS": ("silence_grow_per_s", int),
     "CAPSPLUS_VOICE_GATE_FLOOR": ("gate_floor", float),
     "CAPSPLUS_VOICE_GATE_MULT": ("gate_multiple", float),
     "CAPSPLUS_VOICE_GATE_CEIL": ("gate_ceiling", float),
     "CAPSPLUS_VOICE_NOISE_MS": ("noise_window_ms", int),
     "CAPSPLUS_VOICE_MIN_VOICED_MS": ("min_voiced_ms", int),
+    "CAPSPLUS_VOICE_PAD_HEAD_MS": ("trim_pad_head_ms", int),
+    "CAPSPLUS_VOICE_PAD_TAIL_MS": ("trim_pad_tail_ms", int),
 }
 
 
@@ -175,6 +218,7 @@ class VadResult:
     speech_end_ms: int = -1
     noise_rms: float = 0.0
     gate: float = 0.0
+    silence_hold_ms: int = 0       # 本次判停时要求的那段尾静音（自适应后的**实际**值）
     frames: int = 0
     rms_trace: list[float] = field(default_factory=list)
 
@@ -182,7 +226,8 @@ class VadResult:
         """给人看的一行（进日志用；不含任何语音内容）。"""
         return (f"speech={self.has_speech} stop={self.stop_reason or '-'} "
                 f"drop={self.drop_reason or '-'} voiced_ms={self.voiced_ms} "
-                f"total_ms={self.total_ms} noise_rms={self.noise_rms:.0f} gate={self.gate:.0f}")
+                f"total_ms={self.total_ms} noise_rms={self.noise_rms:.0f} "
+                f"gate={self.gate:.0f} hold_ms={self.silence_hold_ms}")
 
 
 class Vad:
@@ -191,7 +236,7 @@ class Vad:
     事件（`push()` 的返回值）：
       ""             还在录，没到边界
       "speech"       刚跨过能量门（第一帧有声）
-      "endpoint"     有声之后静音连续够 `silence_stop_ms` → 该停了
+      "endpoint"     有声之后静音连续够**当前**的尾静音门槛 → 该停了
       "max_duration" 录到 `max_ms` → 硬停
     """
 
@@ -208,12 +253,28 @@ class Vad:
         self.gate = params.gate_floor     # 校准窗口没满之前只用硬下限
         self.stop_reason = ""
         self.ended = False
+        self.last_hold_frames = params.silence_stop_frames   # 判停那一刻用的门槛（进结论）
 
     # -- 内部 ---------------------------------------------------------------
     def _calibrate(self) -> None:
         if self.frames >= self.p.calib_frames:
             self.noise_rms = percentile(self.rms[:self.p.calib_frames], self.p.noise_percentile)
             self.gate = energy_gate(self.noise_rms, self.p)
+
+    def silence_stop_frames_now(self) -> int:
+        """**当前**要容忍几帧尾静音：基础值 + 每说满 1 秒加 `silence_grow_per_s` 毫秒，封顶。
+
+        为什么跟着"已经说了多久"走（2026-10-20 定）：短促口令（"打开设置"）中间不该容忍长停顿
+        —— 900ms 的空白更可能是"说完了"。反过来，说了十几秒的长句里出现 1~1.5 秒的思考停顿
+        太正常（报型号、数参数时会停），这时还按 1.2 秒掐就会把一句话切成两半。
+        增长是**单调**的：整段尾静音里 `voiced_frames` 不再增长，所以判定门槛在静音期间恒定，
+        不会出现"门槛在涨、永远追不上"的病态（那样会一直录到 max_ms）。
+        """
+        base = max(1, self.p.silence_stop_ms)
+        cap = max(base, self.p.silence_stop_max_ms)
+        talked_ms = self.voiced_frames * self.p.frame_ms
+        grow = (talked_ms // 1000) * max(0, self.p.silence_grow_per_s)
+        return max(1, int(round(min(cap, base + grow) / self.p.frame_ms)))
 
     def _feed_frame(self, frame: bytes) -> str:
         rms = frame_rms(frame, self.p)
@@ -231,7 +292,9 @@ class Vad:
             self.silence_run = 0
         elif self.speech_start >= 0:
             self.silence_run += 1
-            if self.silence_run >= self.p.silence_stop_frames:
+            hold = self.silence_stop_frames_now()
+            self.last_hold_frames = hold
+            if self.silence_run >= hold:
                 event = "endpoint"
         if event != "endpoint" and self.frames >= self.p.max_frames:
             event = "max_duration"
@@ -299,15 +362,16 @@ class Vad:
                          drop_reason=drop, total_ms=total_ms, voiced_ms=voiced_ms,
                          speech_start_ms=start_ms, speech_end_ms=end_ms,
                          noise_rms=round(self.noise_rms, 1), gate=round(self.gate, 1),
+                         silence_hold_ms=int(self.last_hold_frames * self.p.frame_ms),
                          frames=self.frames, rms_trace=list(self.rms))
 
     # 语音段（含 pad）的帧区间，给 `trim_pcm` 用
     def speech_span_frames(self) -> tuple[int, int] | None:
+        """`(起点, 终点)` 帧区间：句首/句尾各按自己的 pad 外扩（理由见 `TRIM_PAD_HEAD_MS`）。"""
         if self.speech_start < 0 or self.speech_end < 0:
             return None
-        pad = self.p.trim_pad_frames
-        return (max(0, self.speech_start - pad),
-                min(self.frames, self.speech_end + 1 + pad))
+        return (max(0, self.speech_start - self.p.trim_pad_head_frames),
+                min(self.frames, self.speech_end + 1 + self.p.trim_pad_tail_frames))
 
 
 def trim_pcm(pcm: bytes, span: tuple[int, int] | None,

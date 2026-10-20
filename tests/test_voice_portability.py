@@ -573,6 +573,29 @@ class TestOsdRealWindow(unittest.TestCase):
         self.assertFalse(handled, "Shift+Enter 被吃掉 = 换不了行")
         self.assertEqual(self.ui._action, "")
 
+    def test_truncation_hint_replaces_the_review_title(self):
+        """录满上限的提示必须**出现在 review 页顶栏**（2026-10-20）。
+
+        为什么钉这一条：`voice_worker` 那句「录到 60s 上限就截断了」如果只进了状态机和日志，
+        用户在屏幕上看到的仍然是一段莫名少了的字。这条验的是它真的走到界面上 ——
+        默认标题（`LABELS["review_title"]`）只是"没有特别要说的事"时才用的。
+        """
+        self.ui.set_review_hint("录到 60s 上限就截断了，后半句没录上")
+        self.ui.post_text("九点开会")
+        self.ui.build()
+        self.pump(0.2)
+        self.assertEqual(self.ui._label.get_text(), "录到 60s 上限就截断了，后半句没录上",
+                         "提示没进 review 页顶栏 = 用户根本不会知道是被截断的")
+        self.assertEqual(self.ui.mode, "review")
+        self.assertEqual(self.ui.text, "九点开会", "提示不许改文本")
+
+    def test_review_title_is_the_default_when_nothing_is_wrong(self):
+        """没有特别要说的事就必须回到默认标题 —— 否则"提示"会一直挂在那儿变成噪声。"""
+        self.ui.post_text("九点开会")
+        self.ui.build()
+        self.pump(0.2)
+        self.assertEqual(self.ui._label.get_text(), self.O.LABELS["review_title"])
+
     def test_show_without_display_is_a_structured_unavailable(self):
         """`show()` 在没显示/没 gi 时**返回**结果而不是抛（worker 靠它降级）。"""
         with mock.patch.object(self.O, "ui_available", return_value=False):

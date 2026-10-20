@@ -11,6 +11,9 @@
 #     capsplus-voice start      # 只开录（worker 不在就自己把它拉起来）
 #     capsplus-voice stop       # 收尾/取消；worker 本来就空闲时 = 关掉常驻进程
 #     capsplus-voice status     # 一页看全：worker / 识别服务 / 上屏探测 / 弹窗（排查就从这里）
+#     capsplus-voice meter [秒数]  # 只量麦克风电平（RMS/峰值/分位 + 当前门限 + 建议）：
+#                                #   **不碰会话**（不起录音线程、不写 socket、不弹窗、不送识别），
+#                                #   默认 3 秒。抱怨"识别不准"时先跑它，能分清"说得轻"还是"底噪高"。
 #
 # 三条不许改的口径（都在 docs/KNOWN-LIMITS.md 与 tests/ 的判据里）：
 #   ① shebang 是 `#!/bin/sh`（本机是 dash）—— **不许用 bash 数组**，`A=(…)` 会当场
@@ -37,8 +40,8 @@ RUN_DIR="${CAPSPLUS_RUN_DIR:-/run/user/$USER_UID}"
 # 这颗 Caps+M 就退化成"查个状态"的哑键 —— 宁可默认去做该做的事。带参数时照旧走参数。
 CMD="${1:-toggle}"
 case "$CMD" in
-  toggle|start|stop|status) ;;
-  *) echo "用法: capsplus-voice toggle|start|stop|status" >&2; exit 2 ;;
+  toggle|start|stop|status|meter) ;;
+  *) echo "用法: capsplus-voice toggle|start|stop|status|meter [秒数]" >&2; exit 2 ;;
 esac
 if [ "$#" -eq 0 ]; then set -- toggle; fi
 
