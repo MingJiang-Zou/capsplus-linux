@@ -1914,7 +1914,8 @@ class Annotator:
                 self._sync_bar_state()               # 高亮跟着键走（不然按了键看不出换了没）
                 self._sync_radio_buttons(tool, colour, width)
                 self.refresh_status()
-                self.area.queue_draw()
+                if getattr(self, "area", None) is not None:      # 没建窗时（判据直接调）不碰控件
+                    self.area.queue_draw()
                 return True
         if action is None:
             return False                    # 没接手的键让 GTK 照常处理（别吞掉）
