@@ -161,7 +161,7 @@ packaging/      应用菜单 .desktop（**只放一条**：CapsPlus 管理器）
               —— 模板里一律用 @BIN_DIR@ / @REPO_DIR@，由 `capsplus install` 换成实际路径
 docs/           KNOWN-LIMITS.md（实测平台限制，逐条带日期与复现方法）/ PRIVACY.md（本机留什么、分享前清什么）
 tests/          标准库 unittest（无 pytest 依赖）
-tools/gen-readme.py  由模板 + 映射数据生成 README
+tools/gen-readme.py  由映射数据刷新 README 里那两张键位表（**只写生成区**，正文手工维护）
 tools/e2e/      真机端到端验收（虚拟键盘逐条比对，要 root）
 tools/ci/nogi/  sitecustomize 屏蔽 gi，一行复现"没装 PyGObject 的 CI"
 tools/install-extension.sh    装/校验 GNOME 扩展 raise-browser（--sync 原子落盘 / --verify 只校验不写）
@@ -509,6 +509,7 @@ voice-svc-user.service`，模型在 `~/.cache/sherpa-onnx/sherpa-onnx-sense-voic
 
 短按 Caps 仍是**原大小写切换**（`overload(capl, capslock)`），与原版一致。按住 Caps 进入 `capl` 层：
 
+<!-- BEGIN GENERATED: key-table:capl -->
 | 组合键 | 功能 |
 | --- | --- |
 | `Caps+e` / `Caps+d` / `Caps+s` / `Caps+f` | 光标 上/下/左/右 |
@@ -528,9 +529,11 @@ voice-svc-user.service`，模型在 `~/.cache/sherpa-onnx/sherpa-onnx-sense-voic
 | `Caps+q` | 打开 Qbar（启动器） |
 | `Caps+space` | 回车 |
 | `Caps+enter` | 到行尾并回车 |
+<!-- END GENERATED: key-table:capl -->
 
 再按住 Alt 进入 `capl+alt` 增强层（原版规律：Alt = 步长更大 / 粒度更粗）：
 
+<!-- BEGIN GENERATED: key-table:capl+alt -->
 | 组合键 | 功能 |
 | --- | --- |
 | `Caps+Alt+e` / `Caps+Alt+d` / `Caps+Alt+s` / `Caps+Alt+f` | 光标大步移动（3 行 / 5 字符） |
@@ -548,6 +551,7 @@ voice-svc-user.service`，模型在 `~/.cache/sherpa-onnx/sherpa-onnx-sense-voic
 | `Caps+Alt+backspace` | 全选删除（等价清空全文） |
 | `Caps+Alt+slash` | 删到文尾 |
 | `Caps+Alt+p` / `Caps+Alt+semicolon` | 文首 / 文尾 |
+<!-- END GENERATED: key-table:capl+alt -->
 
 ## Qbar 用法
 
@@ -838,8 +842,15 @@ python3 -m unittest discover -s tests        # 纯标准库（无 pytest）一�
 xvfb-run -a env -u WAYLAND_DISPLAY GDK_BACKEND=x11 CAPSPLUS_GUI=1   python3 -m unittest discover -s tests      # 显式要求才真跑界面用例（慢十几秒）；连着真实 Wayland 会整类拒跑
 PYTHONPATH=tools/ci/nogi python3 -m unittest discover -s tests   # 复现"没装 python3-gi"的 CI（再跳 6 条动作层 mock 用例）
 python3 -m compileall -q .                   # CI 的另一半：全仓语法过一遍
-python3 tools/gen-readme.py                  # 改了映射/模板就重新生成 README
+python3 tools/gen-readme.py                  # 改了映射就刷新 README 的键位表（正文手工维护，生成器不碰）
 ```
+
+`README.md` **是手工维护的唯一真相源**（`README.template.md` 已于 2026-10-20 退役）：两张键位表用
+`<!-- BEGIN/END GENERATED: key-table:* -->` 夹住，`gen-readme.py` 只重写夹住的那几行，**正文一个字节
+都不碰**（旧版拿模板**整份覆盖** README，把手工写的整节删掉过 —— 实测删了 105 行，靠 git 才捞回来）。
+三道闸任一不过就**非零退出、一个字节都不写**：① 生成区标记必须唯一且有序；② README 的正文不许有
+未提交的改动（**生成器只在干净树上跑**，这样 diff 里只剩"键表变了"一件事）；③ 拼装后自证正文逐字节
+没变。**"键表不手写"这条规矩没变** —— 要改键表就改 `capsplus/mapping_data.py`，然后跑这条命令。
 
 界面测试**默认不跑**：`show_all()` 会在 GDK 当前连着的桌面上真弹窗并抢走键盘焦点，而开发机就是人
 干活的机器（2026-10-16 有实测抱怨）。要跑得同时满足两件事：`CAPSPLUS_GUI=1` + GDK 连的不是真

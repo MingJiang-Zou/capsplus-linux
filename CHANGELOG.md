@@ -7,6 +7,50 @@ GitHub 仓库的 Releases 页。版本号唯一落点是 `capsplus/__init__.py` 
 
 ---
 
+## 未发布 —— 文档与判据卫生：生成器不再能吃正文 + 一条"只在有桌面时才对"的判据
+
+两件收尾上的小事，都属"会反复伤人"那一类（各配反例具型，红过才留）。
+
+### 2026-10-20 事故：`tools/gen-readme.py` 会把 README 的整节删掉
+
+**现象**：`README.md` 与 `README.template.md` 早已不同步（历史提交只改 README、没改模板），
+谁跑一次 `tools/gen-readme.py`，就把 README 里手工加过的整节删掉 —— 实测删掉「安装：一条命令，
+一份实现」共 **105 行**（靠 git 才捞回来）；而模板仍缺那几节 ⇒ 下一个人再跑还会再删一次。
+
+**原因**：旧生成器是「模板 → **整份覆盖** README」，且没有任何护栏；`README.template.md` 是 README
+的第二份真相，两份各写各的必然漂。
+
+**修复**：README 手工维护，生成器只碰生成区。
+
+| 项 | 落点 |
+| --- | --- |
+| 生成区标记 | README 的两张键位表夹在 `<!-- BEGIN/END GENERATED: key-table:* -->` 之间 |
+| 只写生成区 | `tools/gen-readme.py` 只重写夹住的那几行，**正文一个字节都不碰**（结构上不可能被覆盖）|
+| 三道 fail-closed 闸 | ① 标记必须唯一且有序；② 正文不许有未提交的改动（**只在干净树上跑**）；③ 拼装后自证正文逐字节没变。任一不过 = **非零退出 + 一个字节都不写** |
+| 退役 | `README.template.md` 退场（`git show 96af83d:README.template.md` 可取回）|
+
+**判据**（都在真仓上跑过，带 md5 前后对比）：干净树跑生成 = **no-op**（README 逐字节不变）；
+往 README 加一节再跑 = **拒绝 + md5 不变**；生成区标记被改坏 = 拒绝。
+「键表不手写」这条规矩没变：要改键表就改 `capsplus/mapping_data.py`，再跑那条命令。
+
+### 同批：一条真跑 `wl-copy` 的判据在无显示的 shell 里挂死
+
+**现象**：`test_copy_to_clipboard_is_fast_with_a_daemon_shaped_command` 真跑 `wl-copy --type image/png`，
+**没有合成器时那条命令根本不肯退出**（手跑 `timeout 15 wl-copy --type image/png` ⇒ rc=124）⇒
+卡满 5 秒 timeout 报红，还把 `test_no_gi_smoke` 里「整套 discover 退出码为 0」那条**级联带红**
+（三种口径各 2 条红）。
+
+**修复**：形状与行为分开验 ——
+
+* **形状**：`clipboard_command()` 必须还是 `["wl-copy", "--type", "image/png"]`（单独一条判据，改了就红）；
+* **行为**：命令换成等价形状的 stub（`sh -c 'sleep 3 & exit 0'`：父进程立刻退、留守者抱着 stderr），
+  端到端跑一遍 `copy_to_clipboard` —— 不碰真剪贴板、不需要显示服务器、不需要真装 wl-copy。
+  runner 要是又回到 `capture_output=True`，留守者抱住那条永不 EOF 的管子 ⇒ 慢过 1 秒就红。
+
+顺带修掉一个副作用：老版在**真桌面**上跑全量单测，会把明江的剪贴板塞进一张 PNG；现在不会了。
+
+---
+
 ## 未发布 —— 扩展开发回路：部署前预检 + 登录后自证 + 无痛自检
 
 主题：**把"改一行 extension.js 就要注销重登一次"从日常变成最后一步**。这一轮的主诉是明江原话

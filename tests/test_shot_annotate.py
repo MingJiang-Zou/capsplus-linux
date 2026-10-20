@@ -1644,12 +1644,34 @@ class TestDaemonStyleSubprocesses(unittest.TestCase):
         self.assertGreater(bad, 0.8, f"反例没被拖住（{bad:.2f}s）—— 判据失去意义")
         self.assertLess(good, 0.5, f"DEVNULL 那版也慢了（{good:.2f}s）")
 
+    def test_clipboard_command_shape_is_unchanged(self):
+        """复制图片的命令形状：`wl-copy --type image/png`（单独一条，红了一眼就知道是形状变了）。"""
+        self.assertEqual(AN.clipboard_command(), ["wl-copy", "--type", "image/png"],
+                         "复制图片的命令形状变了 —— 少了 `--type image/png`，剪贴板里会是一坨二进制")
+
     def test_copy_to_clipboard_is_fast_with_a_daemon_shaped_command(self):
-        """端到端：`copy_to_clipboard` 在守护型命令上必须**远小于 timeout** 地返回 ok=True。"""
-        t0 = time.monotonic()
-        ok, why = AN.copy_to_clipboard(b"hello", runner=AN._default_clipboard_runner,
-                                       which=lambda _n: "/usr/bin/wl-copy")
-        elapsed = time.monotonic() - t0
+        """端到端：`copy_to_clipboard` 在守护型命令上必须**远小于 timeout** 地返回 ok=True。
+
+        2026-10-20 改的口径（原来这条**在无显示的 shell 里挂死**）：它真跑 `wl-copy --type image/png`，
+        没有合成器时那条命令根本不肯退出 ⇒ 卡满 5 秒 timeout、报 ok=False（实测 `timeout 15 wl-copy
+        --type image/png` rc=124），还把 `test_no_gi_smoke` 里"整套 discover 退出码为 0"那条级联带红。
+        现在**形状与行为分开验**：
+          * 形状 —— 上面那条断言真命令还是 `wl-copy --type image/png`；
+          * 行为 —— 命令换成**等价形状的 stub**（`sh -c 'sleep 3 & exit 0'`：父进程立刻退、留守者抱着
+            stderr），端到端跑一遍 `copy_to_clipboard`。不需要显示服务器、也不需要真装 wl-copy，
+            更不会像老版那样在真桌面上把明江的剪贴板塞进一张 PNG。
+        runner 要是又回到 `capture_output=True`，留守者会抱住那条永不 EOF 的管子 ⇒ 这里就慢过 1 秒 = 红。
+        """
+        stub = ["sh", "-c", "sleep 3 & exit 0"]
+        real = AN.CLIPBOARD_CMD
+        AN.CLIPBOARD_CMD = tuple(stub)
+        try:
+            t0 = time.monotonic()
+            ok, why = AN.copy_to_clipboard(b"hello", runner=AN._default_clipboard_runner,
+                                           which=lambda _n: "/usr/bin/wl-copy")
+            elapsed = time.monotonic() - t0
+        finally:
+            AN.CLIPBOARD_CMD = real
         self.assertTrue(ok, why)
         self.assertLess(elapsed, 1.0, f"复制用了 {elapsed:.2f}s")
 
