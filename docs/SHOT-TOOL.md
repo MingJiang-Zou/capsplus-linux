@@ -97,9 +97,17 @@ capsplus-shot --region | --capture X Y W H --out FILE | --pin FILE
 判据：出现 `[raise-browser] ready capture=on pin=on promisified=true …` ⇒ 新代码在跑；
 只有 `ready default=…` ⇒ 还是旧代码，**要注销重登**。
 
-**装扩展的脚本目前有个坑（2026-10-19 实测，未修 —— 不在本次改动范围内）**：
-`tools/install-extension.sh` 第 17 行 `[ "$1" = "--quiet" ] && QUIET=1` 在 `set -eu` 下无参调用会
-`parameter not set` 直接退出（要传 `--quiet` 反而只报错不复制）。手动部署就照上面那两行 `cp`。
+**装/校验/自检是三条命令，别再照上面那两行 `cp` 手搓**（2026-10-20 收口）：
+
+```bash
+capsplus ext sync     # = sh tools/install-extension.sh --sync   写：原子落盘 + md5 校对（唯一写文件的地方）
+capsplus ext verify   # = sh tools/install-extension.sh --verify 只校验：md5 + enabled 列表，一个字节都不写
+capsplus ext bench    # = sh tools/ext-bench.sh                  在隔离 headless shell 里自检**能不能加载**（不用重登）
+```
+
+三者的分工与各自的退出码语义见 `docs/KNOWN-LIMITS.md`「扩展的部署 / 校验 / 自检」一节。
+顺带记一笔旧坑（**已修**）：2026-10-19 那个 `[ "$1" = "--quiet" ]` 在 `set -eu` 下无参调用会
+`parameter not set` 直接退出；现在参数解析改成 `for _arg in "$@"`，无参运行安全。
 
 ## 三·五、第 2 步：选区遮罩（capsplus 侧，不需要重登）
 

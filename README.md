@@ -37,21 +37,28 @@
 [`docs/KNOWN-LIMITS.md`](docs/KNOWN-LIMITS.md)（13 条编号 + 按日期追加的实测记录，
 每条都带**实测日期**与**复现方法**）。
 
-## 快速上手（三条命令）
+## 快速上手（两条命令）
 
 ```bash
-./install.sh                 # ① 装用户侧：bin 软链 + 应用菜单入口 + autostart + 依赖检查
-capsplus render | less       # ② 先看渲染出来的 keyd 配置，不动系统
-capsplus apply               # ③ 装进 /etc/keyd 并 reload（先备份，keyd 报错自动回滚）
+./install.sh                 # ① 一次装全：依赖检查 + bin 软链 + 菜单入口 + GNOME 扩展副本
+                             #    + keyd 配置（备份/校验/回滚都在内）+ systemd 用户单元组
+capsplus status              # ② 一页看全：keyd / 扩展 / 语音 / 截图 / 托盘，每条带下一步
 ```
 
-`install.sh` **不碰 `/etc/keyd`**，③ 这一步是你自己按下去的。之后：
+`./install.sh` 只是 `capsplus install` 的壳子（**一份实现，两个叫法**）。默认会把 keyd 配置也装上
+（可逆：`apply` 先备份、出错自动回滚）；不想让它碰 `/etc` 就 `./install.sh --no-keyd`，
+回头自己 `capsplus apply`。想看它到底会做什么：`./install.sh --dry-run`。
+
+装完就这三件：
 
 ```bash
-capsplus status              # keyd 服务/程序路径/当前配置摘要/与渲染是否一致
-capsplus-qbar                # Qbar（Caps+Q 由 keyd 唤起）
-capsplus-settings            # 设置窗口：快速链接 / 通用 / 按键映射
+capsplus status              # 现在什么状态、下一步做什么（它自己会说）
+capsplus up                  # 起托盘 + 扩展校验（= systemctl --user start capsplus.target）
+capsplus help                # 全部子命令（install/uninstall/doctor/logs/test/ext/voice/shot/…）
 ```
+
+**应用菜单里只有一个入口「CapsPlus」** —— 打开就是管理器（状态 / 快速链接 / 通用 / 按键映射）。
+Qbar 用 Caps+Q 唤起，也在管理器里能开。
 
 ## 让浏览器在**原窗口开标签页**（可选，需要装一个 GNOME 扩展）
 
@@ -126,6 +133,9 @@ Python 侧同理没有 `Gio.DBus.session`，要用 `Gio.bus_get_sync(Gio.BusType
 
 ```
 capsplus/       CLI 与映射真相源（render / apply / status）
+  cli.py            **全项目唯一命令入口**：status/doctor/install/uninstall/up/down/ext/voice/shot/logs/test 分发
+  install.py        装机件：bin 软链 / 菜单入口 / 扩展副本 / systemd 单元组（幂等、可 --dry-run、退役一律进焚化炉）
+  extcheck.py       扩展体检（状态 + 部署副本 vs 仓内漂移 + Qbar 实测应答）
   env.py            跨发行版落点的唯一入口（keyd 二进制名/单元名、用户 bin 目录、fd 名）
   mapping_data.py   键位数据 + 分组注释（改这里）
   render.py         渲染 keyd 配置 / 归一化校验 / 生成 README 键表 / binding_rows 给界面用
@@ -146,40 +156,67 @@ qbar/           GTK3 浮层启动器（capsplus-qbar）
 settings/       GTK3 设置窗口（capsplus-settings）—— **只摆控件，两页表格一律只读**；算法都在上面那两个纯层里
 bin/            capsplus / capsplus-tray / capsplus-qbar / capsplus-settings / keyd-qbar-cmd / capsplus-voice
 assets/         自画的两个托盘 SVG（启用/暂停）
-packaging/      应用菜单 .desktop（只放 Qbar 与设置两条）、autostart .desktop、systemd --user unit
-              —— 模板里一律用 @BIN_DIR@ / @REPO_DIR@，由 install.sh 换成实际路径
+packaging/      应用菜单 .desktop（**只放一条**：CapsPlus 管理器）、systemd --user 单元
+              （capsplus.target 收托盘与扩展校验两个组件；**不再**用 autostart —— 两条自启路出过双托盘）
+              —— 模板里一律用 @BIN_DIR@ / @REPO_DIR@，由 `capsplus install` 换成实际路径
 docs/           KNOWN-LIMITS.md（实测平台限制，逐条带日期与复现方法）/ PRIVACY.md（本机留什么、分享前清什么）
 tests/          标准库 unittest（无 pytest 依赖）
 tools/gen-readme.py  由模板 + 映射数据生成 README
 tools/e2e/      真机端到端验收（虚拟键盘逐条比对，要 root）
 tools/ci/nogi/  sitecustomize 屏蔽 gi，一行复现"没装 PyGObject 的 CI"
-tools/install-extension.sh    装 GNOME 扩展 raise-browser（激活浏览器窗口用）
+tools/install-extension.sh    装/校验 GNOME 扩展 raise-browser（--sync 原子落盘 / --verify 只校验不写）
+tools/ext-bench.sh            在隔离的 headless gnome-shell 里自检扩展能不能加载（**不用注销重登**）
 tools/verify-raise-browser.py A/B 实测"在原窗口开标签页"有没有生效（不靠人眼数窗口）
 extensions/raise-browser@capsplus.example/  GNOME Shell 扩展本体（D-Bus: RaiseBrowser / Probe）
 .github/        workflows/tests.yml（ubuntu-latest × py3.11/3.12，不装 gi、不 sudo、不碰 /etc）
 CHANGELOG.md    0.1.0 段的版本叙事（**尚无任何 release tag**）
 ```
 
-## 安装
+## 安装：一条命令，一份实现
 
 ```bash
-bash install.sh              # bin 软链 + 应用菜单入口 + autostart + 依赖检查
-bash install.sh --no-autostart   # 不装开机自启（应用菜单入口照装）
+./install.sh                 # = capsplus install：一次装全（幂等，跑两遍结果一样）
+./install.sh --dry-run       # 先看它打算做什么，一个字节都不改
+./install.sh --no-keyd       # 只装用户侧，不碰 /etc/keyd（回头自己 capsplus apply）
+./install.sh --no-extension  # 不装 GNOME 扩展
+./install.sh --no-units      # 不装 systemd 用户单元
+capsplus uninstall           # 卸掉用户侧（默认**不动** /etc/keyd 与你的配置/日志）
 ```
 
-装完后 GNOME **应用网格里能搜到「capsplus Qbar」和「capsplus 托盘」**，可以直接固定到 Dock
-（`.desktop` 落在 `~/.local/share/applications/`，`Terminal=false`、`Categories=Utility;`）。
-装完会跑一次 `desktop-file-validate`；本机没有这个命令就跳过并打印说明。
+`install` 一次做完下面这些，**不再有"这里开一个东西那边开一个东西"**：
+
+| 装什么 | 落到哪 | 说明 |
+| --- | --- | --- |
+| 7 个命令入口 | `~/.local/bin/`（软链回本仓） | `CAPSPLUS_BINDIR` 可改落点（keyd 那边的路径会跟着渲染） |
+| **一个**菜单入口 | `~/.local/share/applications/` | 「CapsPlus」= 管理器窗口；旧的 Qbar 条目会退役 |
+| GNOME 扩展副本 | `~/.local/share/gnome-shell/extensions/` | 原子落盘 + md5 校对；**不**在登录那一秒抢着写（那出过 8190 半截文件事故） |
+| keyd 配置 | `/etc/keyd/capslock-plus.conf` | 先备份 → 装 → reload → 查错，报错自动回滚 |
+| systemd 用户单元组 | `~/.config/systemd/user/` | `capsplus.target` 带托盘 + 扩展校验；`capsplus up/down` 就是它的开关 |
+| 退役旧件 | `/tmp/attic-<日期>/` | 旧的 Qbar 菜单入口、旧的 autostart 托盘 —— 一律 `mv`，不 `rm` |
 
 依赖（本机已装）：`python3-gi`、`gir1.2-gtk-3.0`、`gir1.2-ayatanaappindicator3-0.1`、
 `fd`（Debian/Ubuntu 装出来叫 `fdfind`）、`keyd`（**Debian/Ubuntu 叫 `keyd.rvaiya`，
 Arch/Fedora/openSUSE 叫 `keyd`** —— 本仓两个名字都试，见 `capsplus/env.py`）、GNOME 扩展
 `ubuntu-appindicators@ubuntu.com`（托盘才有地方显示）。
 TOML 解析用 Python 3.11+ 自带的 `tomllib`，**除此之外零第三方依赖**。
-`install.sh` 会先卡两条：`python3 >= 3.11`（不够就给对应发行版的装法）与 keyd 在不在
-（不在就按发行版给 `apt`/`pacman`/`dnf`/`zypper` 命令，**不替你装** —— 它要动内核输入层）。
+缺依赖只会警告、不会中断（SSH / 半残机器上照样能装，缺什么 `capsplus status` 会指出来）；
+keyd 这个要动内核输入层的**不会**替你装。
 
-`install.sh` **不会**碰 `/etc/keyd` —— 配置由你自己跑 `capsplus apply` 并审 diff。
+## 统一管理：status / doctor / up / down
+
+```bash
+capsplus status          # 一页看全：keyd / 扩展 / 语音 / 截图 / 用户侧栈，每条带"下一步"
+capsplus doctor --fix    # 只自动修能安全修的装机件（软链/菜单/单元/扩展副本），不碰键位与数据
+capsplus up | down       # 用户侧栈总开关（systemctl --user start|stop capsplus.target）
+capsplus restart
+capsplus logs            # 用户单元日志（没有用户管理器时退回两个运行日志）
+capsplus logs -f -n 200
+capsplus test            # 仓内全量单测；capsplus test gui = 在 Xvfb 里真跑界面用例
+```
+
+`status` 是本项目**唯一的状态真相源**：命令行的 `capsplus status`、管理器窗口的第一页
+（`settings/settings_app.py` 的 `StatusPage`）、`doctor` 用的都是同一份
+`capsplus/cli.py:collect_status()`，所以"窗口里看到的"和"命令行看到的"永远一致。
 
 ## 用法
 
@@ -187,20 +224,30 @@ TOML 解析用 Python 3.11+ 自带的 `tomllib`，**除此之外零第三方依�
 capsplus render          # 渲染 keyd 配置到 stdout（看一眼再决定）
 capsplus apply           # 备份 -> 装到 /etc/keyd/capslock-plus.conf -> reload -> 查错
 capsplus apply --dry-run # 只渲染并自检，不碰系统
-capsplus status          # 服务状态 + 当前配置摘要 + 与渲染是否一致 + 最近一条日志
+capsplus status          # 见上面「统一管理」：一页看全
 
-capsplus-tray            # 托盘：打开 Qbar / 设置… / 编辑快速链接 / 启停映射 / 重载 / 打开映射文件 / 最近日志 / 关于
-capsplus-qbar            # Qbar：第一次起窗口，已在运行则切换显示/隐藏
-capsplus-qbar --hidden   # 常驻不显示（给 keyd 唤起用）
-capsplus-settings        # 设置窗口（GTK3，三页）：快速链接 / 通用 / 按键映射
+capsplus ext status      # 扩展状态（含"部署副本 vs 仓内"的漂移）
+capsplus ext sync        # 同步扩展副本（原子落盘；改过扩展要**注销重登**才生效）
+capsplus ext bench       # 隔离会话里自检扩展能不能加载 —— 不用重登就能知道改得对不对
+capsplus voice status    # 语音：worker / 识别服务 / 上屏后端 / 能量门参数
+capsplus shot --region   # 截图（等价 capsplus-shot --region）
+
+capsplus tray            # 托盘：打开 Qbar / 设置… / 编辑快速链接 / 启停映射 / 重载 / 打开映射文件 / 最近日志 / 关于
+capsplus qbar            # Qbar：第一次起窗口，已在运行则切换显示/隐藏
+capsplus settings        # 管理器窗口（GTK3，四页）：状态 / 快速链接 / 通用 / 按键映射
 ```
 
-## 设置窗口 `capsplus-settings`
+旧的 `capsplus-tray` / `capsplus-qbar` / `capsplus-settings` / `capsplus-shot` / `capsplus-voice`
+**照样能用**（它们是薄入口，`capsplus <子命令>` 转发到同一批脚本）—— 老的肌肉记忆不用改。
 
-不想手改 TOML 就用它。三页（`Gtk.Notebook`）：
+## 管理器窗口 `capsplus-settings`
+
+**应用菜单里唯一的入口**（托盘「设置…」、Qbar 的 `-> settings`、`capsplus settings` 都开它）。
+四页（`Gtk.Notebook`），第一页是「状态」——打开窗口的人十有八九是某个键没反应：
 
 | 页 | 管的东西 | 写到哪个文件 |
 | --- | --- | --- |
+| **状态** | `capsplus status` 的同一份内容（keyd / 扩展 / 语音 / 截图 / 用户侧栈），底下五个按钮：`重新检查` `一键修复` `同步扩展` `应用键位` `重启托盘` + `打开日志目录`。**判据不在界面里**：直接调 `capsplus.cli.collect_status()`，与命令行同一份真相 | 不写文件（只跑 `capsplus` 子命令） |
 | **快速链接** | **只读**表格（前缀 / 名称 / 类型 / 目标 / 备注）+ 表格下方**表单条**（`前缀` `名称` `类型`下拉五选一 `目标`）；按钮 `保存这一条` `新增` `删除（带确认）` `上移` `下移` `重读文件` `保存快速链接`。选中/输入即更新**实时预览**（`输入 b 关键词 → 最终 URL`，`file`/`app` 显示展开 `~` 后的真实目标，`ask` 多一行灰字写清"回车做哪两件事"）；前缀完全重复 = 红字拦下、**拒绝写盘** | `~/.config/capsplus/qbar.toml` |
 | **通用** | `default_search`（下拉只列 search 类）、`browser`（留空=系统默认）、`hide_on_focus_out` 开关；每项右侧一行灰字解释 | 同上（两页写同一个文件，任一页点保存都会整体写回） |
 | **按键映射** | **只读**生效表（层/键/动作/说明/**来源=默认\|覆盖**，覆盖行加粗）+ 表格下方**编辑条**：`目标：capl / t`（加粗）+ 该行说明 + `动作：`下拉（`ComboBox.new_with_entry`，常用动作可点选也能自由输入）+ `改这一格` `恢复默认（删这条覆盖）`。单击行同步编辑条，**双击行焦点进输入框**，框内回车 = 点「改这一格」；当场用 `validate_action` + `load_known_keys` 校验（非法 = 红字不写盘），宏超 15 事件 = 黄字。「改这一格」立刻写覆盖层并刷表（来源变「覆盖」），但**不碰系统**；「应用」才装进 `/etc/keyd` | `~/.config/capsplus/mappings.toml`（覆盖层） |
@@ -215,8 +262,11 @@ cell editor 是**独立 surface、不跟随表格滚动** —— 表格滚了、
 源码级判据锁死不再回退：`tests/test_table_readonly.py`（AST 扫描，出现 `CellRendererCombo` 或
 `editable=True` 就判红，headless 也拦得住）。
 
-入口只有三个：**托盘「设置…」**、**Qbar 里敲 `-> settings`**、**命令行 `capsplus-settings`**。
-刻意**不装** 应用菜单 `.desktop`（应用里条目越多越难找，上一轮刚删掉一条冗余的）。
+入口四个，都通向**同一个窗口**（单实例 socket：第二次启动只把已开的窗口拉到前台）：
+托盘「设置…」、Qbar 里敲 `-> settings`、命令行 `capsplus settings`、**应用菜单里的「CapsPlus」**。
+（2026-10-20 改的口径：应用菜单里现在有且只有这一条 —— 它就是这个工具的总入口；
+Qbar 那条 `.desktop` 已退役。早先"刻意不装菜单条目"的理由是"条目越多越难找"，
+而现在的做法是**把所有东西收进一条**，比"一条都没有"更符合"统一入口"。）
 
 界面分工：`settings/settings_app.py` 只摆控件，校验/增删/预览/TOML 写回/apply 流程全在
 `capsplus/settings_logic.py` 与 `qbar/search_config.py` 这两个不 import `gi` 的纯层里，
@@ -366,6 +416,20 @@ voice-svc-user.service`，模型在 `~/.cache/sherpa-onnx/sherpa-onnx-sense-voic
 可覆盖：`CAPSPLUS_VOICE_BACKEND=clipboard|primary|manual`、`CAPSPLUS_VOICE_RESTORE_CLIPBOARD=0`
 （关掉还原，回到"覆盖且不还原"的老行为；默认开）、`CAPSPLUS_ASR_HOST/PORT/LANG`。
 
+**一次能说多长、什么时候判停（2026-10-20 实测后定的，客户端限制全在 `capsplus/voice_vad.py`）**：
+
+| 项 | 值 | 为什么 |
+| --- | --- | --- |
+| 单次录音上限 | **60 s**（`CAPSPLUS_VOICE_MAX_MS`） | 服务端实测能吃 60 s；到上限会**明确提示**（弹窗顶栏 / 日志 / `status`），不再静默截断 |
+| 尾静音判停 | **min(2400, 1200 + 每说满 1 s +100 ms)**（`CAPSPLUS_VOICE_SILENCE_MS` / `_MAX_MS`） | 固定 700 ms 会把"句中的正常思考停顿"当成说完（实测 900 ms 停顿就被切断）；短口令又不该等太久 ⇒ 随说话时长增长、带上界 |
+| 送识别前留手 | 句首 **300 ms** / 句尾 **250 ms**（`_PAD_HEAD_MS` / `_PAD_TAIL_MS`） | 8 组前置静音实测：旧 150 ms 丢首字 6/8，300 ms 只剩 1/8，再大不再改善 |
+| 电平 | 默认**不加增益**（`CAPSPLUS_VOICE_GAIN` 可手工 1~4×） | 本机真人语音峰值已占满量程 84%，再加就削顶；底噪 ×8 会抬过能量门下限 |
+
+诊断口：`capsplus voice meter [秒数]`（只读麦克风量电平，不动会话、不写 socket）；
+每次录音的语音段 RMS / 峰值 / 增益都会进 `voice.log` 与 `capsplus voice status`；
+`CAPSPLUS_VOICE_KEEP_LAST=1` 会把最近一次送识别的 WAV 留在状态目录（0600、上限 5 份、默认关），
+识别不准时能拿真音频复盘。
+
 **未实测清单（别当已验证，这几条只有真桌面 + 真人能清）**：① 弹窗销毁后焦点是否真还给原文档 ——
 客户端**问不到**（X11 实测：`unmap` 与 `destroy` 同步、Enter 后 0.03ms 就到，`focus_out` 在没有窗口
 管理器时压根不来；mutter 下收不收得到还没取证），所以现在只能靠真机那一行 `inject_diag` 来定；
@@ -441,7 +505,7 @@ voice-svc-user.service`，模型在 `~/.cache/sherpa-onnx/sherpa-onnx-sense-voic
 | `-> date` / `-> time` | 日期 / 时间（回车复制） |
 | `-> calc <表达式>` | 算术，同上 |
 | `-> link` | 打开快速链接配置文件（TOML） |
-| `-> settings` | **打开设置窗口**（快速链接 / 通用 / 按键映射三页）；窗口已开着就拉到前台 |
+| `-> settings` | **打开管理器窗口**（状态 / 快速链接 / 通用 / 按键映射四页）；窗口已开着就拉到前台 |
 | `http(s)://…` / `xxx.com` | 浏览器打开（真网址优先，不会被单字母 trigger 抢走） |
 
 键盘：`Esc` 关闭、`↑/↓` 选择、`Enter` 打开。历史记在
@@ -592,6 +656,9 @@ url = "https://github.com/pulls"              # ghp      → 固定链接，直�
    ```
 3. **整份撤掉**：`sudo mv /etc/keyd/capslock-plus.conf /tmp/attic-$(date +%Y%m%d)/ && sudo systemctl restart keyd`
 4. **救命组合**：同时按 `backspace` + `escape` + `enter` 会终止 keyd（配置改坏时不至于锁死机器）。
+5. **整份退役**：`capsplus uninstall`（用户侧：软链/菜单/单元/扩展副本，一律进焚化炉），
+   `--purge-keyd` 连 `/etc/keyd` 那份一起退役，`--purge-extension` 连扩展目录一起。
+   **`~/.config/capsplus/` 与 `~/.local/state/capsplus/` 是你的数据，uninstall 不动它们。**
 
 ## 硬件与 keyd 的边界（都是 2026-10-15 用虚拟键盘实测出来的，不是推测）
 
@@ -688,7 +755,7 @@ keyd 的一条 `macro(...)` 里累计发出的按键事件**超过 15 个就不�
 | 用户键位覆盖层 | 上游是改源码；本仓是 `~/.config/capsplus/mappings.toml` 只存"改过的那几条"，没改的键跟着仓库走 |
 | Qbar | 上游 Qbar 是 AHK 实现的启动器；本仓用 GTK3 重写，并把搜索改成**可配置**（`qbar.toml` 五种链接类型） |
 | 托盘 | 上游没有；本仓新增（GTK3 + AyatanaAppIndicator3：启停映射 / 重载 / 唤起 Qbar / 看日志） |
-| 设置界面 | 上游没有；本仓新增 `capsplus-settings`（GTK3 三页：快速链接 / 通用 / 按键映射） |
+| 设置界面 | 上游没有；本仓新增 `capsplus-settings`（GTK3 四页：**状态** / 快速链接 / 通用 / 按键映射），同时是应用菜单里的唯一入口 |
 | 明确没做的 | 独立剪贴板 B 组、WinBind 切窗口、热字符串、F2/F3/F4/F6/F12 —— 原因是 Wayland / keyd 层面做不到，见「与原版 Capslock+ 的差异」 |
 
 上游项目与本仓**没有从属关系**（不是 fork，也没有在 Linux 上跑它的任何 `.ahk` 文件）；
@@ -720,7 +787,7 @@ CI（`.github/workflows/tests.yml`）跑的是 `python3 -m unittest discover -s 
 "没有 gi 也必须能过收集阶段"由 `tests/test_no_gi_smoke.py` 守着（顶层裸写 `import gi` 会被它判红，
 判据自己有反例具型，不是摆设）。
 
-`tests/test_settings_window.py` 是**真起窗**的界面测试（会断言窗口真的 `mapped`、三页控件与
+`tests/test_settings_window.py` 是**真起窗**的界面测试（会断言窗口真的 `mapped`、四页控件与
 表格行数、"单击第 N 行 → 编辑条显示的就是第 N 行"、双击后焦点在编辑条的输入框、
 表格无可编辑 renderer、以及"编辑→校验→写盘→恢复默认→试渲染"整条链）：它把两个配置路径与
 state 目录都指到临时目录，所以不碰 `~/.config/capsplus/`；连不上显示服务器时整个模块自动 skip

@@ -1,12 +1,17 @@
-# capsplus-tray 的 systemd user unit 模板。装法（二选一：autostart 与 unit 别同时开，
-# 否则两个托盘实例；脚本内部有 flock 兜底）。**install.sh 不装它**（要动 systemctl --user
-# enable，属于"开机自启的第二条路"，留给人自己决定），复制过去之前要把占位符换成真实路径：
-#   sed -e "s#@BIN_DIR@#$HOME/.local/bin#" \
-#       packaging/capsplus-tray.service > ~/.config/systemd/user/capsplus-tray.service
-#   systemctl --user daemon-reload && systemctl --user enable --now capsplus-tray.service
+# capsplus-tray 的 systemd user unit 模板。
+#
+# 装法**只有一条**（2026-10-20 起）：`capsplus install` 会渲染本文件、daemon-reload、
+# 并把 `capsplus.target` enable 上；托盘由那个 target 带起来，**不再**走 ~/.config/autostart
+# （两条并行的自启路会出两个托盘实例，脚本内部虽有 flock 兜底，但"关不干净"照样发生）。
+#
+# 手动装（排障时偶尔要用，与 install 等价）：
+#   sed -e "s#@BIN_DIR@#$HOME/.local/bin#" packaging/capsplus-tray.service \
+#       > ~/.config/systemd/user/capsplus-tray.service
+#   systemctl --user daemon-reload && systemctl --user enable --now capsplus.target
 [Unit]
 Description=capsplus 托盘（Capslock+ / keyd）
-PartOf=graphical-session.target
+Documentation=https://github.com/MingJiang-Zou/capsplus-linux
+PartOf=capsplus.target
 After=graphical-session.target
 
 [Service]
@@ -16,4 +21,4 @@ Restart=on-failure
 RestartSec=5
 
 [Install]
-WantedBy=graphical-session.target
+WantedBy=capsplus.target

@@ -7,6 +7,94 @@ GitHub 仓库的 Releases 页。版本号唯一落点是 `capsplus/__init__.py` 
 
 ---
 
+## 未发布 —— 一处管理：一条命令装 / 起 / 查 / 修
+
+主题：**把这套工具的"装、起、停、查、修"从五处收成一处**。这一轮的主诉不是功能缺失，是
+"这里开一个东西那边开一个东西，还没有统一的管理与启动器"。
+
+### 2026-10-20 事故：装机与启动散在五处，漏一步就半残，坏了也不在一个地方看见
+
+**现象**（用户视角）：改完代码/换台机器之后，得自己记着做五件事 ——
+`install.sh`（bin 软链 + 菜单入口 + autostart）、`tools/install-extension.sh`（GNOME 扩展副本）、
+`capsplus apply`（keyd 配置）、`sed` 渲染两个 systemd unit 再 `enable`、以及"托盘到底走 autostart
+还是 unit"。任何一件忘了，症状都是**某个键按了没反应**，而去看的地方彼此不知道对方存在。
+
+**原因**：五条路径各自都"对"，但它们没有共同的入口，也没有共同的状态视图。于是：
+· `capsplus status` 只报 keyd 一项（那是最早写的一个），扩展/语音/托盘坏了它不说；
+· 托盘走 `~/.config/autostart`、扩展校验走独立 unit —— 两条并行自启路，`systemctl --user stop`
+  只能停一半；
+· 应用菜单里有两条入口（Qbar + 设置），用户 2026-10-15 的原话是"应用里面有两个"。
+
+**修复**（一份实现，多处叫法）：
+
+| 原来 | 现在 |
+| --- | --- |
+| `install.sh` / `tools/install-extension.sh` / `capsplus apply` / 手渲 unit / autostart | **`capsplus install`**（`./install.sh` 只是它的壳子）：依赖检查 → bin 软链 → **一条**菜单入口 → 扩展副本（原子落盘）→ keyd 配置（备份/校验/回滚）→ systemd 单元组 → 退役旧件 |
+| `capsplus status` 只看 keyd | **`capsplus status` 一页看全**：keyd / 扩展 / 语音 / 截图 / 用户侧栈，**每个红项都带下一步动作** |
+| 两条自启路 | **`capsplus.target`**（systemd --user）一个开关：`capsplus up/down/restart`；autostart 那份退役 |
+| 应用菜单两条 | **一条「CapsPlus」** = 管理器窗口；Qbar 从管理器或 Caps+Q 开 |
+| 没有卸载 | **`capsplus uninstall [--purge-keyd] [--purge-extension]`**：用户侧全退，默认**不动** `/etc/keyd` 与 `~/.config/capsplus/`、`~/.local/state/capsplus/` |
+| 坏了靠猜 | **`capsplus doctor --fix`**：只自动修能安全修的装机件；`capsplus logs` / `capsplus test` 一个入口 |
+
+**一条命令的落地细节**（都在 `capsplus/install.py`，判据 `tests/test_cli_install.py` 21 条）：
+· **幂等**：跑两遍结果一样；单元/菜单内容没变就一个字节都不写（`write_atomic` 同目录 rename）。
+· **可预演**：`--dry-run` 把每一步先打一遍计划，一个字节都不改。
+· **退役不是删除**：旧的 Qbar 菜单入口、旧的 autostart 托盘一律 `mv` 进 `/tmp/attic-<日期>/`，
+  撞名加序号（不许覆盖上一次退役下来的东西）。
+· **不假装成功**：`up` 在单元没装时退回直接起进程并说明；`install` 有步骤失败仍把其余步骤跑完，
+  最后把状态页打给你看，并按退出码区分。
+· **迁移期的一个真坑**：托盘靠 `tray.lock` 抢单实例、抢不到**退 1**，而单元是 `Restart=on-failure`
+  ⇒ 从 autostart 迁到单元组时，如果不先收掉旧实例就是"每 5 秒重启一次"。`capsplus up` 现在会
+  先停下"不是单元起的那个托盘"再 start target（反例具型在 `TestUpDown` 里钉着顺序）。
+
+### 管理器窗口：应用菜单里唯一的入口
+
+`capsplus-settings` 从"三页设置窗"变成**四页管理器**，第一页是「状态」：
+内容是 `capsplus status` 的同一份（直接调 `capsplus.cli.collect_status()`，**不另算一份**），
+底下五个按钮 `重新检查` `一键修复` `同步扩展` `应用键位` `重启托盘` + `打开日志目录`。
+探测放在后台线程（否则窗口会假死 1~2 秒），按钮只调 `capsplus` 子命令（不在界面里重写一遍装机逻辑）。
+
+### 扩展：部署 / 校验 / 自检三件事分开管（不再靠"注销重登"来试探）
+
+**现象**（用户视角）：改完 `extension.js` 之后唯一能做的验证是注销重登；重登回来还是不对，就再来一次。
+**原因**（分三层，之前混在一起）：
+
+1. **写入时机错了**：登录那个 unit 跑的是 `install-extension.sh --quiet`，也就是**每次登录都 `cp`**
+   一遍扩展目录 —— 而它 `After=graphical-session.target`，正好与 gnome-shell 扫描扩展目录撞在同一秒。
+   2026-10-20 实测的现场是 shell 读到**拷贝中的半截文件**：
+   `TypeError: malformed UTF-8 character sequence at offset 8190`（8190 = 8192−2，一个汉字被切成两半）。
+   扩展 import 失败 ⇒ 抓帧通道没有 ⇒ `Caps+F1` **完全没有反应**，而用户只会说"截图又坏了"。
+2. **"改得对不对"与"shell 里跑的是不是新代码"是两件事**：GNOME 不会就地重新 import 扩展
+   （`ReloadExtension` 上游已废弃，实测回 `deprecated and does not work`；`disable/enable` 也不重新 import），
+   所以"重登"是**平台**的硬边界。但"我的 JS 有没有语法错/加载期抛异常"这件事**不该**靠重登去试。
+3. **失败是静默的**：`Caps+F1` 那条路是 keyd 的 `command(...)` 起的进程，stdout/stderr 落在 journal 里没人看。
+
+**修复**：
+
+| 现在 | 干什么 | 怎么写 / 怎么判 |
+| --- | --- | --- |
+| `capsplus ext sync` | **唯一写扩展副本的地方** | 原子落盘（同目录临时名 + rename）+ 内容相同不写 + 落盘后 md5 校对 |
+| `capsplus ext verify` | 登录时只**读**：md5 比对 + uuid 在不在 `enabled-extensions` | 不一致 → stderr + 桌面通知 + **exit 1**（红在面板上），**一个字节都不写** |
+| `capsplus ext bench`（新 `tools/ext-bench.sh`） | 在**隔离的 `dbus-run-session` + headless gnome-shell** 里真加载一次 | 认 journal 里那行 `[raise-browser] ready capture=on pin=on …`；正例 `EXT_OK（1s）`，坏扩展真红（实测 `SyntaxError: unexpected token: identifier …:990:6`） |
+
+**三条实测结论**（都写进 `docs/KNOWN-LIMITS.md`「扩展的部署 / 校验 / 自检」）：
+· 判活**只能认日志**：本机 gjs 的 `register_object` 是原始 C 绑定（`At least 5 arguments required`），
+  扩展只 `own_name` + `signal_subscribe`，所以隔离会话里 `gdbus --method Probe` 会回
+  `UnknownMethod 对象在路径处不存在` —— 别拿它当"扩展没加载"的证据。
+· `bench` 绿 = **文件层面没问题**，不等于他那个会话里的 shell 已经换上新代码（那仍需一次重登）。
+  所以 `status` 的 ERROR 文案改成"先跑 bench：绿了说明只差重登，红了才是代码坏了"。
+· 失败必须出声：抓帧/贴图超时经 `capsplus/shot_frame.py:notify_failure` 发桌面通知（GIO 优先，
+  没有 gi 退 `notify-send`），三条闸防骚扰（`CAPSPLUS_NOTIFY=0` / 单测进程里 / stderr 是终端）。
+
+### 判据
+
+新增 `tests/test_cli_install.py`（**21 条**，含四条"判据抓不抓得住旧写法"的反例具型：
+未知子命令必须退 2 / `--dry-run` 不许落盘 / 退役撞名不许覆盖 / **报红却不给动作必须被
+`groups_without_actions` 抓住**）；`tests/test_settings_window.py` 的页数与落到哪一页跟着改成四页，
+并新增"状态页打开就有字"那条。三口径：
+`python3 -m unittest discover -s tests` → 全套 OK（skip 77）；Xvfb + `CAPSPLUS_GUI=1` → 界面用例真跑；
+`PYTHONPATH=tools/ci/nogi` → 无 gi 也能收集。
+
 ## 未发布 —— 语音输入（Caps+M）
 
 主题：**在本机全离线地把"说话"变成"光标处的文字"**。键位走用户覆盖层（`m` 在上游表里本来就空着），
@@ -178,6 +266,39 @@ focus-out"这个事实**才注入（下限 120ms、上限兜底 400ms，见下�
   回滚后症状是"识别成功、报 `step_failed`、一个字都不上屏"（也就是这轮之前的状态）。
 
 ---
+
+### 2026-10-20 事故：**只可以是短语音、识别率低** —— 三个限制值全是客户端自造的
+
+**现象**：`Caps+M` 说长句，弹窗里只有几个字；说快一点/停顿一下就被截断。用户的判断是"几乎不可用"。
+**根因**（量出来的，不是猜的）：
+
+| 旧值 | 真凶 | 实测 |
+| --- | --- | --- |
+| `MAX_MS = 20000` | 单次录音 20 s 硬上限 | 同一段 59.5 s 音频：20 s 上限只拿到 **44 字**，放开到 60 s 拿到 **130 字**；服务端两次都 HTTP 200（0.97 s / 3.74 s）⇒ **服务端从来不是瓶颈** |
+| `SILENCE_STOP_MS = 700` 固定 | 尾静音 700 ms 就判"说完了" | 句中 900 ms 的思考停顿：旧参数 **1230 ms 就断**，新参数成一整段 2400 ms |
+| `TRIM_PAD_MS = 150`（前后同值） | 送识别前把句首掐掉 | 8 组前置静音打真服务：旧 150 ms **丢首字 6/8**，300 ms 只丢 1/8，400/500/800 不再改善 ⇒ **300 是拐点** |
+
+**修复**：上限 60 s（到上限**明确提示**：弹窗顶栏 / `voice.log` / `status` 三处，不再静默截断）；
+尾静音自适应 `min(2400, 1200 + 每说满 1 s +100 ms)`；句首/句尾 pad 拆成 300 / 250。
+另修一个被这条连带暴露的 bug：会话看门狗 `MAX_SESSION_S` 90 s 装不下"60 s 录音 + 3.7 s 识别 + 人反应"，
+提到 180 s（否则一次慢识别就把还在等人确认的会话判死）。
+
+**新增诊断口**（为的是"别再靠用户当测试员"）：
+· `capsplus voice meter [秒数]` —— 只读麦克风量电平（RMS/峰值/分位/过门帧/建议增益），
+  不起录音线程、不写 socket、不弹窗、不送识别；
+· 每次录音把 `voice_level rms=… peak=… voiced_rms=… gain=…` 写进 `voice.log` 与 `capsplus voice status`；
+· `CAPSPLUS_VOICE_KEEP_LAST=1` → 状态目录留最近一次送识别的 WAV（0600、上限 5 份、只清自己的文件）。
+
+**没有加自动增益**（量完才定的）：本机真人语音峰值已用掉量程的 84%，任何 ≥1.2× 都会削顶（削顶比声音小更毁识别）；
+而底噪 19 × 8 = 152 会跨过 `GATE_FLOOR=150`，那时没说话也出字 ⇒ 只留手工 `CAPSPLUS_VOICE_GAIN`（夹 1~4×）。
+
+**判据**：`tests/test_voice_vad.py` 扩到 45 条（新增"句中停顿不切断"/"60 s 上限"/"pad 保句首"三组）、
+新增 `tests/test_voice_levels.py` 26 条、`test_voice_asr.py` +5、`test_voice_proto.py` +7。
+五组反例具型**逐条真红过**（把旧参数塞回去 → 对应判据红，日志在 `~/.dsh/work/20261020-voice-fix/red/`，
+扰动后 `sha256` 自证还原）。
+
+**诚实的未做**：60 s 的 A/B 用的是"同一句参考音频重复 10 次"的替身，不是真人 60 秒长句；
+真机"说一整句 → 弹窗 → 上屏"这一条仍要用户自己按一次（会抢焦点，不越这道线）。
 
 ## 0.2.0 —— 2026-10-16
 

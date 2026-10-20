@@ -3,8 +3,12 @@
 # Copyright (c) 2026 capsplus-linux contributors
 # 本文件属 capsplus-linux —— CapsLock+ v3.3.0 的 Linux 移植（衍生作品）；按键映射数据译自上游：
 #   上游 https://github.com/wo52616111/capslock-plus （GPL-2.0，© wo52616111）；改动见 README「许可与上游」。
-"""capsplus-settings —— Capslock+ 的设置窗口（GTK3，中文，三页）。
+"""capsplus-settings —— CapsPlus 管理器（GTK3，中文，四页）。
 
+    ⓪ 状态       **本工具的总入口**：keyd / 扩展 / 语音 / 截图 / 用户侧栈一页看全，
+                 每条红项配一个按钮（同步扩展、应用键位、重启托盘、一键修复）。
+                 那份状态**不是这里另算的**：直接调用 `capsplus.cli.collect_status()`，
+                 与命令行 `capsplus status` 是同一份真相（2026-10-20 统一入口时定的）。
     ① 快速链接   只读表格 + 表格下方的**表单条**：增/删/上下移动 + 五种类型 + 实时预览，
                  写回 `qbar.toml`
     ② 通用       default_search / browser / hide_on_focus_out
@@ -28,8 +32,9 @@ TOML 写回、apply 流程全在 `capsplus/settings_logic.py` 与 `qbar/search_c
 `-> settings`）只发一个字节，让已经开着的窗口回到前台 —— 开两个窗口各自覆盖对方的改动，
 是最容易丢配置的那种事故。
 
-入口只有三个：托盘「设置…」、Qbar `-> settings`、`~/.local/bin/capsplus-settings`。
-刻意**没有** .desktop 应用菜单条目（2026-10-15 定案：应用里条目越多越难找，上一轮刚删掉一条）。
+入口四个，都通向**这一个窗口**：托盘「设置…」、Qbar `-> settings`、命令行 `capsplus settings`、
+应用菜单里的「CapsPlus」。2026-10-20 之前的规则是"刻意不装菜单条目"（应用里条目越多越难找），
+现在的规则换成"**应用里有且只有一条，而且它就是总入口**" —— 理由见 README「安装」一节。
 """
 
 from __future__ import annotations
@@ -97,12 +102,123 @@ def store_rows(store) -> list[tuple]:
 
 
 # ===========================================================================
+# ⓪ 状态页 —— 总入口
+# ===========================================================================
+class StatusPage(Gtk.Box):
+    """一页看全 + 就地修。判断全部来自 `capsplus.cli.collect_status()`（不在这里另算一份）。
+
+    两条刻意的设计（2026-10-20）：
+      · **探测放到线程里**：一次体检要问 systemctl、读扩展状态、探识别服务，串起来 1~2 秒。
+        直接在 GTK 主线程里做，窗口会假死，用户以为程序卡住。
+      · **按钮只调 `capsplus` 子命令**，不在界面里重写一遍装机/apply 的逻辑 ——
+        否则窗口和命令行又会变成两份实现、两套行为。
+    """
+
+    BUTTONS = (
+        ("重新检查", ["status"], False),
+        ("一键修复", ["doctor", "--fix"], False),
+        ("同步扩展", ["ext", "sync"], False),
+        ("应用键位", ["apply"], False),
+        ("重启托盘", ["restart"], False),
+    )
+
+    def __init__(self, app):
+        super().__init__(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+        self.app = app
+        self.set_border_width(10)
+
+        hint = Gtk.Label(xalign=0)
+        hint.set_line_wrap(True)
+        hint.set_markup(markup("这是 CapsPlus 的总入口。红项下面都有对应的按钮；"
+                               "命令行等价物是 `capsplus status` / `capsplus doctor --fix`。", GREY))
+        self.pack_start(hint, False, False, 0)
+
+        self.view = Gtk.TextView()
+        self.view.set_editable(False)
+        self.view.set_cursor_visible(False)
+        self.view.set_monospace(True)
+        self.view.set_wrap_mode(Gtk.WrapMode.WORD_CHAR)
+        self.view.set_left_margin(8)
+        self.view.set_top_margin(6)
+        scroll = Gtk.ScrolledWindow()
+        scroll.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
+        scroll.add(self.view)
+        self.pack_start(scroll, True, True, 0)
+
+        row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        for label, argv, _ in self.BUTTONS:
+            button = Gtk.Button(label=label)
+            button.connect("clicked", self._on_action, argv)
+            row.pack_start(button, False, False, 0)
+        open_dir = Gtk.Button(label="打开日志目录")
+        open_dir.connect("clicked", self._on_open_logs)
+        row.pack_end(open_dir, False, False, 0)
+        self.pack_start(row, False, False, 0)
+
+        self.reload()
+
+    # ── 探测（线程里做，回主线程画）────────────────────────────────────
+    def reload(self) -> None:
+        self._set_text("检查中……（systemctl / 扩展 / 语音 / 截图，约 1~2 秒）")
+        threading.Thread(target=self._probe, daemon=True).start()
+
+    def _probe(self) -> None:
+        import io
+
+        from capsplus import cli
+
+        buf = io.StringIO()
+        try:
+            cli.render_groups(cli.collect_status(), buf)
+            text = buf.getvalue()
+        except Exception as exc:  # noqa: BLE001 —— 体检自己挂了也要把原因显示出来
+            text = f"体检失败：{type(exc).__name__}: {exc}\n命令行排查：capsplus status"
+        GLib.idle_add(self._set_text, text)
+
+    def _set_text(self, text: str) -> bool:
+        self.view.get_buffer().set_text(text)
+        return False        # 只跑一次（GLib.idle_add 的约定）
+
+    # ── 按钮 ───────────────────────────────────────────────────────────
+    def _on_action(self, _button, argv: list[str]) -> None:
+        self._set_text(f"正在执行：capsplus {' '.join(argv)} ……")
+        threading.Thread(target=self._run_cli, args=(argv,), daemon=True).start()
+
+    def _run_cli(self, argv: list[str]) -> None:
+        import subprocess
+
+        cmd = [sys.executable, str(REPO / "bin" / "capsplus"), *argv]
+        try:
+            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+            text = (proc.stdout + proc.stderr).strip() or f"（{argv[0]} 没有输出）"
+            text += f"\n\n[退出码 {proc.returncode}]"
+        except Exception as exc:  # noqa: BLE001
+            text = f"执行失败：{type(exc).__name__}: {exc}"
+        GLib.idle_add(self._set_text, text)
+        # 动作做完再体检一次：用户要看到的是"现在怎么样"，不是动作的回显
+        GLib.timeout_add(600, lambda: (self.reload(), False)[1])
+
+    def _on_open_logs(self, _button) -> None:
+        import subprocess
+
+        try:
+            subprocess.Popen(["xdg-open", str(STATE_DIR)], stdout=subprocess.DEVNULL,
+                             stderr=subprocess.DEVNULL)
+        except OSError:
+            pass
+
+    def reload_from_memory(self) -> None:
+        """设置窗统一刷新时会调它（状态页没有内存态，重探一次就够）。"""
+        self.reload()
+
+
+# ===========================================================================
 # 窗口
 # ===========================================================================
 class SettingsWindow(Gtk.Window):
     def __init__(self, qbar_path: Path | None = None, overrides_path: Path | None = None,
                  state_dir: Path | None = None):
-        super().__init__(title="Capslock+ 设置")
+        super().__init__(title="CapsPlus 管理器")
         self.set_default_size(960, 680)
 
         self.qbar_path = Path(qbar_path) if qbar_path else SC.CONFIG_PATH
@@ -127,12 +243,14 @@ class SettingsWindow(Gtk.Window):
         box.pack_start(self.statusbar, False, False, 0)
         self.add(box)
 
+        self.status_page = StatusPage(self)
         self.links_page = LinksPage(self)
         self.general_page = GeneralPage(self)
         self.mapping_page = MappingPage(self)
-        for title, page in (("快速链接", self.links_page), ("通用", self.general_page),
-                            ("按键映射", self.mapping_page)):
+        for title, page in (("状态", self.status_page), ("快速链接", self.links_page),
+                            ("通用", self.general_page), ("按键映射", self.mapping_page)):
             self.notebook.append_page(page, Gtk.Label(label=title))
+        # 打开就落在「状态」：它是总入口 —— 谁点开这个窗口，十有八九是某个键没反应。
         self.notebook.set_current_page(0)
 
         # 状态栏就绪之后才能报读取期发现的问题（放最开头会撞在未创建的控件上）
@@ -149,7 +267,7 @@ class SettingsWindow(Gtk.Window):
 
     # ------------------------------------------------------------------
     def status(self, text: str, color: str = GREY) -> None:
-        """三页共用一条状态栏：红=拦住了、黄=提醒、灰=说明、蓝=写成了。"""
+        """四页共用一条状态栏：红=拦住了、黄=提醒、灰=说明、蓝=写成了。"""
         self.statusbar.set_markup(markup(text or "", color))
         self.statusbar.set_tooltip_text(text or "")
 
@@ -165,7 +283,11 @@ class SettingsWindow(Gtk.Window):
         return True
 
     def refresh_all(self) -> None:
-        """改完一处三页都跟着变（第②页的下拉候选就是第①页的链接表）。"""
+        """改完一处三个配置页都跟着变（第②页的下拉候选就是第①页的链接表）。
+
+        状态页不在这里刷：它每次重探都要问 systemctl 与识别服务，
+        跟着每一次按键变化重跑会把窗口拖慢（它有自己的「重新检查」）。
+        """
         self.links_page.reload_from_memory()
         self.general_page.reload_from_memory()
         self.mapping_page.reload_from_memory()

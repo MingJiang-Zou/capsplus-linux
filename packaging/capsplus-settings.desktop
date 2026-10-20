@@ -1,14 +1,20 @@
-# 模板：@BIN_DIR@ / @REPO_DIR@ 由 install.sh 换成实际路径后装到 ~/.local/share/applications/
+# 模板：@BIN_DIR@ / @REPO_DIR@ 由 `capsplus install` 换成实际路径后装到 ~/.local/share/applications/
+# 应用菜单里**只留这一条**（2026-10-20 定）：它是入口的入口 ——
+# 打开就是「CapsPlus 管理器」窗口（状态 + 快速链接 + 通用 + 按键映射），
+# Qbar 也从这里开。原先另装的 capsplus-qbar.desktop 已退役，
+# 理由就是 2026-10-15 用户的原话「应用里面有两个」：条目越多越难找。
 [Desktop Entry]
 Type=Application
 Version=1.0
-Name=capsplus 设置
-Name[zh_CN]=capsplus 设置
-Comment=配置快速链接 / 网站内搜索 / 按键映射
-Comment[zh_CN]=配置快速链接 / 网站内搜索 / 按键映射
+Name=CapsPlus
+Name[zh_CN]=CapsPlus
+GenericName=Capslock+ 键位与效率工具
+GenericName[zh_CN]=Capslock+ 键位与效率工具
+Comment=键位映射 / 快速链接 / 截图 / 语音输入的总管理窗口（状态、一键修复、设置）
+Comment[zh_CN]=键位映射 / 快速链接 / 截图 / 语音输入的总管理窗口（状态、一键修复、设置）
 Exec=@BIN_DIR@/capsplus-settings
 Icon=@REPO_DIR@/assets/capsplus-on.svg
 Terminal=false
-Categories=Settings;
-Keywords=capsplus;settings;qbar;keyd;按键;快速链接;搜索;设置;
+Categories=Utility;Settings;
+Keywords=capsplus;settings;qbar;keyd;按键;快速链接;搜索;设置;截图;语音;
 StartupNotify=false

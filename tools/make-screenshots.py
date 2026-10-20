@@ -31,7 +31,12 @@ REPO = pathlib.Path(__file__).resolve().parent.parent
 OUT_DIR = REPO / "assets" / "screenshots"
 DEMO_QBAR = OUT_DIR / "demo-qbar.toml"
 NEUTRAL_BINDIR = "/opt/demo-bin"
+# 拍哪几页：**状态页（第 0 页）刻意不拍** —— 它显示的是本机真实状态，含
+# `~/.local/state/capsplus` 这类家目录路径，拍进 PNG 就等于把用户名画进公开仓库
+# （比 grep 得出来的文字泄漏更难防，见 docs/PRIVACY.md）。所以这里从第 1 页起拍。
+# 2026-10-20 加了状态页之后页序变了，这条一并改成"按页序从 1 开始"。
 PAGES = ("links", "general", "keys")
+FIRST_PAGE_INDEX = 1
 
 
 def refuse_real_desktop(backend: str, allow_wayland: bool) -> str:
@@ -103,8 +108,8 @@ def main(argv=None) -> int:
 
         pump(0.6)
         notebook = find(win, Gtk.Notebook)
-        for index, name in enumerate(PAGES):
-            notebook.set_current_page(index)
+        for offset, name in enumerate(PAGES):
+            notebook.set_current_page(FIRST_PAGE_INDEX + offset)
             pump(0.5)
             win.check_resize()
             pump(0.3)

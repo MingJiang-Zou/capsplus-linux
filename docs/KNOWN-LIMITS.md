@@ -102,8 +102,9 @@
 - **现象**：`_NET_WM_STATE_SKIP_TASKBAR` 是 X11/EWMH 的东西，Wayland 侧没有对应请求；
   GNOME 的活动概览/Dock 由合成器自己按 toplevel 列表决定，客户端拦不住。
 - **怎么验的**：起 Qbar 后看 Dock —— 图标会出现（这就是当时把 `.desktop` 条目删到只剩一条的背景）。
-- **结论**：**做不到，不是 bug**。本仓的做法是少装应用菜单条目（`install.sh` 里只装 Qbar + 设置两条，
-  托盘走 autostart），而不是靠 hint。
+- **结论**：**做不到，不是 bug**。本仓的做法是**只装一条**应用菜单条目、并把它做成总入口
+  （`capsplus install` 只装「CapsPlus」= 管理器；Qbar 那条已退役，托盘走 `capsplus.target`），
+  而不是靠 hint。
 
 ### 8. 合成按键送不进**刚起来**的 Wayland 原生窗口
 
@@ -170,7 +171,8 @@
   必须装 `ubuntu-appindicators@ubuntu.com` 扩展；扩展处于 INACTIVE 时图标不出现，
   但托盘进程还在跑（`~/.local/state/capsplus/tray.lock`）。
 - **怎么验的**：`gnome-extensions list --show-disabled` 看 `ubuntuappindicators@ubuntu.com` 的开关；
-  被禁掉时"应用菜单里的 capsplus 设置"是唯一不靠命令行的入口（所以 `install.sh` 特意装了那条 `.desktop`）。
+  被禁掉时"应用菜单里的「CapsPlus」"是唯一不靠命令行的入口（所以 `capsplus install` 装的那条
+  `.desktop` 是**必须**的，不是可有可无的装饰）。
 
 ---
 
@@ -298,7 +300,7 @@ r = searchParams.get("q")?.trim() ?? e.get("prompt")
    热重启 ⇒ 需要一次注销重登），外加开发 ~120 行 JS + Qbar 侧 ~15 行与 GNOME 升级的维护成本。
    **仓内实现（已写完）**：`extensions/raise-browser@capsplus.example/`（D-Bus **信号** `RaiseBrowser` / `Probe`；
    这台机的 GJS 没有 `export_object_path`、`register_object` 只剩 C 绑定 ⇒ 只能走信号）+ `tools/install-extension.sh`（复制进用户扩展目录并加进 `enabled-extensions`）+
-   `tools/verify-raise-browser.py`（**A/B 实测**：用 `Probe` 报的窗口数做差，+1 = 另起新窗、0 = 原窗口
+   `tools/ext-bench.sh`（隔离 headless shell 自检，不用重登）+ `tools/verify-raise-browser.py`（**A/B 实测**：用 `Probe` 报的窗口数做差，+1 = 另起新窗、0 = 原窗口
    开标签页 —— 不依赖人眼，绕开"Wayland 下我拿不到窗口"这个死结）。Qbar 侧由
    `[general] raise_browser`（默认 true）控制，调用超时 0.35s、失败静默跳过（实测扩展不在时 7ms 返回）。
    判据：`tests/test_raise_browser.py`。
@@ -324,6 +326,44 @@ r = searchParams.get("q")?.trim() ?? e.get("prompt")
 其余失败由扩展自己的 `console.error` 写进 journal；排查一律
 `journalctl --user --since '-10 min' | grep raise-browser`。
 另外：改过扩展代码后 `disable/enable` **不会重新 import**（状态卡在 ERROR），必须重登。
+
+### 扩展的部署 / 校验 / 自检：三件事分开管（2026-10-20）
+
+**为什么要把它们分开**：GNOME 生效只有一条路（注销重登），而"重登"被当成排查手段以后，
+每次改一行 `extension.js` 都要陪上一次会话重启 —— 明江的原话是「老是要重登 感觉也不好吧」。
+更糟的是登录时那一步 `cp` 会与 shell 扫描扩展目录撞车，读出**半截文件**：
+
+    gnome-shell: Extension raise-browser@capsplus.example:
+      TypeError: malformed UTF-8 character sequence at offset 8190
+
+（8190 ≈ 8192-2 = 一个汉字被切在两半。两份文件本身都合法，坏的只是那一刻的时序 ⇒
+扩展 import 失败 ⇒ 抓帧通道没有 ⇒ 按 `Caps+F1` 完全没反应，而**没有任何报错**。）
+所以现在的口径是「写入只在安装侧、登录只校验、自检不重登」：
+
+| 做什么 | 命令 | 会不会写文件 |
+| --- | --- | --- |
+| 部署 / 升级扩展 | `sh tools/install-extension.sh --sync`（= 无参默认，也 = `capsplus ext sync`） | 写。同目录临时名 + `rename` 原子落盘，**内容相同就一个字节都不写** |
+| 登录时体检 | unit `capsplus-extension-sync.service` → `install-extension.sh --verify --quiet` | **不写**。md5 比对 + 看在不在 `enabled-extensions` 里；不一致就报告 + 桌面通知 + 非 0 退出（红在面板上） |
+| 不重登自检 | `sh tools/ext-bench.sh`（= `capsplus ext bench`） | 不碰部署副本。隔离 headless shell 里验「真加载了 + 抓帧/贴图通道挂上了」，1~3 秒 |
+
+实测要点（别再自己发明）：
+
+* **自检只能认日志**：本机 gjs 的 `register_object` 是原始 C 绑定，扩展导出不了 D-Bus 对象 ⇒
+  隔离会话里 `gdbus … --method Probe` 报 UnknownMethod「对象在路径处不存在」。判词只认
+  `[raise-browser] ready capture=on pin=on …` 那行，以及「没有任何 `Extension <uuid>: …`」——
+  后者就是 shell 加载期报错的口径（实例：`Extension …: SyntaxError: unexpected token … :990:6`）。
+* **自检必须隔离**：`dbus-run-session` 起独立会话总线（headless shell 顺手激活的
+  nautilus / tracker / portal 全挂在临时总线上跟着收尸），只 `kill` 自己起的那个 pid
+  —— 绝不能 `pkill -f gnome-shell`，那杀的是明江正在用的会话。它抢不到 `wayland-0` 的 lock
+  时会自己退到 `wayland-1`，不影响真 compositor。
+* **自检 ≠ 生效**：它证明的是"仓里这份文件能被 shell 加载"，明江自己会话里跑的仍是旧代码。
+  所以最后一步仍是注销重登 —— 但那时已经**确定**新代码没问题，重登不再是排查。
+* **失败一定出声**：`Caps+F1` 是 keyd 的 `command(...)` 起的进程，stdout/stderr 落在 journal 里
+  没人看。抓帧超时 / 贴图失败 / 登录校验发现落后，除了 stderr 还会发桌面通知（GIO
+  `org.freedesktop.Notifications`，没有 gi 才退 `notify-send`），文案里带**能直接跑的那条命令**。
+  通知有三条闸：`CAPSPLUS_NOTIFY=0`、进程里已 import `unittest`（测试绝不弹）、stderr 是终端（人在看）。
+* `ext-bench.sh` 的退出码：0 绿 / 1 判据红 / 2 环境不齐（没有 gnome-shell、`dbus-run-session` 或
+  python3）。CI 不跑它（runner 没有图形栈），只跑 `sh -n` 与判词单测（`extcheck.bench_verdict`）。
 
 ### 发信号必须**跑主循环**，`sleep` 等于没发（2026-10-16 实测，代价最大的一条）
 
@@ -485,6 +525,56 @@ r = searchParams.get("q")?.trim() ?? e.get("prompt")
   焦点、无 activation token** 的 shell 里 `wl-copy --type image/png < 5.62MiB.png`：父进程毫秒级返回、
   **选区当场设成**（deskflow 日志 `sent clipboard size=5880052`）。⇒ `owner_rejected` 仍要报（那是
   运行期事实），但它**不是"必然发生"的预期**，别拿它当已知结论去解释别的现象。
+
+### 12. 一次录音能有多长、什么时候判停、句首留多少（2026-10-20 实测）
+
+这一节回答"语音输入几乎不可用、只可以是短语音、识别率有点低"里可量化的那部分。三个数
+（**20s / 700ms / 句首 150ms**）全是**客户端自己定的**，跟模型、跟服务端能力都无关 —— 这是本轮最要紧的一条。
+复现脚本在 `~/.dsh/work/20261020-voice-fix/`（`ab_pad.py` / `ab_pad2.py` / `ab_long.py`），
+判据在 `tests/test_voice_vad.py` 与 `tests/test_voice_levels.py`。
+
+- **20s 上限是自造的，服务端吃 60s**：同一段 59.52s 音频（sherpa 参考句 ×10、间隔 400ms —— 手头
+  没有真人 60 秒长句，这是替身，如实标注）分别按旧/新上限走完仓里这条链路，打本机 `:18090`：
+
+  | 上限 | 送出去的音频 | WAV 字节 | 服务往返（服务自报） | 识别字数 |
+  | --- | --- | --- | --- | --- |
+  | 旧 `MAX_MS=20000` | 20.01s | 640364 | 0.98s（973ms） | **44** |
+  | 新 `MAX_MS=60000` | 59.28s | 1897004 | 3.74s（3735ms） | **130** |
+
+  两次都 HTTP 200。⇒ "只能短语音"不是能力问题，是那个 20s。现在到上限也**不再静默**：`decoding`
+  事件、review 弹窗顶部、`voice.log` 的 `truncated …`、`status` 的「截断提示」四处同步。
+
+- **尾静音 700ms 正好卡在"换气"和"说完了"之间**：真机日志（`~/.local/state/capsplus/voice.log`
+  2026-10-20T18:44:00 / 18:44:09）采集 3s → 3 字、4 字，都是说到一半被 endpoint 掐掉；同一段话手动
+  收尾能录 12s → 47 字。中文一句话中间的停顿普遍 300~800ms。现在改成**自适应**：
+  `门槛 = min(2400ms, 1200ms + 每说满 1 秒 +100ms)`；判停时用的实际值记进 `VadResult.silence_hold_ms`
+  （`status` 的「能量门」行里是 `hold_ms=`）。上界 2400ms 管的是"说完半天不出字"；门槛在尾静音期间
+  **恒定**（`voiced_frames` 不再增长），不会出现"门槛一直在涨、永远追不上"的病态。
+
+- **句首 150ms 是丢首字的那一刀**：把参考音频裁成语音段送真服务，A/B 八种前置静音
+  （0/100/200/300/500/700/900/1200ms），看首字"开"在不在：
+
+  | 句首 pad | 丢首字 | 前置静音 ≥100ms 的那 7 组 |
+  | --- | --- | --- |
+  | 150ms（旧） | 6/8 | **5/7 丢** |
+  | 250ms | 3/8 | — |
+  | **300ms（新）** | **1/8** | **0/7 丢** |
+  | 400 / 500 / 800ms | 1/8 | 0/7 丢 |
+
+  300ms 是**拐点**：再大一个都不多救，只会多喂噪声。剩下那 1/8 是"按键的同时就开口"（前置静音 0），
+  段头本来就在 `speech_start` 里，pad 救不了 —— 属于第 10 条那个"张口就说"的场景。句尾 pad 单独取
+  250ms（盖住尾辅音），不必和句首一样长。
+
+- **电平：本机"说话太轻"不成立，所以默认不加增益**（`capsplus-voice meter [秒数]` 就是量这个的）：
+  参考真人音频整段 RMS=4330、峰值 27611（**已用 84% 量程**）；房间底噪 RMS 两次实测 11.8 / 11.5
+  （2026-10-17 记的是 19）。⇒ 任何 ≥1.2× 的增益都会削顶，而削顶比"声音小"更毁识别；反过来只要 8×
+  就能把 19 的底噪抬过 `GATE_FLOOR=150`（19×8=152），那时没说话也会出字。所以只提供**手工**
+  `CAPSPLUS_VOICE_GAIN`（夹在 1~4×），不开自动增益。每次送识别前的语音段 RMS/峰值/增益由
+  `voice_levels.Levels.describe()` 写进 `voice.log` 的 `voice_level …` 行与 `status` 的「电平增益」行。
+
+- **诊断留证**：`CAPSPLUS_VOICE_KEEP_LAST=1` 时把最近送识别的 WAV 留一份到状态目录
+  （`voice-last-<时间戳>.wav`，0600，最多 5 份，只清自己这个模式）。默认**不写** —— 那是用户说的话，
+  落盘要他点头。下次再抱怨"识别不准"，拿这份 wav 重跑 `POST /asr-upload` 就知道是音频问题还是模型问题。
 
 ---
 

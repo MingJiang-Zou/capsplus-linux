@@ -412,13 +412,29 @@ class TestSettingsWindow(unittest.TestCase):
             self.assertIn("wayland", disp.get_name().lower())
         self.assertTrue(display is None or True)
 
-    def test_three_pages_exist_with_the_right_titles(self):
+    def test_four_pages_exist_with_the_right_titles(self):
+        """四页：状态在最前（2026-10-20 起它是总入口 —— 打开窗口就是来看"哪个键没反应"的）。"""
         labels = [self.window.notebook.get_tab_label(self.window.notebook.get_nth_page(i))
                   .get_text() for i in range(self.window.notebook.get_n_pages())]
-        self.assertEqual(labels, ["快速链接", "通用", "按键映射"])
+        self.assertEqual(labels, ["状态", "快速链接", "通用", "按键映射"])
         self.assertIsInstance(self.window.links_page, self.app_module.LinksPage)
         self.assertIsInstance(self.window.general_page, self.app_module.GeneralPage)
         self.assertIsInstance(self.window.mapping_page, self.app_module.MappingPage)
+
+    def test_status_page_is_the_landing_page_and_says_something(self):
+        """状态页必须真建出来、并且一打开就落在它上面。
+
+        判据只看两件**确定性**的事（探测是后台线程、不能靠等）：
+          ① 当前页是第 0 页 = 「状态」；
+          ② 文本缓冲一开始就有字（`reload()` 会先写"检查中……"再起线程）。
+        至于探测结果对不对，那是 `capsplus.cli` 的判据（tests/test_cli_install.py）管的，
+        这里重复断言一遍只会变成"窗口一改就假红"。
+        """
+        self.assertEqual(self.window.notebook.get_current_page(), 0)
+        buf = self.window.status_page.view.get_buffer()
+        text = buf.get_text(buf.get_start_iter(), buf.get_end_iter(), False)
+        self.assertTrue(text.strip(), "状态页打开是空的 —— reload() 没跑？")
+        self.assertIn("检查中", text)
 
     # ------------------------------------------------------------------
     # 第①页

@@ -3,7 +3,14 @@
 # Copyright (c) 2026 capsplus-linux contributors
 # 本文件属 capsplus-linux —— CapsLock+ v3.3.0 的 Linux 移植（衍生作品）；按键映射数据译自上游：
 #   上游 https://github.com/wo52616111/capslock-plus （GPL-2.0，© wo52616111）；改动见 README「许可与上游」。
-"""capsplus CLI 入口：render / apply / status。"""
+"""capsplus CLI 入口 —— 全项目的**唯一**命令入口。
+
+2026-10-20 之前这里只转发 render/apply/status，装机与启停散在 install.sh、tools/*.sh、
+systemd unit 与 autostart 好几处。现在分发在 `capsplus/cli.py`：
+    capsplus status / doctor / install / uninstall / up / down / restart /
+             render / apply / ext / voice / shot / qbar / settings / tray / logs / test
+用法一律 `capsplus help`。
+"""
 import os
 import sys
 
@@ -11,7 +18,7 @@ REPO = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
 if REPO not in sys.path:
     sys.path.insert(0, REPO)
 
-from capsplus.apply import main  # noqa: E402
+from capsplus.cli import main  # noqa: E402
 
 if __name__ == "__main__":
     raise SystemExit(main(sys.argv[1:]))
