@@ -153,7 +153,7 @@ def static_violations(source: str) -> list[str]:
 
 
 # ── 反例具型：修前（2026-10-17 之前）的错误代码，摘其形状、语义原样 ──────────────
-# 这就是明江真机上弹「无响应」的那份实现；喂给 static_violations 必须变红，
+# 这就是用户真机上弹「无响应」的那份实现；喂给 static_violations 必须变红，
 # 否则上面的检查器就是永远绿的空门。
 BROKEN_SNIPPET = '''
 class Session:
@@ -523,7 +523,7 @@ class TestReviewRunsOnMainThread(unittest.TestCase):
         """判据 A 本体：Enter → commit → 窗口销毁**并且时间线里出现焦点交出的事实** → 注入。
 
         2026-10-17 改口径：原来这条只断言"隔了 ≥100ms"，那只是"过了那么久"，不说明焦点
-        给了谁 —— 明江真机看到的"贴上又被删"就是从这种假绿里漏过去的。现在断言的是**顺序**：
+        给了谁 —— 用户真机看到的"贴上又被删"就是从这种假绿里漏过去的。现在断言的是**顺序**：
         时间线里 `unmap`/`focus_out` 至少一条，且它发生在注入之前。
         """
         from capsplus import voice_worker as W

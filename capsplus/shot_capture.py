@@ -117,7 +117,7 @@ def capture(x: int, y: int, w: int, h: int, out_path, *, timeout_ms: int = SF.CA
 def command_clear_pins(args, deps=None) -> int:
     """`Caps+Esc` 的活儿：清空所有贴图。
 
-    为什么要它（2026-10-19 明江「贴出来的图 删都删不掉」）：贴图是 shell 的图层 actor，
+    为什么要它（2026-10-19 用户「贴出来的图 删都删不掉」）：贴图是 shell 的图层 actor，
     只有 shell 能销毁；而"点某张图上的 ×""右键菜单""Esc（拿到焦点后）"都在那张图上 ——
     万一哪条不好使，得有**不看光标在哪**的全局兜底。这条走的就是已有的 D-Bus 信号通道。
     """
@@ -228,7 +228,7 @@ def _region_flow(args, deps, monitors, freeze_fn, select, annotate_fn, providers
 
 
 def command_annotate(args, deps=None) -> int:
-    """对一张已有的图开标注窗（第 3 步的独立入口，方便明江单独验这件事）。"""
+    """对一张已有的图开标注窗（第 3 步的独立入口，方便用户单独验这件事）。"""
     deps = deps or {}
     annotate_fn = deps.get("annotate") or _default_annotate
     pin_fn = deps.get("pin")

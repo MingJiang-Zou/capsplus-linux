@@ -5,7 +5,7 @@
 #   上游 https://github.com/wo52616111/capslock-plus （GPL-2.0，© wo52616111）；改动见 README「许可与上游」。
 """选区遮罩（第二批 P0 重写）：**冻结帧当背景** + 全局坐标选区（可跨屏）+ 贴边吸附。
 
-为什么重写（2026-10-19 明江真机：「框选的时候全黑屏是盲选，而且貌似无法全屏选择」）：
+为什么重写（2026-10-19 用户真机：「框选的时候全黑屏是盲选，而且貌似无法全屏选择」）：
 旧版是"全屏半透明窗 + 压暗 + 指望合成器把桌面透出来"。Wayland 下拿不到 ARGB 表面时那层
 "透明"就是**全黑** ⇒ 盲选；而 xvfb 里（X11 有 ARGB 视觉）**永远复现不了**，所以当时的像素判据
 全绿。现在：窗口背景 = **该屏的冻结图**（`capsplus/shot_frames.py` 抓的），**不透明**，
@@ -18,7 +18,7 @@
     所以旧版那套"藏窗 → settle → 再抓一帧"整段删掉了 —— 那个 settle 正是为了躲自己的遮罩，
     现在结构上不存在这个问题。
 
-**绝不闪**（明江换掉 Snipaste 就是因为闪）：本文件没有一处动画。判据
+**绝不闪**（用户换掉 Snipaste 就是因为闪）：本文件没有一处动画。判据
 （`tests/test_shot_overlay.py::TestNoAnimation`）在扫这件事。
 
 顶层**不 import gi / cairo**（CI 不装 PyGObject 与 pycairo）：两边都在 `_gtk()` / `_cairo()` 里懒加载。
@@ -62,7 +62,7 @@ def key_action(keyval_name: str, ctrl: bool = False):
     """键盘 → 动作。Esc 取消、Enter 确认、Ctrl+A 全选；其余不处理。
 
     ⚠ 刻意**不占用 Esc 之外的任何字母键**：遮罩窗会短暂持有键盘焦点，
-    抢键等于偷明江的输入（`Caps+Esc` 那种"一不小心全关掉"的热键留在 keyd 侧，见贴图那条）。
+    抢键等于偷用户的输入（`Caps+Esc` 那种"一不小心全关掉"的热键留在 keyd 侧，见贴图那条）。
     """
     if keyval_name == "Escape":
         return ACTION_CANCEL
@@ -73,13 +73,13 @@ def key_action(keyval_name: str, ctrl: bool = False):
     if keyval_name in ("Up", "Down", "Left", "Right"):
         return ACTION_NUDGE                  # 方向键微调选区（1px；Shift=10px）
     if keyval_name.lower() == "c":
-        # 提取颜色（明江 2026-10-20 要的）：复制光标下那一个像素的 `#RRGGBB`。
+        # 提取颜色（用户 2026-10-20 要的）：复制光标下那一个像素的 `#RRGGBB`。
         # 只占 `C` **一个字母键**，且只在遮罩窗这几秒里有意义 —— 不碰别的键。
         return ACTION_COPY_COLOUR
     return None
 
 
-# 放大镜（明江："从冻结帧取样，光标旁 80×80 + 坐标；我们已经有冻结帧，这个很便宜"）
+# 放大镜（用户："从冻结帧取样，光标旁 80×80 + 坐标；我们已经有冻结帧，这个很便宜"）
 MAG_SIZE = 80
 MAG_ZOOM = 4
 MAG_GAP = 16
@@ -187,7 +187,7 @@ def draw_colour_readout(cr, xy, rgb, area, size=(104, 26)) -> tuple:
     # ⚠ 这里原来有一行 `cr.flush()` —— pycairo 的 `cairo.Context` **没有** flush 方法
     #   （只有 `cairo.Surface.flush()`；本文件另外两处 flush 都打在 Surface 上，是对的）。
     #   后果不是"这次没刷出去"，而是 **paint 处理器每帧抛 AttributeError**：
-    #   遮罩画不出十字线/读数，框选看起来"完全没反应"（2026-10-20 明江真机报"截图有问题"、
+    #   遮罩画不出十字线/读数，框选看起来"完全没反应"（2026-10-20 用户真机报"截图有问题"、
     #   两次 Caps+F1 后只能去开 Snipaste）。删掉即可：GTK 的 draw 回调由 toolkit 自己提交。
     return (x, y, w, h)
 
@@ -480,7 +480,7 @@ def paint(cr, area, rect, frame=None, hint: bool = True, crosshair=None, handles
 # 实测（xvfb 复现 lead 的真机数字）：
 #   ① `realize()` → `fullscreen_on_monitor()` → `show_all()`  ⇒ device **200×200**
 #      （200×200 是 GTK toplevel 的默认尺寸；mutter 把这张 stale 缓冲**拉伸铺满整块屏**，
-#       于是"整屏纯黑 / 一块矩形、看不到画面"——正是明江看到的现象）
+#       于是"整屏纯黑 / 一块矩形、看不到画面"——正是用户看到的现象）
 #   ② `set_default_size(mon_w, mon_h)` → `fullscreen_on_monitor()` → `show_all()` ⇒ device 1600×900 ✓
 # 所以：**先给尺寸，再全屏，最后显示**；并且不要提前 `realize()`。
 OVERLAY_MIN_SETTLE = 150          # map 之后等一小会儿再量尺寸（合成器要一帧提交）
@@ -758,7 +758,7 @@ class Overlay:
         性能体检（2026-10-20 实测，本机同图）：
           * 每帧把 2560×1440 的源缩到 1920×1080：**p50 32.1 ms / p95 33.0 ms**（一帧就超 60Hz 两倍）
           * 预缩放一次、之后只做同尺寸 `set_source_surface` + `paint()`：**p50 0.76 ms / p95 0.82 ms**
-          ⇒ 快 **~42×**。明江说的"框选特别卡"主要就是这条：拖选区时每次都要整幅重画 + 每帧重新缩放。
+          ⇒ 快 **~42×**。用户说的"框选特别卡"主要就是这条：拖选区时每次都要整幅重画 + 每帧重新缩放。
         缓存键带 `area` 与帧对象 id（换帧/换窗口尺寸就重做），且**只留最新一份**（别把每块屏的图攒着）。
         """
         if frame is None:
@@ -841,7 +841,7 @@ class Overlay:
               crosshair=crosshair, magnifier=magnifier, colour=colour)
         # ⚠ **必须 return True**（2026-10-19 真机事故）：`GtkWidget::draw` 的默认处理器跑在自定义
         # 处理器**之后**，会把控件自己的主题背景刷在我们的画上面 —— 表现就是"三个窗口尺寸都对，
-        # 屏幕上却是整块纯白"（Adwaita 的 #fafafa ≈ 250；明江看到纯白、我抓屏读数也是均匀 250，
+        # 屏幕上却是整块纯白"（Adwaita 的 #fafafa ≈ 250；用户看到纯白、我抓屏读数也是均匀 250，
         # 两者一致）。返回 True = 停止信号发射 ⇒ 默认背景不再覆盖。
         # 反例：删掉这一行 → `tests/test_shot_overlay.TestWindowsBackgroundNotOverpaint` 必红
         #（那条判据必须用真 `Gtk.Window`；`Gtk.DrawingArea` 本来就没背景，测不出来，会假绿）。
@@ -857,7 +857,7 @@ class Overlay:
     def _on_motion_event(self, _widget, event, idx):
         """鼠标移动：**指针动就重画**（不按键也要跟手）。
 
-        2026-10-20 真机事故（明江："十字线不跟鼠标走、要按着拖才跟"）：上一批的"性能体检 B3"
+        2026-10-20 真机事故（用户："十字线不跟鼠标走、要按着拖才跟"）：上一批的"性能体检 B3"
         把这里改成对 GdkWindow 调 **子区域** `invalidate_rect(dirty, False)` —— 而 GTK3 对
         **直接打在 GdkWindow 上的子区域失效不发 `draw` 信号**（只有整幅 `invalidate_rect(None,…)`
         才发）。于是第一次移动走"整幅"那条路（画得出来），之后每次移动都走脏矩形那条路 ⇒

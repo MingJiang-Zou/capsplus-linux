@@ -6,7 +6,7 @@
  * 贴图（pin）的样式。**这个文件以前不存在** —— 而 extension.js 里早就在用
  * `capsplus-pin` / `capsplus-pin-close` / `capsplus-pin-box` 三个 class（2026-10-19 主代理查证）。
  * 没有样式表 = 那些 class 一个都不生效：`×` 是裸 `St.Button`，没尺寸、没背景、没 hover 反馈，
- * 明江的原话就是"贴出来的图 删都删不掉"（看不出那儿能点）。
+ * 用户的原话就是"贴出来的图 删都删不掉"（看不出那儿能点）。
  *
  * GNOME 会把扩展目录下的同名 `stylesheet.css` 自动加载（不用在 metadata.json 里声明，也不用 reload）；
  * 改这个文件之后 `gnome-extensions disable/enable <uuid>` 即生效（不需要注销重登）。
@@ -21,7 +21,7 @@
     box-shadow: 0 6px 20px rgba(0, 0, 0, 0.55);
 }
 
-/* 拿到键盘焦点（点/拖之后）时的反馈：明江要能看出"键现在归它" */
+/* 拿到键盘焦点（点/拖之后）时的反馈：用户要能看出"键现在归它" */
 .capsplus-pin-box.capsplus-pin-active {
     border: 1px solid rgba(90, 200, 255, 0.95);
     box-shadow: 0 0 0 1px rgba(90, 200, 255, 0.65), 0 6px 22px rgba(0, 0, 0, 0.6);

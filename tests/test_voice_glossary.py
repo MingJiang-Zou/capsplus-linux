@@ -128,7 +128,7 @@ class TestLoadAndEnv(unittest.TestCase):
     def test_user_table_overrides_the_builtin_key(self):
         user = G.user_path()
         if user.exists():
-            self.skipTest(f"本机真有用户表 {user}，这条会动到明江的东西")
+            self.skipTest(f"本机真有用户表 {user}，这条会动到用户的东西")
         with mock.patch.object(G, "user_path", return_value=table(self._tmp.name, "帮晒\t我的写法\n")):
             os.environ[G.ENV] = ""
             g = G.load()

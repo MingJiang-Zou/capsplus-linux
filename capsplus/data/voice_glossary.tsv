@@ -12,7 +12,7 @@
 #
 # ⚠ 下面四条来自 2026-10-07 的同模型实测（SenseVoice int8 转写 B 站音频时的系统性错字，
 #   出处 ~/.dsh/memories/echo/experience.md「bilibili 字幕 asr sensevoice」那条）。
-#   其余留空 —— 明江自己的专名（型号、项目名）Echo 手上没有实测到的错法，
+#   其余留空 —— 用户自己的专名（型号、项目名）Echo 手上没有实测到的错法，
 #   编条目等于往识别结果里注入没发生过的错，**不许编**。以后真机遇到就往这里加一条。
 帮晒	Bonsai
 邦晒	Bonsai

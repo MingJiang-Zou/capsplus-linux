@@ -4,7 +4,7 @@
 #   上游 https://github.com/wo52616111/capslock-plus （GPL-2.0，© wo52616111）；改动见 README「许可与上游」。
 """部署**之前**的预检：把坏文件挡在登录之外（`tools/preflight-extension.sh` 的嘴）。
 
-为什么要有这一层（2026-10-20 真事故，明江那天因此重登 3 次）：
+为什么要有这一层（2026-10-20 真事故，用户那天因此重登 3 次）：
   扩展目录里出现过**半截文件** —— 登录同步脚本与 gnome-shell 抢同一个文件，shell 读到了
   拷贝到一半的 extension.js：
     gnome-shell: Extension raise-browser@capsplus.example:

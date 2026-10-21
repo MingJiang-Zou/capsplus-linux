@@ -8,7 +8,7 @@
     `capsplus/shot_overlay.py` 的 `draw_colour_readout()` 里有一行 `cr.flush()` —— pycairo 的
     `cairo.Context` **没有** flush（只有 `cairo.Surface.flush()`）。后果不是"这次没刷出去"，
     而是 **GTK 的 draw 回调每帧抛 AttributeError**：遮罩画不出十字线/取色读数，框选看着"完全没反应"
-    （明江两次 Caps+F1 后只能去开 Snipaste；热修 `613cd5d`）。
+    （用户两次 Caps+F1 后只能去开 Snipaste；热修 `613cd5d`）。
     当时 1224 条判据**全绿** —— 因为没有任何一条走过"带颜色、带指针"的真实绘制路径：
     取色读数只在 `crosshair is not None and colour is not None` 时才画，而既有像素用例
     （`test_shot_overlay.TestFrozenBackgroundIsTheContent` 等）只喂 `frame`/`rect`，`colour` 一律 None。

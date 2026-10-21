@@ -18,7 +18,7 @@ CTC-ish 结构，热词要靠 `sherpa-onnx` 的 transducer + `hotwords-file` 那
 2. **ASCII 键要求词边界**：`JSQ` 不许命中 `JSQX` 或 `xJSQy`。中文键没有词边界可言
    （中文不写空格），所以改用另一条：**中文键不得短于 2 个字** —— 单字键会命中一切，
    等于把这份表变成一台随机改写机。
-3. **表是数据不是代码**：内置表在 `capsplus/data/voice_glossary.tsv`，明江自己那份放
+3. **表是数据不是代码**：内置表在 `capsplus/data/voice_glossary.tsv`，用户自己那份放
    `~/.local/share/capsplus/voice_glossary.tsv`（XDG 数据目录；本仓**不许**往
    `~/.config/capsplus/` 写东西）。同名的键以用户表为准。
 
@@ -37,7 +37,7 @@ from pathlib import Path
 ENV = "CAPSPLUS_VOICE_GLOSSARY"
 OFF_VALUES = ("0", "off", "none", "no", "false")
 BUILTIN_RELPATH = ("capsplus", "data", "voice_glossary.tsv")
-# 明江自己那份。**不是** ~/.config/capsplus：那个目录在本项目里是禁碰区。
+# 用户自己那份。**不是** ~/.config/capsplus：那个目录在本项目里是禁碰区。
 USER_SUBPATH = ("capsplus", "voice_glossary.tsv")
 
 # 键长度下限。中文键 1 个字 = 命中一切；ASCII 键 1 个字符同理（`a` 会命中所有 a）。
@@ -122,7 +122,7 @@ def parse_tsv(content: str) -> list[tuple[str, str]]:
 
 
 def user_path() -> Path:
-    """明江那份表的位置（`XDG_DATA_HOME` 认的话跟着它走）。"""
+    """用户那份表的位置（`XDG_DATA_HOME` 认的话跟着它走）。"""
     base = os.environ.get("XDG_DATA_HOME") or (Path.home() / ".local" / "share")
     return Path(base).joinpath(*USER_SUBPATH)
 

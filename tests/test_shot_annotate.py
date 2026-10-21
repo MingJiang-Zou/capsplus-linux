@@ -9,7 +9,7 @@
 这样换一个实现（比如以后改用 PIL）也得先满足同一条口径。
 
 两条不许踩的红线（判据直接扫源码）：
-  * 界面判据不许动明江的剪贴板 ⇒ `Annotator` 的复制走注入的 `clip`，测试里给 stub；
+  * 界面判据不许动用户的剪贴板 ⇒ `Annotator` 的复制走注入的 `clip`，测试里给 stub；
   * 标注窗不许动画（`ease`/`set_opacity`/`transition`），与遮罩同一条口径。
 """
 
@@ -111,7 +111,7 @@ def desktop_risk() -> str:
     """GDK 连上的到底是不是**真实 Wayland 桌面**：是、又没显式授权，就别跑界面用例。
 
     口径与 `tests/test_settings_window.py` / `tests/test_shot_overlay.py` 一致：
-    这台机是明江干活的机器，判据不许把窗口弹到他屏幕上（`CAPSPLUS_WAYLAND=1` 才放行）。
+    这台机是用户干活的机器，判据不许把窗口弹到他屏幕上（`CAPSPLUS_WAYLAND=1` 才放行）。
     """
     if not RUN_GUI:
         return "没设 CAPSPLUS_GUI=1"
@@ -520,7 +520,7 @@ class TestKeyRoster(unittest.TestCase):
         self.assertEqual(AN.key_command("y", ctrl=True), AN.ACTION_REDO)
 
     def test_enter_means_copy_and_close_here(self):
-        """回车 = 复制并关（明江要的 Snipaste 手感）。
+        """回车 = 复制并关（用户要的 Snipaste 手感）。
 
         ⚠ 口径变更（第三批）：第一批"回车留给选区确认"说的是**遮罩**那条链路
         （`shot_overlay.key_action("Return")` 仍然是 `confirm`）；标注窗里回车改成"复制并关"，
@@ -636,7 +636,7 @@ class TestTextActionsDoNotFreezeTheWindow(unittest.TestCase):
     """F2/F4 不能冻住界面：有主循环时必须走后台线程，结果回主线程再碰界面。
 
     为什么要这条：本机 27B 翻译实测 1 秒起、百度 OCR 三百多毫秒 —— 同步跑等于窗子卡死，
-    而"卡住"在截图工具里是最容易被骂的体验（明江换掉 Snipaste 就是因为闪）。
+    而"卡住"在截图工具里是最容易被骂的体验（用户换掉 Snipaste 就是因为闪）。
     """
 
     def setUp(self):
@@ -825,7 +825,7 @@ class TestNewToolbarAndEditing(unittest.TestCase):
         self.assertEqual(len(flat), len(set(flat)), "同一个工具出现在两个组里了")
 
     def test_action_groups_are_split_left_and_right(self):
-        """撤销重做在最左、复制/存盘/贴图/关闭在最右，且**没有重复**（明江："别再顶栏底栏各一套"）。"""
+        """撤销重做在最左、复制/存盘/贴图/关闭在最右，且**没有重复**（用户："别再顶栏底栏各一套"）。"""
         self.assertEqual(tuple(AN.EDIT_ACTIONS), (AN.ACTION_UNDO, AN.ACTION_REDO))
         self.assertEqual(tuple(AN.ACTION_GROUP),
                          (AN.ACTION_COPY, AN.ACTION_SAVE, AN.ACTION_PIN, AN.ACTION_CLOSE))
@@ -841,7 +841,7 @@ class TestNewToolbarAndEditing(unittest.TestCase):
         self.assertTrue(all(labels))
 
     def test_bar_never_covers_the_image_when_there_is_room(self):
-        """有留白可用时工具条**必须**在图像外（明江："贴近选区但不遮挡"）。"""
+        """有留白可用时工具条**必须**在图像外（用户："贴近选区但不遮挡"）。"""
         screen = (1920, 1080)
         for image in ((400, 200), (1920, 1080), (4800, 1080), (120, 90)):
             with self.subTest(image=image):
@@ -885,7 +885,7 @@ class TestNewToolbarAndEditing(unittest.TestCase):
         bar = AN.bar_layout(plan["canvas"], (bar_w, 46), plan["window"])
         self.assertGreaterEqual(bar["x"], 0, "工具条左端出界了")
         self.assertLessEqual(bar["x"] + bar_w, plan["window"][0],
-                             f"工具条右端越出窗口（就是明江看到的那条切边）：{bar}")
+                             f"工具条右端越出窗口（就是用户看到的那条切边）：{bar}")
         self.assertFalse(AN.bar_overlaps_image({**bar, "w": bar_w, "h": 46}, plan["canvas"]),
                          "变宽之后工具条还得在图像外面")
 
@@ -1088,7 +1088,7 @@ class TestNewToolbarAndEditing(unittest.TestCase):
         self.assertEqual(shape.rect[:2], (10, 10), "外接矩形跟着点集走")
 
     def test_selection_is_drawn_with_handles_and_hover_outline(self):
-        """选中/悬停必须在**画出来的像素**上看得见（明江："没有描边和手柄，看不出可编辑"）。"""
+        """选中/悬停必须在**画出来的像素**上看得见（用户："没有描边和手柄，看不出可编辑"）。"""
         base = white_surface(200, 120)
         shape = AN.Shape("rect", (40, 30, 60, 40), color=(0.9, 0.1, 0.1, 1.0))
         plain = AN.render_to_surface(base, [shape])
@@ -1139,7 +1139,7 @@ class TestNewToolbarAndEditing(unittest.TestCase):
 class TestClippingToTheScreenshotRect(unittest.TestCase):
     """**落笔裁到截图范围内**（lead 第五刀）：留白区不许落笔，导出只导出截图矩形。
 
-    明江看图时说"1 号圆圈与黄箭头跑到白色截图框外了" —— 一半是渲染脚本的 demo 画得不对，
+    用户看图时说"1 号圆圈与黄箭头跑到白色截图框外了" —— 一半是渲染脚本的 demo 画得不对，
     一半是产品行为没定死：画布留白区当时真的能落笔。
     """
 
@@ -1483,7 +1483,7 @@ class TestRealWindow(unittest.TestCase):
         self.assertEqual(state["text"], "识别到的文字")
 
     def test_window_has_the_new_toolbar_layout(self):
-        """真窗口里核对新布局（明江："太丑、易用性有待提高" 那一批的**结构**判据）。
+        """真窗口里核对新布局（用户："太丑、易用性有待提高" 那一批的**结构**判据）。
 
         ⚠ 两条踩过的坑，别再犯：
           1. **所有碰控件的检查必须在 `destroy()` 之前做完** —— 控件销毁后再 `get_image()` /
@@ -1587,7 +1587,7 @@ class TestRealWindow(unittest.TestCase):
                         "线宽圆点缺样式，或选中态没走同一个 cp-active")
         self.assertEqual(state["actions"], sorted(AN.ACTION_GROUP + AN.EDIT_ACTIONS),
                          "动作区必须含撤销重做 + 复制/存盘/贴图/关闭，且各一次")
-        self.assertTrue(state["primary_class"], "复制要是主按钮（明江要的「主次分明」）")
+        self.assertTrue(state["primary_class"], "复制要是主按钮（用户要的「主次分明」）")
         self.assertEqual(state["missing_icons"], [], "这些动作按钮没有图标")
         blank = {n: ink for n, ink in state["blank_icons"].items() if ink < 20}
         self.assertEqual(blank, {}, f"这些动作按钮的图标是空的（渲染出来是个空方块）：{blank}")
@@ -1613,7 +1613,7 @@ class TestRealWindow(unittest.TestCase):
 class TestPanelCopyGoesThroughWlCopy(unittest.TestCase):
     """判据：结果面板那个「复制」按钮**真的把文字送出去了**，而且走的是能活过退出的那条路。
 
-    2026-10-20 明江真机报"翻译 / OCR 的文本点复制按钮复制不出来"。根因不是剪贴板工具坏了，是那行代码用了
+    2026-10-20 用户真机报"翻译 / OCR 的文本点复制按钮复制不出来"。根因不是剪贴板工具坏了，是那行代码用了
     **GTK4** 的 `Gdk.Display.get_clipboard()` —— GTK3 的 `Gdk.Display` 上没有这个方法（真机实测
     `AttributeError: 'GdkWaylandDisplay' object has no attribute 'get_clipboard'`），异常抛在
     GTK 信号处理器里、stderr 落在 keyd 热键那条没人看的路径上 ⇒ 现象就是"点了完全没反应"。
@@ -1682,7 +1682,7 @@ if __name__ == "__main__":
 class TestDaemonStyleSubprocesses(unittest.TestCase):
     """**守护型命令不许用 `capture_output` 等管道 EOF**（2026-10-19 真机事故）。
 
-    明江："我多按几次 Ctrl+C 程序就会异常"。根因：`wl-copy` 会 fork 一个长期存活的"留守者"，
+    用户："我多按几次 Ctrl+C 程序就会异常"。根因：`wl-copy` 会 fork 一个长期存活的"留守者"，
     它 **stderr 原样继承** ⇒ `capture_output=True` 等于等一条永不 EOF 的管道 ⇒ 每次复制卡满
     5 秒 timeout（主线程被冻住），连按几次就堆成"程序异常"。
 
@@ -1726,7 +1726,7 @@ class TestDaemonStyleSubprocesses(unittest.TestCase):
           * 形状 —— 上面那条断言真命令还是 `wl-copy --type image/png`；
           * 行为 —— 命令换成**等价形状的 stub**（`sh -c 'sleep 3 & exit 0'`：父进程立刻退、留守者抱着
             stderr），端到端跑一遍 `copy_to_clipboard`。不需要显示服务器、也不需要真装 wl-copy，
-            更不会像老版那样在真桌面上把明江的剪贴板塞进一张 PNG。
+            更不会像老版那样在真桌面上把用户的剪贴板塞进一张 PNG。
         runner 要是又回到 `capture_output=True`，留守者会抱住那条永不 EOF 的管子 ⇒ 这里就慢过 1 秒 = 红。
         """
         stub = ["sh", "-c", "sleep 3 & exit 0"]
@@ -1807,7 +1807,7 @@ if __name__ == "__main__":
 class TestArrowAndLineEndpoints(unittest.TestCase):
     """箭头/直线的**起点与终点必须就是按下的点与抬起的点**（2026-10-20 真机 P0）。
 
-    明江原话：「标注箭头和直线的时候有 bug，在点击拖动添加箭头的时候，**箭头的起始点会到处跑
+    用户原话：「标注箭头和直线的时候有 bug，在点击拖动添加箭头的时候，**箭头的起始点会到处跑
     （和鼠标移动方向关联）**，**箭头的终点反而不会 y 轴移动**」。
 
     实测根因（先复现、后定位）：`drag()` 用 `normalize_rect(A, B)` 落地成一个**正宽高**矩形，
@@ -2019,7 +2019,7 @@ class TestEyedropperPicksExactPixels(unittest.TestCase):
 class TestNarrowWindowInARealWindow(unittest.TestCase):
     """② 的**真窗口**判据：260×420 的窄图，窗口与工具条的**实际分配**都要装得下。
 
-    真机复现命令（明江给的，留在这里好复算）：
+    真机复现命令（用户给的，留在这里好复算）：
         python3 -c "from PIL import Image; Image.new('RGB',(260,420),(240,240,245)).save('/tmp/narrow.png')"
         capsplus-shot --annotate /tmp/narrow.png
     修前：窗口 288×510、工具条 1012px ⇒ 右端（颜色圆点那排）越出窗口被切掉。
@@ -2073,7 +2073,7 @@ class TestNarrowWindowInARealWindow(unittest.TestCase):
         x, _y, width, _h = state["alloc"]
         self.assertGreaterEqual(x, 0, "工具条左端出界")
         self.assertLessEqual(x + width, state["win"][0],
-                             f"工具条右端越出窗口 —— 正是明江看到的那条切边：{state['alloc']}")
+                             f"工具条右端越出窗口 —— 正是用户看到的那条切边：{state['alloc']}")
         self.assertGreaterEqual(width, state["bar_w"] - 4,
                                 f"工具条被压窄了：{state['alloc']} vs 固有 {state['bar_w']}px")
         bar = {**state["layout"], "w": state["bar_w"], "h": 46}
@@ -2084,7 +2084,7 @@ class TestNarrowWindowInARealWindow(unittest.TestCase):
 class TestToolbarTipsAndStatusInARealWindow(unittest.TestCase):
     """④ 在**真窗口**里逐按钮核对"是什么 + 快捷键"，并核对状态栏跟着走（2026-10-20）。
 
-    明江："工具栏有几个按钮不知道什么意思" —— 纯函数那几条只证明表是对的，这条证明**按钮上真挂上了**、
+    用户："工具栏有几个按钮不知道什么意思" —— 纯函数那几条只证明表是对的，这条证明**按钮上真挂上了**、
     悬停/按键之后**状态栏真变了**。
     """
 

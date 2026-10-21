@@ -4,7 +4,7 @@
 #   上游 https://github.com/wo52616111/capslock-plus （GPL-2.0，© wo52616111）；改动见 README「许可与上游」。
 """判据：选区遮罩（第二批 P0 重写版）—— **背景必须是冻结图**、选区跨屏、整屏捷径、贴边吸附。
 
-这一版为什么重写（2026-10-19 明江真机「框选的时候全黑屏是盲选」）：
+这一版为什么重写（2026-10-19 用户真机「框选的时候全黑屏是盲选」）：
 旧版是「全屏半透明窗 + 压暗 + 指望合成器把桌面透出来」，Wayland 下拿不到 ARGB 就是**全黑**，
 而 xvfb（X11 有 ARGB 视觉）**永远复现不了** —— 当时那批像素判据全绿却拦不住真机 bug。
 
@@ -12,10 +12,10 @@
   * `TestFrozenBackgroundIsTheContent`：拿一张**有图案的假冻结图**当背景，断言「选区里能看到图案」
     —— 拦的是「背景不是冻结图」（透明、纯色、纯黑都会红）；
   * `TestNoTransparencyReliance`：再补一条「整块画布每个像素都不透明」，把病根直接焊死；
-  * `TestNoAnimation`：不闪（明江换掉 Snipaste 就是因为闪）—— 扫源码里不许出现动画 API。
+  * `TestNoAnimation`：不闪（用户换掉 Snipaste 就是因为闪）—— 扫源码里不许出现动画 API。
 
 GUI 用例默认 skip：`CAPSPLUS_GUI=1` 才跑，且 GDK 连到**真实 Wayland 桌面**时整类拒跑
-（`CAPSPLUS_WAYLAND=1` 才放行）—— 这台机是明江干活的机器，不许判据把窗口弹到他屏幕上。
+（`CAPSPLUS_WAYLAND=1` 才放行）—— 这台机是用户干活的机器，不许判据把窗口弹到他屏幕上。
 CI 里用虚拟显示真跑：`xvfb-run -a env -u WAYLAND_DISPLAY GDK_BACKEND=x11 CAPSPLUS_GUI=1
 python3 -m unittest tests.test_shot_overlay`。
 """
@@ -48,7 +48,7 @@ GREEN = (0.1, 0.85, 0.3)
 
 
 def guard() -> str:
-    """没设 CAPSPLUS_GUI=1、或 GDK 连的是明江的真实 Wayland 桌面，就别跑界面用例。"""
+    """没设 CAPSPLUS_GUI=1、或 GDK 连的是用户的真实 Wayland 桌面，就别跑界面用例。"""
     if not RUN_GUI:
         return "没设 CAPSPLUS_GUI=1"
     try:
@@ -107,9 +107,9 @@ class TestKeyAndButtonMap(unittest.TestCase):
         self.assertEqual(OV.key_action("A", ctrl=True), OV.ACTION_FULL)
 
     def test_letter_keys_are_not_stolen_without_ctrl(self):
-        """遮罩窗短暂持有键盘焦点：**除明江点名的 `C` 之外**，不许抢普通按键。
+        """遮罩窗短暂持有键盘焦点：**除用户点名的 `C` 之外**，不许抢普通按键。
 
-        `C` = 提取颜色（2026-10-20 明江要的功能，他自己建议用 C：复制光标下的 `#RRGGBB`）。
+        `C` = 提取颜色（2026-10-20 用户要的功能，他自己建议用 C：复制光标下的 `#RRGGBB`）。
         这条是**唯一放行的字母键**，别的一个都不许加 —— 多一个都算偷他的输入。
         """
         for name in ("a", "s", "z", "d", "b", "space", "F5", ""):
@@ -391,13 +391,13 @@ class TestOverlayStateMachine(unittest.TestCase):
 
 
 class TestNoAnimation(unittest.TestCase):
-    """明江换掉 Snipaste 的原因就是「截图会闪一下」：源码里不许出现动画。"""
+    """用户换掉 Snipaste 的原因就是「截图会闪一下」：源码里不许出现动画。"""
 
     def test_no_animation_api_in_source(self):
         body = _overlay_body()
         for bad in ("ease", "transition", "set_opacity", "animate", "add_transition"):
             self.assertIsNone(re.search(rf"\b{re.escape(bad)}", body),
-                              f"遮罩里出现了动画相关调用：{bad}（明江要的是「绝不闪」）")
+                              f"遮罩里出现了动画相关调用：{bad}（用户要的是「绝不闪」）")
 
     def test_windows_are_shown_not_faded(self):
         self.assertIn("win.show_all()", _overlay_body())
@@ -633,7 +633,7 @@ class TestGeometrySelfCheck(unittest.TestCase):
 
 @unittest.skipUnless(HAVE_CAIRO, "没有 pycairo：放大镜判据要造帧")
 class TestMagnifier(unittest.TestCase):
-    """放大镜（明江要的"光标旁 80×80 + 坐标，从冻结帧取样"）。
+    """放大镜（用户要的"光标旁 80×80 + 坐标，从冻结帧取样"）。
 
     取样位置错一点，放大镜里看到的就是**旁边**的像素 —— 拿它对准会直接对歪，
     所以这条判据不测"画出来没有"，而是测"**中心那个像素就是光标下的那个像素**"。
@@ -1034,7 +1034,7 @@ class _Ev:
 
 @unittest.skipUnless(not GUI_SKIP, f"跳过界面用例：{GUI_SKIP}")
 class TestMotionActuallyRepaints(unittest.TestCase):
-    """⑤ 指针一动就必须**真的重画**（明江真机："十字线不跟鼠标走、要按着拖才跟"）。
+    """⑤ 指针一动就必须**真的重画**（用户真机："十字线不跟鼠标走、要按着拖才跟"）。
 
     病根（2026-10-20 实测，两层证据）：
       * **真机探针**：`ydotool` 连移 30 次指针 ⇒ 遮罩进程里 MOTION **690** 次、REDRAW **689** 次，

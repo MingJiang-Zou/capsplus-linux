@@ -4,7 +4,7 @@
 # 本文件属 capsplus-linux —— CapsLock+ v3.3.0 的 Linux 移植（衍生作品）；按键映射数据译自上游：
 #   上游 https://github.com/wo52616111/capslock-plus （GPL-2.0，© wo52616111）；改动见 README「许可与上游」。
 #
-# 进程级验收判据（2026-10-17，真机事故）：明江按 Caps+M 后 GNOME 弹「voice_worker.py 无响应」——
+# 进程级验收判据（2026-10-17，真机事故）：用户按 Caps+M 后 GNOME 弹「voice_worker.py 无响应」——
 # 取证发现**主线程停在 hrtimer_nanosleep**（time.sleep 轮询），GLib 循环跑在别的线程上，
 # mutter 对客户端 ping 应答不稳。这条脚本不测功能，只测一件事：
 #

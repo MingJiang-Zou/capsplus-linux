@@ -4,7 +4,7 @@
 #   上游 https://github.com/wo52616111/capslock-plus （GPL-2.0，© wo52616111）；改动见 README「许可与上游」。
 """上屏时的剪贴板备份 / 条件还原：四条判据，每条都带能红的反例具型。
 
-要还的债（2026-10-17）：我对明江说过「约 800ms 后自动恢复原剪贴板」，而当时 `voice_inject.py`
+要还的债（2026-10-17）：我对用户说过「约 800ms 后自动恢复原剪贴板」，而当时 `voice_inject.py`
 里**没有任何 `wl-paste` 备份 / 回写**，文档只能按事实写成「会覆盖且不恢复」。这一轮把它做成事实。
 行为顺序就是判据：
 
@@ -25,7 +25,7 @@
 全套用可注入的假 runner（一台假 Wayland 剪贴板），headless 也跑：不起窗口、不打真键、
 不碰真剪贴板；状态目录由 `env()` **默认**钉进本模块的沙箱（`SANDBOX`，模块结束随
 `tearDownModule` 收掉），`TestSandboxGuard` 钉住这个默认值 —— 因为本轮真栽过一次：
-某个类忘了指 `CAPSPLUS_STATE_DIR`，判据就往明江的 `~/.local/state/capsplus/voice.log` 里写了行。
+某个类忘了指 `CAPSPLUS_STATE_DIR`，判据就往用户的 `~/.local/state/capsplus/voice.log` 里写了行。
 """
 
 import atexit
@@ -53,7 +53,7 @@ CARD = "6222021234567890123"              # 假装躺在剪贴板里的卡号：
 PNG = b"\x89PNG\r\n\x1a\n" + b"\x00" * 40
 OUR_TEXT = "九点在三号楼开会"
 
-# ── 沙箱护栏：本模块任何用例都不许碰明江的**真状态目录** ─────────────────────────
+# ── 沙箱护栏：本模块任何用例都不许碰用户的**真状态目录** ─────────────────────────
 # 本轮真栽过一次：`TestRestoreRunsOnTheRealMainLoop` 忘了指 `CAPSPLUS_STATE_DIR`，于是
 # `Server.run_clipboard_restore` 里的 `P.log_line` 往 `~/.local/state/capsplus/voice.log`
 # 追加了 32 行（内容没漏，只有代码 `restored`，但那是他的文件）。
@@ -80,7 +80,7 @@ def _sandbox_dir(name: str) -> Path:
 
 # 2026-10-19：`run_step` 的守护步在**状态目录**里开 0600 临时错误文件（读完即毁）。
 # 本模块有一批判据在 `env()` 之外直接调 inject/perform_restore（还原链那几个），没有模块级
-# 护栏就会把文件写进明江的真状态目录 —— 护栏必须是默认值，不能靠每个类自觉（TestSandboxGuard
+# 护栏就会把文件写进用户的真状态目录 —— 护栏必须是默认值，不能靠每个类自觉（TestSandboxGuard
 # 的同一个教训）。`env()` 的 with-patch 仍可覆盖；两处指的都是本模块 SANDBOX 下的子目录。
 _ORIG_STATE_DIR = os.environ.get("CAPSPLUS_STATE_DIR")
 
@@ -212,7 +212,7 @@ def env(**over):
     """干净环境：还原开关默认开，并把 `CAPSPLUS_STATE_DIR` 钉进沙箱。
 
     状态目录在这里给默认值是**故意的**（见上面沙箱护栏那段）：判据跑的是真 `Server`，
-    它会写 `voice.log` —— 不设默认就等于往明江的真目录里写。`over` 仍可覆盖（`TestSandboxGuard`
+    它会写 `voice.log` —— 不设默认就等于往用户的真目录里写。`over` 仍可覆盖（`TestSandboxGuard`
     就是查这个默认值咬不咬得住）。
     """
     base = {k: v for k, v in os.environ.items()
@@ -687,7 +687,7 @@ class TestEmptyClipboard(unittest.TestCase):
                                 binary_reader=lambda p: b"",
                                 daemon_probe=lambda: (True, "可达"), header="/no/such")
         self.assertFalse(without.wl_copy_clear)
-        self.assertFalse(without.ran, "注入了假件还跑了真命令 = 在动明江的机器")
+        self.assertFalse(without.ran, "注入了假件还跑了真命令 = 在动用户的机器")
 
     def test_this_machine_really_has_clear(self):
         """探测结论必须等于本机真相：读**真装的** wl-copy 的 --help（只读，不注入）。"""
@@ -948,7 +948,7 @@ class TestRestoreRunsOnTheRealMainLoop(unittest.TestCase):
     """真 GLib 主循环版：等待由 `timeout_add` 计时，**主循环在等的这段时间里一直在转**。
 
     这条是「剪贴板还原把主线程睡过去」那个事故的预防针 —— 上一轮语音链就是因为主线程
-    `time.sleep` 等注入，mutter 的 ping 没人应答，明江的桌面弹了「无响应」。
+    `time.sleep` 等注入，mutter 的 ping 没人应答，用户的桌面弹了「无响应」。
     这里不建任何窗口（GLib 主循环本身不需要显示服务），所以有 gi 的机器都能跑；
     没装 PyGObject 的机器（CI 主 job）显式 skip，不算绿。
     """
@@ -958,7 +958,7 @@ class TestRestoreRunsOnTheRealMainLoop(unittest.TestCase):
         self.W = W
         self.glib = W._glib()
         # 这一类的 arm/run **不在 `env()` 里**（循环跑到哪算哪），所以状态目录必须在 setUp 就钉住：
-        # 忘了就会往明江的 `~/.local/state/capsplus/voice.log` 里追加行（本轮真犯过）。
+        # 忘了就会往用户的 `~/.local/state/capsplus/voice.log` 里追加行（本轮真犯过）。
         self._patch = mock.patch.dict(os.environ,
                                       {"CAPSPLUS_STATE_DIR": str(_sandbox_dir("mainloop"))})
         self._patch.start()
@@ -1026,7 +1026,7 @@ class TestRestoreRunsOnTheRealMainLoop(unittest.TestCase):
 
 
 class TestSandboxGuard(unittest.TestCase):
-    """护栏判据：本模块**默认**就不可能写到明江的真状态目录 —— 少一处都算没做到。
+    """护栏判据：本模块**默认**就不可能写到用户的真状态目录 —— 少一处都算没做到。
 
     为什么专门钉一条：本轮真的犯过一次（某个类忘了指 `CAPSPLUS_STATE_DIR`，`P.log_line`
     就往 `~/.local/state/capsplus/voice.log` 追加了 32 行）。把护栏做成 `env()` 的默认值之后，
@@ -1052,7 +1052,7 @@ class TestSandboxGuard(unittest.TestCase):
         real = Path.home() / ".local" / "state" / "capsplus"
         with env():
             self.assertNotEqual(P.log_path(), real / "voice.log",
-                                "`env()` 的默认值被改掉了 ⇒ 用例又会往明江的真日志里写")
+                                "`env()` 的默认值被改掉了 ⇒ 用例又会往用户的真日志里写")
 
     def test_a_full_chain_writes_its_log_inside_the_sandbox_only(self):
         clip = FakeWaylandClipboard({"text/html": "原文".encode("utf-8")})

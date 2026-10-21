@@ -2,7 +2,7 @@
 # Copyright (c) 2026 capsplus-linux contributors
 # 本文件属 capsplus-linux —— CapsLock+ v3.3.0 的 Linux 移植（衍生作品）；按键映射数据译自上游：
 #   上游 https://github.com/wo52616111/capslock-plus （GPL-2.0，© wo52616111）；改动见 README「许可与上游」。
-"""判据：图标与设计语言（明江："太丑、易用性有待提高" 那一批）。
+"""判据：图标与设计语言（用户："太丑、易用性有待提高" 那一批）。
 
 钉住三件事：
   ① **每个图标都画得出东西**，而且**彼此不同**（全画成一样的方块=没图标）；提示文案齐全；
@@ -125,7 +125,7 @@ class TestIconsRender(unittest.TestCase):
         self.assertIsNotNone(I.width_dot_surface(3, 16))
 
     def test_width_dots_differ_by_size(self):
-        """线宽圆点必须**看得出粗细差别**（明江要求"用粗细圆点"，不写 2px/3px/6px）。"""
+        """线宽圆点必须**看得出粗细差别**（用户要求"用粗细圆点"，不写 2px/3px/6px）。"""
         inks = []
         for width in (2, 3, 6):
             surface = I.width_dot_surface(width, 20, (1, 1, 1, 1))
@@ -204,7 +204,7 @@ class TestStyleSheet(unittest.TestCase):
     def test_three_states_exist_for_buttons(self):
         css = S.CSS
         for selector in (".cp-btn:hover", ".cp-btn:active", ".cp-btn:disabled"):
-            self.assertIn(selector, css, f"按钮缺 {selector} 态（明江要 hover/active/disabled 三态）")
+            self.assertIn(selector, css, f"按钮缺 {selector} 态（用户要 hover/active/disabled 三态）")
 
     def test_colours_follow_the_theme(self):
         """颜色一律用主题变量（深浅色主题各自成立），只有画布底色允许写死。"""

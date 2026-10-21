@@ -65,14 +65,14 @@ warn() { printf '%s\n' "$1" >&2; }
 md5_of() { md5sum < "$1" | cut -d' ' -f1; }
 
 # 失败必须**出声**：登录 unit 与 keyd 这两条路上都没人看 stderr，而"扩展落后 / 没加载"的表现
-# 恰恰就是"Caps+F1 没反应" —— 不说出来等于没发生（2026-10-20 明江为此白重登过）。
+# 恰恰就是"Caps+F1 没反应" —— 不说出来等于没发生（2026-10-20 用户为此白重登过）。
 # GIO 优先：`gdbus` 是 GLib 自带的，不引新依赖；没有才退回 notify-send。
 # 通知发不出去只是少一条提示，**不许**让它把脚本/unit 带崩，所以两条路都兜住、永远 return 0。
 notify() {
     _title="$1"
     _body="$2"
     # `CAPSPLUS_NOTIFY=0` 关掉（与 capsplus/shot_frame.py 同一套开关）。为什么要有：反例举证时
-    # 脚本会**故意**让预检红，那时不该把弹窗拍到明江屏幕上 —— 他不欠我们一次打扰。
+    # 脚本会**故意**让预检红，那时不该把弹窗拍到用户屏幕上 —— 他不欠我们一次打扰。
     [ "${CAPSPLUS_NOTIFY:-1}" = 0 ] && return 0
     if command -v gdbus >/dev/null 2>&1; then
         if gdbus call --session --dest org.freedesktop.Notifications \
@@ -192,7 +192,7 @@ install_atomic() {
 install_atomic metadata.json
 install_atomic extension.js
 # stylesheet.css 也要复制：GNOME 会自动加载**扩展目录下**的同名样式表，
-# 少了它 extension.js 里那些 style_class 一个都不生效 —— 2026-10-19 明江那句
+# 少了它 extension.js 里那些 style_class 一个都不生效 —— 2026-10-19 用户那句
 # "贴出来的图 删都删不掉"就是这条（`×` 变成裸按钮：没尺寸、没背景、没 hover）。
 if [ -f "$SRC_DIR/stylesheet.css" ]; then
     install_atomic stylesheet.css

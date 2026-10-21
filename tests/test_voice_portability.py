@@ -18,7 +18,7 @@
 
 真开窗的用例在 `TestOsdRealWindow`：默认 skip，只有 `CAPSPLUS_GUI=1` 才跑，
 且 GDK 连着**真实 Wayland 桌面**又没给 `CAPSPLUS_WAYLAND=1` 时整类拒跑（口径照
-`tests/test_settings_window.py`，那是明江实测被弹窗打扰之后定下来的）。
+`tests/test_settings_window.py`，那是用户实测被弹窗打扰之后定下来的）。
 """
 
 import ast
@@ -111,7 +111,7 @@ def real_desktop_risk() -> str:
     except Exception:                                       # noqa: BLE001
         return ""
     if "Wayland" in backend:
-        return (f"GDK 当前连的是真实 Wayland 桌面（{backend}），弹窗会直接出现在明江屏幕上"
+        return (f"GDK 当前连的是真实 Wayland 桌面（{backend}），弹窗会直接出现在用户屏幕上"
                 "并抢走键盘焦点。正确跑法："
                 "`xvfb-run -a --server-args=\"-screen 0 1024x768x24\" "
                 f"env -u {VAR_WAYLAND} GDK_BACKEND=x11 CAPSPLUS_GUI=1 python3 -m unittest …`；"
@@ -657,7 +657,7 @@ class TestRealWindowRefusesTrueWaylandWithoutOptIn(unittest.TestCase):
             self.skipTest(f"GDK 连的不是 Wayland（{backend}），这条不适用")
         if ALLOW_WAYLAND_DESKTOP:
             self.skipTest("已显式授权真桌面")
-        self.assertTrue(real_desktop_risk(), "真桌面 + 未授权却没拦住 = 会弹到明江屏幕上")
+        self.assertTrue(real_desktop_risk(), "真桌面 + 未授权却没拦住 = 会弹到用户屏幕上")
 
     def test_skip_unless_condition_is_pointed_the_right_way(self):
         """反例具型：`skipUnless` 的条件方向写反过一次，界面测试直接弹到屏幕上（2026-10-16）。"""

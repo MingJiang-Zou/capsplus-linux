@@ -4,7 +4,7 @@
 #   上游 https://github.com/wo52616111/capslock-plus （GPL-2.0，© wo52616111）；改动见 README「许可与上游」。
 """判据：贴图的**删除路径 / 样式表 / 模态焦点**（2026-10-19 P0）。
 
-明江原话：「贴出来的图 删都删不掉」；随后又纠正：「点击了贴图或者拖动了贴图，焦点就在这个上面了，
+用户原话：「贴出来的图 删都删不掉」；随后又纠正：「点击了贴图或者拖动了贴图，焦点就在这个上面了，
 然后按 esc 就可以取消贴图」。所以这里钉三件事：
 
   1. **样式表存在且不许有裸 class**：`stylesheet.css` 以前**根本不存在**，而 extension.js 一直在用
@@ -15,11 +15,11 @@
      后的 `Esc`、以及 `Caps+Esc` 的全局兜底（`ClearPins` 信号 + `--clear-pins` 子命令）。
      反例：摘掉右键那条 → 红；摘掉 `ClearPins` 订阅或子命令 → 红。
   3. **pushModal / popModal 必须配对**（这条是**灾难级**）：没配对 = shell 卡在模态态，
-     明江的键盘进不了任何应用。判据：全文件只允许各出现一次、必须在同一对函数里、且所有销毁路径
+     用户的键盘进不了任何应用。判据：全文件只允许各出现一次、必须在同一对函数里、且所有销毁路径
      都经过 `destroyPin`。反例：删掉 `Main.popModal(...)` → 红。
 
 另外补一条**语法**判据（`node --check`）：扩展语法错 = 静默不加载，只能靠现象反推
-（2026-10-16 就这么白让明江注销重登过一次）。
+（2026-10-16 就这么白让用户注销重登过一次）。
 """
 
 
@@ -120,7 +120,7 @@ class TestStylesheetExists(unittest.TestCase):
 
     def test_focused_pin_looks_selected(self):
         self.assertIn("capsplus-pin-active", STYLE,
-                      "拿到键盘焦点时要有视觉反馈（明江得知道「键现在归它」）")
+                      "拿到键盘焦点时要有视觉反馈（用户得知道「键现在归它」）")
 
     def test_no_naked_style_class_in_extension_js(self):
         """extension.js 里用到的每个 `capsplus-*` class 都必须在样式表里有规则。
@@ -147,7 +147,7 @@ class TestClosePaths(unittest.TestCase):
 
     def test_at_least_three_paths_exist(self):
         found = [name for name, needle in self.PATHS.items() if needle in CODE]
-        self.assertGreaterEqual(len(found), 3, f"关闭路径只有 {found} —— 明江要的是「删得掉」")
+        self.assertGreaterEqual(len(found), 3, f"关闭路径只有 {found} —— 用户要的是「删得掉」")
 
     def test_each_path_actually_destroys(self):
         for name, needle in self.PATHS.items():
@@ -238,7 +238,7 @@ class TestModalFocusIsPaired(unittest.TestCase):
 class TestDuplicateSubscriptionSafety(unittest.TestCase):
     """热重载会留下**摘不掉的旧订阅**（这版 GJS 没有 signal_remove）⇒ 每个请求跑两遍。
 
-    2026-10-19 真机实测：重载之后每次抓帧都是两行 `started` + 两行 `fail`，明江的截图直接不能用
+    2026-10-19 真机实测：重载之后每次抓帧都是两行 `started` + 两行 `fail`，用户的截图直接不能用
     （两条 handler 抢同一个 `.part`：后一条触发 shell 的"同一时刻只允许一个截图操作"，
     它的失败清理又删掉 `.part`，前一条 rename 时报"没有那个文件"）。
     所以判据钉两件事：**跨实例去重**（用 shell 的 `global`，不是模块变量）+ `.part` 名字唯一。
@@ -265,7 +265,7 @@ class TestDuplicateSubscriptionSafety(unittest.TestCase):
 
 
 class TestExtensionSyntax(unittest.TestCase):
-    """语法错 = 静默不加载（2026-10-16 白让明江注销重登过一次）。"""
+    """语法错 = 静默不加载（2026-10-16 白让用户注销重登过一次）。"""
 
     @unittest.skipUnless(shutil.which("node"), "没有 node：这条语法判据跳过")
     def test_parses_as_an_es_module(self):
@@ -475,7 +475,7 @@ class TestHoverToolbarIsReachable(unittest.TestCase):
         self.assertEqual(data["miss"], -1, "没点到就该返回 -1（别误触发）")
 
     def test_toolbar_never_overlaps_the_pin(self):
-        """**工具条与贴图矩形零重叠**（明江 2026-10-20：摆里面"会挡住贴图部分内容"）。
+        """**工具条与贴图矩形零重叠**（用户 2026-10-20：摆里面"会挡住贴图部分内容"）。
 
         坐标断言（不是"看起来没压"）：工具条矩形与贴图矩形必须有**空隙**、不许相交；
         位置默认在下方，下面放不下翻上方，贴到屏幕边缘时还得留在 stage 里。
@@ -513,7 +513,7 @@ class TestHoverToolbarIsReachable(unittest.TestCase):
 
 
 class TestPinsAreHiddenDuringCapture(unittest.TestCase):
-    """**遮罩压在贴图之上**（明江 2026-10-19 口径）：抓帧期间贴图必须真的藏起来。
+    """**遮罩压在贴图之上**（用户 2026-10-19 口径）：抓帧期间贴图必须真的藏起来。
 
     为什么不做"开关"（他嫌复杂）：贴图在 shell 图层、遮罩是 GTK 窗口，物理上抬不过去；
     等价做法只有"抓帧前隐藏 → 抓完恢复"。副作用：**新截图不会把旧贴图拍进去**（也是他最初的诉求）。

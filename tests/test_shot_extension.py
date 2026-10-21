@@ -5,14 +5,14 @@
 """判据：GNOME 扩展里新增的抓帧/贴图那两段 —— 形状必须与 Python 侧、与这台机的 GJS 实测一致。
 
 为什么需要静态判据（2026-10-19）：扩展跑在 shell 进程里，**改错了不会有任何报错**——
-现象只是"截图没反应"。而重新加载扩展要明江注销重登（Wayland 没有 Alt+F2 r），
+现象只是"截图没反应"。而重新加载扩展要用户注销重登（Wayland 没有 Alt+F2 r），
 所以每一次部署都该是"已经用机器核对过形状"的，不能拿他的会话来试错。
 
 这里钉的每一条都对应一个实测过的事实（不是想象的规矩）：
 * `Shell.Screenshot.screenshot_area(x, y, w, h, stream[, callback])` —— 签名从本机
   `/usr/lib/gnome-shell/Shell-18.typelib` dump 出来（x,y,w,h:int32 + Gio.OutputStream + callback）；
   闪屏是 shell 自己的 JS 动画（`ui/screenshot.js` 的 `Flashspot`，500ms opacity 255→0），
-  所以"不碰那段动画 + 不加 flash 参数"就是明江要的"绝不闪"；
+  所以"不碰那段动画 + 不加 flash 参数"就是用户要的"绝不闪"；
 * 不能 `export_object_path` / `register_object` / `return_value`（本机 GJS 里全不可用）；
 * `signal_subscribe` 只能 7 实参、回调在最后（仓里 raise-browser 的既有实测）；
 * 参数要从 tuple variant 里 `deepUnpack()` 出来（本机实测 `unpack()` 对元组返回 5 个空对象）；
@@ -108,7 +108,7 @@ class TestExtensionShape(unittest.TestCase):
         for banned in ("Flashspot", "ease(", "Lightbox", "duration:"):
             self.assertNotIn(banned, self.code,
                              f"{banned} 是 shell 那套截图 UI 的闪屏动画写法；我们的抓帧不许带上它"
-                             "（明江换掉 Snipaste 就是因为闪）")
+                             "（用户换掉 Snipaste 就是因为闪）")
 
     def test_one_screenshot_instance_is_reused(self):
         self.assertEqual(len(re.findall(r"new Shell\.Screenshot\(", self.code)), 1,
@@ -148,7 +148,7 @@ class TestExtensionShape(unittest.TestCase):
 
     def test_pin_does_not_steal_keyboard_focus(self):
         self.assertIn("can_focus: false", self.code,
-                      "× 按钮不许拿键盘焦点（明江在干活，贴图不能把输入抢走）")
+                      "× 按钮不许拿键盘焦点（用户在干活，贴图不能把输入抢走）")
         self.assertNotIn("grab_key_focus", self.code)
         self.assertNotIn("navigate_focus", self.code)
 
@@ -203,7 +203,7 @@ class TestExtensionShape(unittest.TestCase):
         import json
         meta = json.loads((EXT.parent / "metadata.json").read_text(encoding="utf-8"))
         self.assertEqual(meta["uuid"], SF.EXT_UUID,
-                         "绝不许新建 uuid：GNOME 只在启动时扫描扩展目录，新 uuid 要明江注销重登")
+                         "绝不许新建 uuid：GNOME 只在启动时扫描扩展目录，新 uuid 要用户注销重登")
 
 
 class TestGuardHasTeeth(unittest.TestCase):
@@ -260,7 +260,7 @@ class TestFailureIsLoud(unittest.TestCase):
 
     抓帧超时 / 贴图失败 / 清空贴图失败三条路都过 `timeout_report`，所以通知挂在那里；
     单测把发送函数换掉，只断言"该不该发 + 发的是什么话"。**绝不真发** ——
-    这台机是明江的干活机器，弹窗就是打断他。
+    这台机是用户的干活机器，弹窗就是打断他。
     """
 
     def setUp(self):
@@ -302,7 +302,7 @@ class TestFailureIsLoud(unittest.TestCase):
         """闸门本身要有牙：单测进程里不弹（`unittest` 已在 sys.modules），`CAPSPLUS_NOTIFY=0` 也不弹。"""
         # 这里必须调**原函数**：setUp 把 SF._notify_allowed 换成了恒真的替身（用来测文案）
         self.assertFalse(self._orig_allowed(),
-                         "单测进程里居然允许弹窗 —— 跑一次全量会给明江刷一屏通知")
+                         "单测进程里居然允许弹窗 —— 跑一次全量会给用户刷一屏通知")
         with mock.patch.dict(os.environ, {"CAPSPLUS_NOTIFY": "0"}):
             self.assertFalse(self._orig_allowed())
 

@@ -30,7 +30,7 @@ def desktop_risk() -> str:
     """GDK 连上的到底是不是**真实 Wayland 桌面**：是、又没显式授权，就别跑界面用例。
 
     口径与 `tests/test_settings_window.py` / `tests/test_shot_overlay.py` 一致：
-    这台机是明江干活的机器，判据不许把窗口弹到他屏幕上（`CAPSPLUS_WAYLAND=1` 才放行）。
+    这台机是用户干活的机器，判据不许把窗口弹到他屏幕上（`CAPSPLUS_WAYLAND=1` 才放行）。
     """
     if not RUN_GUI:
         return "没设 CAPSPLUS_GUI=1"

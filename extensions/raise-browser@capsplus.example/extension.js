@@ -29,7 +29,7 @@
  *   外部 `org.gnome.Shell.Screenshot.ScreenshotArea` 实测 `AccessDenied`；而 shell 进程内
  *   `Shell.Screenshot`（Shell-18.typelib）可用。闪屏是 shell 自己 `ui/screenshot.js` 里
  *   `Flashspot` 那段 JS 动画（500ms opacity 255→0）干的，**不在 C 抓帧里** ⇒ 本文件直接调
- *   `screenshot_area(x, y, w, h, stream)`、不碰那段动画，天然不闪（这正是明江换掉 Snipaste 的原因）。
+ *   `screenshot_area(x, y, w, h, stream)`、不碰那段动画，天然不闪（这正是用户换掉 Snipaste 的原因）。
  */
 import Clutter from 'gi://Clutter';
 import Cogl from 'gi://Cogl';
@@ -63,7 +63,7 @@ let _subClear = 0;
  * 旧实例的订阅摘不掉（这版 GJS 没有 `signal_remove`，见 `disable()`），于是每次请求都跑两遍：
  *   * 抓帧：两条 handler 抢同一个 `.part` ⇒ 后一条触发 "Only one screenshot operation at a time"，
  *     它的失败清理又删掉 `.part`，前一条 rename 时"没有那个文件" ⇒ **两条都失败**。
- *     2026-10-19 实测（明江那边就是"按了没反应"）：每次抓帧都是两行 started + 两行 fail。
+ *     2026-10-19 实测（用户那边就是"按了没反应"）：每次抓帧都是两行 started + 两行 fail。
  *   * 贴图：一张图会变成两张；清空：ack 写两遍。
  *
  * 所以用 shell 的 `global` 当**跨实例**去重表 —— 模块级变量各实例一份，挡不住这种重复。
@@ -221,7 +221,7 @@ function callArea(shot, x, y, w, h, stream, done) {
  * 先写 `<out>.part` 再 rename 成 outPath：**outPath 一出现就是完整 PNG**，
  * 调用方（capsplus 等文件出现）不会读到半张图 —— 这是本链路上唯一能防"静默半图"的办法。
  */
-/** 抓帧期间把手头所有贴图**真的藏起来**，抓完/失败/超时一律恢复（明江 2026-10-19 定的口径）。 */
+/** 抓帧期间把手头所有贴图**真的藏起来**，抓完/失败/超时一律恢复（用户 2026-10-19 定的口径）。 */
 function hidePinsForCapture() {
     const was = _pins.map(p => p.actor.visible);
     const plan = pinVisibilityPlan(was);
@@ -254,7 +254,7 @@ function captureArea(x, y, width, height, outPath) {
     const out = Gio.File.new_for_path(outPath);
     console.log(`[raise-browser] shot result=started path=${outPath} ${rect}`);
 
-    // **遮罩压在贴图之上**（明江 2026-10-19 定的口径，见 docs/SHOT-TOOL.md §7.9）：
+    // **遮罩压在贴图之上**（用户 2026-10-19 定的口径，见 docs/SHOT-TOOL.md §7.9）：
     // 贴图在 shell 图层、GTK 遮罩在窗口层，物理上抬不过去；等价做法是抓帧前把贴图
     // 真的藏起来、抓完恢复 —— 这样 ①压暗能盖住原贴图位置 ②新截图不会把旧贴图拍进去。
     const hidden = hidePinsForCapture();
@@ -356,7 +356,7 @@ function pinLog(result, extra) {
     console.log(`[raise-browser] pin result=${result}${extra ? ' ' + extra : ''}`);
 }
 
-// ── 模态焦点：点/拖某张贴图 → 键盘归它，Esc 关掉它（明江 2026-10-19 要的就是 Snipaste 这套）──
+// ── 模态焦点：点/拖某张贴图 → 键盘归它，Esc 关掉它（用户 2026-10-19 要的就是 Snipaste 这套）──
 //
 // **本机实测**（不是照网上写法来的，2026-10-19 从 shell 自己的 JS 资源里读出来的：
 //   `gresource list /usr/lib/gnome-shell/libshell-18.so` → 抽 `/org/gnome/shell/ui/main.js`）：
@@ -368,9 +368,9 @@ function pinLog(result, extra) {
 //   * pushModal 还会 `actor.connect('destroy', …popModal)`：actor 一销毁就自动摘焦点。**仍然显式配对**，
 //     因为我们要保证"能 destroy 的每条路都先 pop"（宁可多一次显式调用，也不要赌自动那一下）。
 //   * 它是 `global.stage.grab`：**键盘和鼠标一起抓**。所以"点窗外"要主动交还焦点
-//     （见 `_isOutside`）—— 否则明江点到别的窗口会像"点不动"。
+//     （见 `_isOutside`）—— 否则用户点到别的窗口会像"点不动"。
 //
-// ⚠ 灾难级失误的防线：pushModal 没配对 popModal = shell 卡在模态态、明江的键盘进不了任何应用。
+// ⚠ 灾难级失误的防线：pushModal 没配对 popModal = shell 卡在模态态、用户的键盘进不了任何应用。
 //   本文件里 pushModal **只有一处**（`grabPinFocus`），popModal **只有一处**（`releasePinFocus`），
 //   而所有销毁路径都必经 `destroyPin` → `releasePinFocus`。判据
 //   `tests/test_raise_pin_ui.py::TestModalFocusIsPaired` 就是钉这件事的（删掉 pop 必红）。
@@ -513,7 +513,7 @@ const HOVER_GRACE_MS = 250;             // 200–300ms 宽限：跨空隙也能�
 const TOOLBAR_GAP = 6;                  // 工具条与贴图之间的空隙（宽限要大于走过去的时间）
 
 /**
- * 工具条的位置：**在贴图外面**（明江 2026-10-20 明确：摆里面"会挡住贴图部分内容"）。
+ * 工具条的位置：**在贴图外面**（用户 2026-10-20 明确：摆里面"会挡住贴图部分内容"）。
  *
  * 默认**下方**、下面放不下翻**上方**；再越界就左右挪，保证整条都在 stage 里。
  * 返回的 `overlaps` 是判据要的那个硬条件：**与贴图矩形零重叠**。

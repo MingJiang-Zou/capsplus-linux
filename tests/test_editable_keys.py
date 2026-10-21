@@ -4,7 +4,7 @@
 #   上游 https://github.com/wo52616111/capslock-plus （GPL-2.0，© wo52616111）；改动见 README「许可与上游」。
 """设置页的键位全表：默认声明过的绑定 + **空位**（数字键 / F1-F12 / m、z 之类）。
 
-起因（明江原话）：「capsplus 这个软件我希望对应的快捷键的组合都添加上去，可以在设置页面里面设置」
+起因（用户原话）：「capsplus 这个软件我希望对应的快捷键的组合都添加上去，可以在设置页面里面设置」
 「快捷键我希望同样可以组合数字按键 以及 F1-F12 数字键」。查下来：设置页列出的键
 **就是** `mapping_data.SECTIONS` 声明的键（`render.binding_rows` 与 `layer_rows` 都从它派生，
 差集为空）—— 所以"有些快捷键没有"不是界面漏渲染，而是**表里根本没声明那些键位**：
@@ -42,7 +42,7 @@ REF_CONF = Path(os.environ.get(
     "CAPSPLUS_REF_CONF",
     Path.home() / ".dsh/refs/capslock-v3.3.0/keyd-capslock-plus.conf"))
 
-# 明江点名要的两组：数字键 0-9 与 F1-F12（写法以 keyd 自己的键名表为准：`1`..`9` `0`、`f1`..`f12`）
+# 用户点名要的两组：数字键 0-9 与 F1-F12（写法以 keyd 自己的键名表为准：`1`..`9` `0`、`f1`..`f12`）
 DIGITS = list("1234567890")
 FKEYS = [f"f{i}" for i in range(1, 13)]
 LETTERS = list("abcdefghijklmnopqrstuvwxyz")
@@ -141,7 +141,7 @@ class TestPageListsTheWholeKeyMatrix(unittest.TestCase):
                              f"[{section}] 设置页列出的键 ≠ 参考实现的键位全表")
 
     def test_page_keys_cover_declared_plus_digits_and_fkeys(self):
-        """明江要的那句：设置页 ⊇ 内置表声明的键 ∪ 数字键 ∪ F1-F12。"""
+        """用户要的那句：设置页 ⊇ 内置表声明的键 ∪ 数字键 ∪ F1-F12。"""
         page = {row[0] for row in binding_rows("capl")}
         self.assertEqual(declared_keys("capl") - page, set(), "默认绑定的键反而不在设置页里")
         self.assertEqual(set(DIGITS) - page, set(), "数字键没进设置页")
@@ -190,7 +190,7 @@ class TestPageMatchesTheUpstreamScheme(unittest.TestCase):
 
     @unittest.skipUnless(REF_SCHEME.exists(), f"没有上游源码：{REF_SCHEME}")
     def test_upstream_declares_digits_and_fkeys_for_the_base_layer(self):
-        """上游确实声明了数字键与 F1-F12（这是明江要的那两组的出处，不是我们自己想的）。"""
+        """上游确实声明了数字键与 F1-F12（这是用户要的那两组的出处，不是我们自己想的）。"""
         upstream = upstream_key_matrix(REF_SCHEME.read_text(encoding="utf-8"))
         self.assertEqual(set(DIGITS) - upstream["capl"], set())
         self.assertEqual(set(FKEYS) - upstream["capl"], set())

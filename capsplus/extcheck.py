@@ -118,7 +118,7 @@ _BENCH_LOAD_ERROR = re.compile(r"Extension " + re.escape(EXT_UUID) + r":")
 
 # 判据：ready 行必须报到"抓帧/贴图通道都挂上了"。这不是多余的严格 ——
 # 扩展**加载成功但订阅没挂上**时，现象与"没装"一模一样（Caps+F1 没反应、也没有报错），
-# 那正是明江反复重登都修不好的那种状态。
+# 那正是用户反复重登都修不好的那种状态。
 BENCH_READY_NEEDS = ("capture=on", "pin=on")
 
 

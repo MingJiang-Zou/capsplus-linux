@@ -536,7 +536,7 @@ except Exception as exc:                                 # noqa: BLE001
 class StubBar:
     """只摆 `_activate` 用到的成员，**调用真的 `QbarWindow._activate`**。
 
-    为什么不建窗口：界面用例在明江的机器上不许弹任何东西（`CAPSPLUS_GUI` 那套管的是
+    为什么不建窗口：界面用例在用户的机器上不许弹任何东西（`CAPSPLUS_GUI` 那套管的是
     真映射窗口）。这里 `Gtk` 整个换成假模块 → `set_text` 不碰真剪贴板；`_open_url` 是
     Mock → 不叫浏览器。于是"回车做了哪两件事"这件事照样能断言。
     """
@@ -560,7 +560,7 @@ class StubBar:
 @unittest.skipUnless(GI_OK, f"没有 PyGObject：动作层用例跳过（{GI_ERROR}）")
 class TestAskActivationMocked(TempAskMixin, unittest.TestCase):
     """跑**真**的 `QbarWindow._activate`：`Gtk` 换成假模块 → 不碰真剪贴板；
-    `_open_url` 是 Mock → 不叫浏览器；不建窗口 → 明江屏幕上什么都不会多出来。
+    `_open_url` 是 Mock → 不叫浏览器；不建窗口 → 用户屏幕上什么都不会多出来。
     """
 
     def setUp(self):

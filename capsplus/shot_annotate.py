@@ -83,10 +83,10 @@ COLORS = (("红", (0.90, 0.15, 0.15, 1.0)),
           ("蓝", (0.20, 0.55, 0.95, 1.0)),
           ("黑", (0.05, 0.05, 0.05, 1.0)),
           ("紫", (0.62, 0.32, 0.88, 1.0)),
-          ("橙", (1.00, 0.55, 0.10, 1.0)))     # 明江要求"颜色至少 6 个"（原 5 个不够）
+          ("橙", (1.00, 0.55, 0.10, 1.0)))     # 用户要求"颜色至少 6 个"（原 5 个不够）
 WIDTHS = (2, 3, 6)
 
-# ── 工具/颜色/线宽的**窗内快捷键**（2026-10-20 加，明江：工具条上"有几个按钮不知道什么意思"）──
+# ── 工具/颜色/线宽的**窗内快捷键**（2026-10-20 加，用户：工具条上"有几个按钮不知道什么意思"）──
 # 这一段是**唯一一份定义**：按钮提示（`tool_tip`/`colour_tip`/`width_tip`）、状态栏那两行
 # （`tool_key_hint`）、键处理（`tool_for_key`/`colour_for_key`/`width_for_key`）全都读它，
 # 免得"提示里写 R、实际按 R 没反应"这种两头对不上。字母键不引 Ctrl，所以与 Ctrl+C/S/Z/Y/P 不冲突。
@@ -152,7 +152,7 @@ def width_tip(width) -> str:
 def tool_key_hint() -> str:
     """工具/颜色/线宽的键位一栏（**从上面三张表现算**，所以永远不会和实现漂）。
 
-    状态栏第二行与 `hint_text()` 都读它 —— 明江要的"键位提示保持与实现一致"就靠这条。
+    状态栏第二行与 `hint_text()` 都读它 —— 用户要的"键位提示保持与实现一致"就靠这条。
     """
     tools = " ".join(f"{TOOL_KEYS[t]}={TOOL_LABELS[t]}" for t in TOOLS if TOOL_KEYS.get(t))
     colours = " ".join(f"{key}={name}" for name, key in COLOR_KEYS.items())
@@ -396,7 +396,7 @@ def render(cr, base_surface, shapes, size=None, selected=None, hover=None) -> No
     """把底图 + 全部图形画到 cairo 上下文上（**不碰 gi**，判据渲染到 ImageSurface 上断言像素）。
 
     `selected` / `hover` 传**图形对象**（`Shape`）：选中的画描边 + 8 个手柄，hover 的画虚线框
-    —— 这样"这东西能拖"一眼看得出来（明江说"没有描边和手柄，看不出可编辑"）。
+    —— 这样"这东西能拖"一眼看得出来（用户说"没有描边和手柄，看不出可编辑"）。
     """
     cairo = _cairo()
     if size is None:
@@ -551,10 +551,10 @@ def window_plan(image_size, screen, bar_h=40, margin=CANVAS_MARGIN, gap=BAR_GAP,
     `bar_layout` 才会退回"贴着图内下沿"，并被判据标成 `overlaps=True`。
 
     `min_width` = **工具条固有宽度 + 两边**（调用方用 `bar_min_window_width()` 算）。为什么要有它
-    （2026-10-20 明江真机：260×420 的窄选区，工具条右端那一排颜色圆点被窗口黑边切掉）：
+    （2026-10-20 用户真机：260×420 的窄选区，工具条右端那一排颜色圆点被窗口黑边切掉）：
     窗口尺寸原来**只由截图算**，而工具条的宽度与截图无关（本机实测 1012px）——窄图必然算出一个
     比工具条窄的窗口，`bar_layout` 把条夹到 `x=2` 之后右端就伸到窗口外面去了。
-    治本就是这条：**窗口宽度不得小于工具条需要的宽度**（明江给的三选一里的①）。
+    治本就是这条：**窗口宽度不得小于工具条需要的宽度**（用户给的三选一里的①）。
     图像仍在画布里居中，多出来的宽度就是两侧留白。
     """
     strip = int(bar_h) + int(gap) * 2
@@ -606,7 +606,7 @@ def handle_at(bounds, xy, size=HANDLE_SIZE) -> str:
 
 
 def clamp_to_image(xy, image_size) -> tuple:
-    """把坐标夹进截图矩形内 —— **留白区不许落笔**（明江看到的"能画到框外"就是这条没做）。"""
+    """把坐标夹进截图矩形内 —— **留白区不许落笔**（用户看到的"能画到框外"就是这条没做）。"""
     width, height = image_size
     return (int(min(max(xy[0], 0), max(width - 1, 0))),
             int(min(max(xy[1], 0), max(height - 1, 0))))
@@ -920,7 +920,7 @@ def copy_to_clipboard(data: bytes, runner=None, which=None) -> tuple:
 def _default_clipboard_runner(argv, data):
     """喂 `wl-copy`：**只等父进程退出，绝不接管道的另一端**。
 
-    ⚠ 2026-10-19 真机事故（明江："我多按几次 Ctrl+C 程序就会异常"）：`wl-copy` 会 fork 一个
+    ⚠ 2026-10-19 真机事故（用户："我多按几次 Ctrl+C 程序就会异常"）：`wl-copy` 会 fork 一个
     **长期存活的"留守者"**替你守剪贴板，而它 fork 前只把 stdin/stdout 换成 /dev/null，
     **stderr 原样继承** ⇒ 用 `capture_output=True` 就等于在等一条永不 EOF 的管道：
     实测每次复制 `ok=False`、**卡满 5 秒 timeout**（主线程被冻住，连按几次就堆成"程序异常"），
@@ -969,7 +969,7 @@ class Annotator:
     def __init__(self, base_surface, on_pin=None, screen=(1920, 1080), directory=None, clip=None,
                  on_ocr=None, on_translate=None, copy_text=None):
         self.base = base_surface
-        self._clip = clip or copy_to_clipboard      # 判据注入 stub：不许在测试里动明江的剪贴板
+        self._clip = clip or copy_to_clipboard      # 判据注入 stub：不许在测试里动用户的剪贴板
         # 面板文本走**另一条**（wl-copy --type text/plain），同样可注入；默认就是生产实现
         self._copy_text = copy_text or copy_text_to_clipboard
         self._loop = None
@@ -992,7 +992,7 @@ class Annotator:
         self.screen = screen           # 用来算"给工具条留出的那条带"（见 window_plan）
         self.drag_from = None
         self.pending = None            # 正在拖的那个图形（未提交）
-        # ── 可编辑的标注（明江："没有描边和手柄，看不出可编辑"）──
+        # ── 可编辑的标注（用户："没有描边和手柄，看不出可编辑"）──
         self.selected = None           # 选中的 Shape（**对象引用**，不进栈副本）
         self.hover = None              # 鼠标下的 Shape（虚线框反馈）
         self.edits = []                # 拖动/缩放/删除的编辑历史（撤销先走它）
@@ -1075,7 +1075,7 @@ class Annotator:
         self.selected = None
         return True
 
-    # ---- 选中 / 拖动 / 缩放 / 删除（明江要的"看得出可编辑"）----
+    # ---- 选中 / 拖动 / 缩放 / 删除（用户要的"看得出可编辑"）----
     def selected_bounds(self):
         return shape_bounds(self.selected) if self.selected is not None else None
 
@@ -1407,7 +1407,7 @@ class Annotator:
     def copy_panel_text(self) -> tuple:
         """面板上的"复制"：把当前该复制的那段**文本**送进剪贴板。
 
-        2026-10-20 真机事故（明江："翻译以及 OCR 出来的文本点击那个复制按钮复制不出来"）。
+        2026-10-20 真机事故（用户："翻译以及 OCR 出来的文本点击那个复制按钮复制不出来"）。
         这里原先写的是：
 
             display.get_clipboard(Gdk.SELECTION_CLIPBOARD).set_text(text, -1)
@@ -1485,7 +1485,7 @@ class Annotator:
         overlay.add(self.area)
         overlay.add_overlay(self._bar)
 
-        # 结果抽屉与状态栏是**独立的一层**（明江："不许和工具条挤在同一行"）
+        # 结果抽屉与状态栏是**独立的一层**（用户："不许和工具条挤在同一行"）
         self._panel_view = PanelView(on_copy=lambda _m: self.copy_panel_text(),
                                      on_retranslate=lambda _m: self._on_action(None, ACTION_TRANSLATE),
                                      on_switch=lambda m: self._switch_panel_backend(),
@@ -1578,7 +1578,7 @@ class Annotator:
     def _attach_hover_hint(self, btn, tip: str) -> None:
         """把"鼠标停在这个按钮上"写进状态栏那条主行（**与悬浮提示同一句文案**，不另抄一份）。
 
-        明江 2026-10-20："有几个按钮不知道什么意思" —— 提示气泡要等一秒才弹，状态栏是即时的；
+        用户 2026-10-20："有几个按钮不知道什么意思" —— 提示气泡要等一秒才弹，状态栏是即时的；
         两条都从同一个 `tip` 来，所以不会一个说法一个样。移开就回到"当前工具"。
         """
         def enter(_w, _e):

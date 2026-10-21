@@ -4,7 +4,7 @@
 #   上游 https://github.com/wo52616111/capslock-plus （GPL-2.0，© wo52616111）；改动见 README「许可与上游」。
 """守护式命令（`wl-copy`）不许用「等管道 EOF」判成败：真子进程具型 + 回读自证 + 隐私全链。
 
-要还的债（2026-10-19）：明江真机 09:15 识别出 6 个字，焦点事实也拿到了，结果却是
+要还的债（2026-10-19）：用户真机 09:15 识别出 6 个字，焦点事实也拿到了，结果却是
 `inject_done backend=clipboard ok=0 code=step_failed steps=0`，而 55 减 50 恰好等于
 `STEP_TIMEOUT_S = 5.0` —— **上屏这个功能从落地起一次都没真贴上过字**。
 
@@ -35,10 +35,10 @@
      回读不是我们的文本 ⇒ `owner_rejected` 且**粘贴那步不发**；剪贴板字节（含"留守进程"写进
      stderr 的那份）**一个字节都不许**出现在日志 / 事件帧 / 诊断行 / 摘要 / 状态目录里。
 
-全套**不碰明江的屏幕、不碰他的剪贴板**：假 `wl-copy`/`wl-paste`/`ydotool` 三个可执行脚本
+全套**不碰用户的屏幕、不碰他的剪贴板**：假 `wl-copy`/`wl-paste`/`ydotool` 三个可执行脚本
 住在本次 `mktemp` 沙箱里，剪贴板状态就是沙箱里的一个 JSON 文件；用的却是**真子进程、真管道、
 真 fork**（假 runner 在这条判定上什么都证明不了）。状态目录由模块级护栏钉进沙箱 ——
-`run_step` 的守护步会往状态目录写临时文件，护栏忘了就是往明江的真目录里写（同一教训见
+`run_step` 的守护步会往状态目录写临时文件，护栏忘了就是往用户的真目录里写（同一教训见
 `tests/test_voice_clipboard.py` 的 `TestSandboxGuard`）。
 """
 
@@ -68,7 +68,7 @@ OUR_TEXT = "九点在三号楼开会"
 CARD = "6222021234567890123"          # 躺在剪贴板里的卡号：隐私判据的探针
 FAKE_CODES = {"KEY_LEFTCTRL": 29, "KEY_V": 47}
 
-# ── 沙箱：本模块任何用例都不许碰明江的真状态目录 / 真剪贴板 ──────────────────────
+# ── 沙箱：本模块任何用例都不许碰用户的真状态目录 / 真剪贴板 ──────────────────────
 SANDBOX = Path(tempfile.gettempdir()) / f"capsplus-daemon-copy-{os.getpid()}"
 FIXTURE = SANDBOX / "bin"
 CLIP_DIR = SANDBOX / "clipboard"
@@ -91,7 +91,7 @@ def _sandbox(name: str) -> Path:
 
 def setUpModule():
     # 护栏必须是**默认值**：`run_step` 的守护步往状态目录写临时错误文件，
-    # 忘了钉住就是往明江的 `~/.local/state/capsplus/` 里写（test_voice_clipboard 真栽过一次）。
+    # 忘了钉住就是往用户的 `~/.local/state/capsplus/` 里写（test_voice_clipboard 真栽过一次）。
     os.environ["CAPSPLUS_STATE_DIR"] = str(_sandbox("module"))
 
 
@@ -308,7 +308,7 @@ def kill_fixture_daemons() -> None:
     """收掉本轮 fork 出来的留守者。
 
     **只扫 `/proc` 里 argv 含本轮沙箱路径的进程**（`SANDBOX` 里带着本次测试进程自己的 pid），
-    所以碰不到并发的另一次测试运行，更碰不到明江的任何进程。
+    所以碰不到并发的另一次测试运行，更碰不到用户的任何进程。
     为什么不用 `daemons.pids` 收尸：父进程退得比子进程被调度还早，那行登记可能**来不及写**，
     按文件收尸就会漏（本轮实测漏了两个）。
     """
@@ -355,7 +355,7 @@ class TestTheRealWlCopyShape(unittest.TestCase):
         self.addCleanup(kill_fixture_daemons)
 
     def test_capture_output_on_a_forking_command_never_sees_eof(self):
-        """老写法具型：`capture_output=True` + 超时 = 明江 09:15 那个 `steps=0`。
+        """老写法具型：`capture_output=True` + 超时 = 用户 09:15 那个 `steps=0`。
 
         这条**不是**在测被测代码 —— 它钉的是"这个夹具真的能重放事故"。否则后面那句
         "守护步现在毫秒级返回"就是空口无凭：夹具要是没 fork 出握着管道的留守者，

@@ -139,7 +139,7 @@ class TestWaitForFile(unittest.TestCase):
 
 
 class TestTimeoutReport(unittest.TestCase):
-    """超时话术必须**可操作**：明江讨厌被打断，给他能自己跑的一条命令，而不是一句"失败了"。"""
+    """超时话术必须**可操作**：用户讨厌被打断，给他能自己跑的一条命令，而不是一句"失败了"。"""
 
     def setUp(self):
         self.text = SF.timeout_report("/tmp/out.png", 3000, journal_hint="journalctl --user -n 200")
@@ -326,7 +326,7 @@ class TestSaveLocation(unittest.TestCase):
         with mock.patch.dict(os.environ, {}, clear=False):
             os.environ.pop("CAPSPLUS_SHOT_DIR", None)
             self.assertEqual(SF.save_dir(), Path.home() / "Pictures" / "Screenshots",
-                             "默认落点按明江的要求是 ~/Pictures/Screenshots（不许写死某个家目录）")
+                             "默认落点按用户的要求是 ~/Pictures/Screenshots（不许写死某个家目录）")
 
     def test_filename_carries_a_timestamp(self):
         name = SF.shot_filename(datetime.datetime(2026, 10, 19, 11, 22, 33))

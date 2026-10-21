@@ -5,7 +5,7 @@
 """判据：扩展的**部署前预检**（`tools/preflight-extension.sh` / `capsplus/extpreflight.py`）。
 
 为什么这一层要有判据（2026-10-20 真事故）：坏文件进了扩展目录 ⇒ shell import 失败 ⇒ 进 ERROR 态
-⇒ Wayland 下只能注销重登才能恢复。明江那天为此重登了 3 次。所以"挡住坏文件"这件事本身
+⇒ Wayland 下只能注销重登才能恢复。用户那天为此重登了 3 次。所以"挡住坏文件"这件事本身
 必须有**会红过的**判据 —— 而且最要紧的一条不是"预检报了红"，是
 **"报红的时候一个字节都没写"**：只报不挡等于没挡。
 
@@ -237,7 +237,7 @@ class TestSyncRefusesToWrite(unittest.TestCase):
 
     做法：造一个**假仓**（复制 tools/preflight-extension.sh + capsplus/ + 扩展）与一个**假 HOME**
     （`$HOME/.local/share/gnome-shell/extensions/<uuid>` 里先放一份**完好**的部署副本）。
-    这样真跑 `install-extension.sh --sync` 也只可能碰假 HOME —— 明江真那一份部署副本全程零接触。
+    这样真跑 `install-extension.sh --sync` 也只可能碰假 HOME —— 用户真那一份部署副本全程零接触。
     """
 
     def setUp(self):

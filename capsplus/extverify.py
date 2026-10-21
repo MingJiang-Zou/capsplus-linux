@@ -4,7 +4,7 @@
 #   上游 https://github.com/wo52616111/capslock-plus （GPL-2.0，© wo52616111）；改动见 README「许可与上游」。
 """登录后**一条命令自证**：`tools/verify-after-login.sh` 的判词。
 
-为什么要有它（2026-10-20）：明江那天因为改 `extension.js` 重登了 3 次，而且有一次登录后扩展直接
+为什么要有它（2026-10-20）：用户那天因为改 `extension.js` 重登了 3 次，而且有一次登录后扩展直接
 进了 ERROR 态 —— "重登完到底行不行"当时只能靠**按 Caps+F1 试一下**（手的记忆，没有证据）。
 这条命令把"行不行"变成一张 PASS/FAIL 表，一条命令跑完，不用鼠标、不用人眼看。
 
@@ -15,7 +15,7 @@
   ④ `Probe` 往返             —— 发一个信号，journal 里必须**多出一行** `[raise-browser] probe …`
   ⑤ 真抓一帧 200×150         —— 产物是完整 PNG **且像素不是纯色**（纯色 = 抓了个空/黑）
   ⑥ 贴图 + 清贴图             —— PIN 与 CLEAR 两条路的 ack 都要回来（贴图会短暂出现在屏幕上）
-  ⑦ 遮罩起停                 —— 在 **xvfb 里**建窗→量尺寸→收窗，**不碰明江的屏**
+  ⑦ 遮罩起停                 —— 在 **xvfb 里**建窗→量尺寸→收窗，**不碰用户的屏**
 
 两条口径上的讲究（都是踩出来的，别改回去）：
   * **判活不认 `gdbus call …Probe`**：本机 GJS 导出不了 D-Bus 对象，那条命令只会回
@@ -202,7 +202,7 @@ def pin_clear_state(png: Path | None, pin_fn, clear_fn) -> tuple:
 
 # --------------------------------------------------------------------- 遮罩（在 xvfb 里）
 
-# 为什么在 xvfb 里跑：遮罩是**全屏置顶窗口**，真跑会在明江屏幕上盖住一切 —— 那正是他抱怨过的事
+# 为什么在 xvfb 里跑：遮罩是**全屏置顶窗口**，真跑会在用户屏幕上盖住一切 —— 那正是他抱怨过的事
 # （"老把 qbar 和设置页面换出来"）。xvfb 里建窗→量尺寸→收窗，验的是同一段真代码路径。
 # 三条安全阀（本仓的硬口径，写进判据里）：① `-u WAYLAND_DISPLAY` 不够，还要 `GDK_BACKEND=x11`
 # 且显式 `CAPSPLUS_GUI=1`；② 驱动里**先查后端**，是 Wayland 就拒跑（不许赌环境变量）；③ 跑完收窗。
@@ -376,7 +376,7 @@ def run_all(*, journal_fn=None, unit_fn=None, owned_fn=None, emit_fn=None,
             png = tmp / m.group(1)
 
     if no_screen:
-        rows.append((SKIP, "--no-screen：贴图会在明江屏幕上短暂出现，这次跳过"))
+        rows.append((SKIP, "--no-screen：贴图会在用户屏幕上短暂出现，这次跳过"))
     else:
         rows.append(pin_clear_state(png, pin_fn, clear_fn))
 

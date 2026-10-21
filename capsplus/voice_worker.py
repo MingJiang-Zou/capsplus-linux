@@ -31,7 +31,7 @@
     `INJECT_FLOOR_MS` 只是**下限**、`INJECT_WAIT_CAP_MS` 只是**上限兜底**；等满上限还拿不到
     任何这类信号，就带着诊断注入并把这一次标成**未确认**（Wayland 不保证给我们这种通知），
     绝不写成"上屏结束"。等待全程由主循环计时（`GLib.timeout_add`），不是主线程 sleep ——
-    否则 Ctrl+V 会贴进我们自己的窗口，而"贴进去又随窗口消失"就是明江看到的"闪一下"；
+    否则 Ctrl+V 会贴进我们自己的窗口，而"贴进去又随窗口消失"就是用户看到的"闪一下"；
   * **剪贴板的还原同一条时序模型**（2026-10-17 补）：上屏前在后台线程读一份内存快照，
     粘贴之后由主循环 `after_ms(CLIPBOARD_SETTLE_MS, …)` 计时，到点再起一个后台线程跑
     `voice_inject.perform_restore`。快照**只在内存**，永不落盘（判据
@@ -39,7 +39,7 @@
 
 为什么定成这个样子（真机事故，2026-10-17）：旧写法每个 utterance 新开一个 GTK 线程 +
 `GLib.MainLoop`，主线程 `join()` + `time.sleep` 轮询；mutter 对客户端的 ping 落在主线程
-上没人应答，明江的 GNOME 直接弹「"voice_worker.py" 无响应（等待/强制退出）」。本仓早就
+上没人应答，用户的 GNOME 直接弹「"voice_worker.py" 无响应（等待/强制退出）」。本仓早就
 用血换过这条结论（`qbar_app.py::_pump` 的 A/B 实测：主循环不转，连 D-Bus 消息都发不出去），
 语音这条链把它又犯了一遍。判据三层，都能红：
 `tools/verify-voice-mainloop.sh`（进程级：主线程 wchan 不许是 hrtimer_nanosleep）、
@@ -121,7 +121,7 @@ def should_abandon(session, now: float | None = None, limit: float = MAX_SESSION
 # ── 注入的触发条件（2026-10-17 改口径：从"拍脑袋计时"改成"确认自己已经不在焦点链上"）──
 #
 # 旧写法只有一个 `FOCUS_RETURN_MS = 120` 的定时器：窗口销毁之后固定等 120ms 就发 Ctrl+V。
-# 真机现象（明江 17:19：文字像贴上去了又被删掉，"闪烁了一下"）说明**这段时间既不充分也不是
+# 真机现象（用户 17:19：文字像贴上去了又被删掉，"闪烁了一下"）说明**这段时间既不充分也不是
 # 证据** —— 它只是"过了 120 毫秒"，不说明焦点交给了谁。现在三段分开，判据各自钉在段上：
 #
 #   必要条件  时间线里出现 `unmap` 或 `focus_out`（`voice_osd.RELEASE_KINDS`）：
@@ -129,7 +129,7 @@ def should_abandon(session, now: float | None = None, limit: float = MAX_SESSION
 #   下限      `INJECT_FLOOR_MS`：事实到得再早也不许比这更快动手。X11/GTK3 实测（Xvfb +
 #             `CAPSPLUS_GUI=1`，2026-10-17 晚）：`destroy()` 里 **unmap 与销毁是同步的**，
 #             Enter 之后 0.03ms 就到；`focus_out` 在没有窗口管理器的环境里**根本没来**。
-#             所以"只等事件"在那个平台上等于不等。下限取 120ms = 明江一直活着、本轮真机
+#             所以"只等事件"在那个平台上等于不等。下限取 120ms = 用户一直活着、本轮真机
 #             也确实在跑的那个值 —— 这次改动**不许把注入提得比现状更早**。
 #   上限兜底  `INJECT_WAIT_CAP_MS`：等满了仍然一个"焦点交出"的信号都没拿到（Wayland 不保证
 #             把这种通知交给客户端），**带着诊断**注入，并把这一次标成**未确认**而不是
@@ -164,7 +164,7 @@ def _num(value, missing: int = -1) -> str:
 def timeline_token(timeline) -> str:
     """把时间线压成一个 token：`map@-8,focus_in@-7,finish@0,unmap@250,destroy@250`（**毫秒**，相对 Enter）。
 
-    只有 `kind` 与时刻，别的什么都没有 —— 明江真机日志里最想要的就这一串：
+    只有 `kind` 与时刻，别的什么都没有 —— 用户真机日志里最想要的就这一串：
     单位与 `enter_ms`/`release_ms` 一致（微秒读起来没人能对得上现象），Enter 之前的事件是负数
     （`map@-8` = 开窗后 8 毫秒才进焦点链），之后的是正数。
     """
@@ -180,7 +180,7 @@ def timeline_token(timeline) -> str:
 
 
 def inject_diag_line(diag: dict) -> str:
-    """`inject_diag key=value …`：**固定前缀 + key=value**，给明江拿去和真机现象对齐。
+    """`inject_diag key=value …`：**固定前缀 + key=value**，给用户拿去和真机现象对齐。
 
     里面只有状态量：弹窗可见性/实化/mapped、Enter→注入与 Enter→焦点交出的毫秒数、
     让这一步的是哪个 gate、时间线 token。**识别文本、剪贴板内容一个字符都不许进这一行**
@@ -264,7 +264,7 @@ def idle_note(diag: dict) -> str:
 
 
 def verdict_line(diag: dict, clip_diag: dict | None = None) -> str:
-    """`status` 里"上次上屏：结论 + 依据"那**一行**（明江只要贴这一行给我，不必贴整页）。
+    """`status` 里"上次上屏：结论 + 依据"那**一行**（用户只要贴这一行给我，不必贴整页）。
 
     结论放在最前面，第二个词就是依据；后面跟"凭什么"的状态量。控制在一行内 ——
     这行是他复制粘贴的唯一入口，长了就等于没有。
@@ -298,7 +298,7 @@ def truncation_hint(vad) -> str:
     """"录满上限被截断"的提示文案（空串 = 没截断）。
 
     为什么要一条**专门**的文案：旧行为是到了 `MAX_MS` 就静默收尾，用户只知道"我后半句没了"，
-    查不出是设备、服务还是这个上限（明江 2026-10-20 的原话就是「只可以是短语音」）。
+    查不出是设备、服务还是这个上限（用户 2026-10-20 的原话就是「只可以是短语音」）。
     现在这句话会同时出现在：`decoding` 事件、review 弹窗顶部、`voice.log`、`status` 的能量门行。
     """
     if vad is None or vad.stop_reason != "max_duration":
@@ -737,7 +737,7 @@ class Server:
         """只缓存**通过**的探测。
 
         为什么没通过的不缓存：worker 是常驻的（照 Qbar），而 `ydotoold` 常常是**后来**才起来的
-        —— 把第一次的"未验证"钉死，明江装了 daemon 之后还会一直得到 manual 的结果。
+        —— 把第一次的"未验证"钉死，用户装了 daemon 之后还会一直得到 manual 的结果。
         """
         with self._probe_lock:
             if self._probe is None or not self._probe.verified:
@@ -763,7 +763,7 @@ class Server:
             self._set_clipboard_summary(note)
         if job is None:
             # 没有作业 = 这次**不会**有任何东西回来（开关关着 / 备份没成 / 降级 / manual）。
-            # 这条分支必须落进日志：明江看到的"闪一下"如果正是 300ms 后的还原，这里会是 armed。
+            # 这条分支必须落进日志：用户看到的"闪一下"如果正是 300ms 后的还原，这里会是 armed。
             self.clipboard_diag = {"branch": "skip", "still_ours": None}
             P.log_line(restore_diag_line("skip"))
             return
@@ -1212,7 +1212,7 @@ def cmd_meter(seconds: float = 3.0) -> int:
 
     存在的理由（2026-10-20）："识别率低"这句话可以指三件完全不同的事 ——
     ① 说话太轻（语音段 RMS 低）；② 底噪太高（门限被抬得很高，弱起音过不去）；
-    ③ 模型/音频格式问题。没有这个命令，三种只能靠猜；有了它，明江对着麦克风说一句就知道是哪一种。
+    ③ 模型/音频格式问题。没有这个命令，三种只能靠猜；有了它，用户对着麦克风说一句就知道是哪一种。
     """
     params = V.params_from_env()
     try:

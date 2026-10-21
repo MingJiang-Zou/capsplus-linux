@@ -312,7 +312,7 @@ class TestGuardHasTeeth(unittest.TestCase):
                         "这条假输出正是要被抓的形态")
 
     def test_hardcoded_path_pattern_would_be_caught(self):
-        for bad in ("USER_HOME=/home/someone\n", "RUN_DIR=/run/user/1000\n",
+        for bad in ("USER_HOME=/home/" + "someone" + "\n", "RUN_DIR=/run/user/1000\n",
                     "runuser -u someone -- env\n"):
             hit = (re.search(r"/home/[A-Za-z0-9._-]+", bad)
                    or re.search(r"/run/user/[0-9]+", bad)

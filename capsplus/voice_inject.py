@@ -28,7 +28,7 @@
 
 ### 2026-10-19 的事故：这个功能从落地起**一次都没真贴上过字**
 
-真机取证（明江 09:15）：识别 6 字，焦点事实拿到了（`gate=floor … visible=0 mapped=0 unmap=1
+真机取证（用户 09:15）：识别 6 字，焦点事实拿到了（`gate=floor … visible=0 mapped=0 unmap=1
 destroy=1`，**不是**"贴进自己弹窗"），5 秒后 `inject_done backend=clipboard ok=0 code=step_failed
 steps=0` —— 55 减 50 恰好 `STEP_TIMEOUT_S = 5.0`。根因：执行器用
 `subprocess.run(..., capture_output=True, timeout=STEP_TIMEOUT_S)` 跑 **`wl-copy`**，而 `wl-copy`
@@ -153,7 +153,7 @@ RESTORE_ENV = "CAPSPLUS_VOICE_RESTORE_CLIPBOARD"      # =0 关掉还原（默认
 # 粘贴之后到"允许还原"之间的缓冲。**不能是 0**：`wl-copy` 退出码 0 只表示"我挂上了选区所有权"，
 # 目标应用收到 Ctrl+V 之后还要**异步**向源端要一次数据（offer → data_offer → 读管道）。
 # 在这一步之前回写，等于把自己刚给出去的东西抽走，应用粘到的是空或旧内容。
-# 也不能太长（早先对明江说过 800ms，那个数没有依据）：这段等待里他自己复制了别的东西，
+# 也不能太长（早先对用户说过 800ms，那个数没有依据）：这段等待里他自己复制了别的东西，
 # "还是我们写的吗"就判否 ⇒ 白等一场不还原。300ms 是按"够用就好"取的，真机要调只动这一处。
 CLIPBOARD_SETTLE_MS = 300
 
@@ -693,7 +693,7 @@ def snapshot_clipboard(probe: Probe, run, primary: bool = False,
     """把剪贴板当前内容读进内存（两步：先问类型，再按选中的那种读字节）。
 
     任何一步不成都抛 —— 回来一个带 `problem` 的 Snapshot，调用方据此决定**不还原**并如实说明。
-    `run` 是注入点：单测必须给假的（真跑就是往明江的剪贴板上伸手）。
+    `run` 是注入点：单测必须给假的（真跑就是往用户的剪贴板上伸手）。
     """
     if not probe.clipboard_backup:
         # 走 Probe.clipboard_backup 而不是裸摸 wl_paste：那句"故意不进 verified"的口径要有人用着
@@ -873,7 +873,7 @@ def degraded_clipboard_write(text: str, backend: str, probe: Probe, run) -> Inje
     2026-10-19 两点：①这一步就是「先占后贴」的**前半段**（弹窗还在、用户自己再粘）——
     写入走守护步执行器并**当场回读自证**；②降级场景下我们**必然没有键盘焦点**（worker 后台常驻），
     正是"所有权可能被拒"的最坏形状 —— rc=0 却回读不到我们的文本 ⇒ 报 `owner_rejected`，
-    **不许**再对明江说"文本已写进剪贴板"（那条承诺没有证据）。
+    **不许**再对用户说"文本已写进剪贴板"（那条承诺没有证据）。
     """
     if not probe.wl_copy or backend not in ("clipboard", "primary"):
         return None
@@ -914,7 +914,7 @@ def inject(text: str, backend: str | None = None, probe: Probe | None = None,
     """执行上屏。任何一步失败都归成结构化结果，**不抛异常**。
 
     `runner` 注入的是 `subprocess.run` 等价物 —— 单测必须注入假的，
-    否则就会往**明江正在用的屏幕**上打键（红线），也就会真去读他的剪贴板。
+    否则就会往**用户正在用的屏幕**上打键（红线），也就会真去读他的剪贴板。
     步骤一律走 `run_step`（守护/普通两种等法，2026-10-19）；写剪贴板之后**当场回读自证**
     （`verify_clipboard_write`），回读不是我们的文本 ⇒ `owner_rejected` 且**不发粘贴**。
 

@@ -122,7 +122,7 @@ def clear(*, emit_fn=None, wait_fn=None, ack_path=None, timeout_ms: int = PIN_TI
     """`Caps+Esc` 的活儿：清空屏幕上所有贴图。返回 `(ok, 说明)`。
 
     **没有贴图时也安全**（扩展侧只是清 0 张 + 写 ack 一行 `cleared=0`）——
-    这条是硬口径：全局热键最怕"没东西时按一下就报错"，那会让明江不敢按。
+    这条是硬口径：全局热键最怕"没东西时按一下就报错"，那会让用户不敢按。
     """
     ack = Path(ack_path) if ack_path else (raw_dir() / f"clear-{os.getpid()}.ack")
     ack.parent.mkdir(parents=True, exist_ok=True)

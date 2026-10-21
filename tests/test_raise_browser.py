@@ -208,7 +208,7 @@ class TestExtensionStatusReport(unittest.TestCase):
     """`capsplus status` 的扩展体检：状态要读得到，且每种状态都带下一步动作。
 
     存在理由：扩展加载失败是**静默**的（只在 journal 留一行），Qbar 走信号又没有回复通道，
-    用户只能看到"还是新窗口"。2026-10-16 我因此白让明江重登了一次 —— 现场必须能自己说清。
+    用户只能看到"还是新窗口"。2026-10-16 我因此白让用户重登了一次 —— 现场必须能自己说清。
     """
 
     # 判据用的是模块级名字，不写 `cls.fn = extension_status`：
@@ -337,7 +337,7 @@ class InstallScriptSandbox:
     """把 `tools/install-extension.sh` 放进一个**什么都碰不到**的沙箱里真跑。
 
     三条不碰真机的要求（穷举过）：
-      * `HOME` 指到临时目录 ⇒ 部署副本写不到明江的 ~/.local；
+      * `HOME` 指到临时目录 ⇒ 部署副本写不到用户的 ~/.local；
       * `PATH` 最前面放假 `gsettings` ⇒ 绝不去读/写他真实的 dconf（`--sync` 会写启用列表！）；
       * 假 `gdbus` / `notify-send` ⇒ 失败路径的桌面通知只落在夹具日志里（**不许弹到他屏幕上**）。
     """
@@ -608,7 +608,7 @@ class TestPumpNotSleep(unittest.TestCase):
 
     2026-10-16 血案：A/B 工具用真 MainLoop 测出 +0（原窗口开标签页），
     而 Qbar 里写的是 `GLib.usleep(80_000)` —— 主线程睡过去，主循环不转，
-    队列里的信号一条都没写出去，所以明江重登后手动测"还是一样"。
+    队列里的信号一条都没写出去，所以用户重登后手动测"还是一样"。
     """
 
     @classmethod
@@ -697,7 +697,7 @@ GNOME Shell-Message: 18:56:24.382: [raise-browser] 已启用 iface=io.github.cap
 BENCH_SYNTAX_ERROR_LINE = (
     "(gnome-shell:36283): GNOME Shell-CRITICAL **: 18:56:38.408: Extension "
     "raise-browser@capsplus.example: SyntaxError: unexpected token: identifier @ "
-    "file:///home/zmj/.local/share/gnome-shell/extensions/raise-browser@capsplus.example/"
+    "file:///home/<user>/.local/share/gnome-shell/extensions/raise-browser@capsplus.example/"
     "extension.js:990:6")
 
 
@@ -825,7 +825,7 @@ class TestBenchScriptShape(unittest.TestCase):
         self.assertNotRegex(code, r"(?<!\$)\(\( ", "用了 bash 的 `(( ))` 算术命令，dash 会整段炸")
 
     def test_only_kills_its_own_pid(self):
-        """绝不许 `pkill -f gnome-shell`：那会杀掉明江正在用的会话（本仓踩过同类坑）。"""
+        """绝不许 `pkill -f gnome-shell`：那会杀掉用户正在用的会话（本仓踩过同类坑）。"""
         code = sh_code(self.SCRIPT.read_text(encoding="utf-8"))
         self.assertNotIn("pkill", code)
         self.assertNotIn("killall", code)

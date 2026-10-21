@@ -2,7 +2,7 @@
 # Copyright (c) 2026 capsplus-linux contributors
 # 本文件属 capsplus-linux —— CapsLock+ v3.3.0 的 Linux 移植（衍生作品）；按键映射数据译自上游：
 #   上游 https://github.com/wo52616111/capslock-plus （GPL-2.0，© wo52616111）；改动见 README「许可与上游」。
-"""上屏注入的**触发条件**判据（2026-10-17，明江真机：文字"贴上又被删掉，闪烁了一下"）。
+"""上屏注入的**触发条件**判据（2026-10-17，用户真机：文字"贴上又被删掉，闪烁了一下"）。
 
 修前只有一个定时器：窗口销毁之后固定等 `FOCUS_RETURN_MS = 120ms` 就发 Ctrl+V。
 "过了 120 毫秒"不等于"焦点已经回到原文档" —— 而 Ctrl+V 落进我们**自己**那个正在消失的弹窗，
@@ -178,7 +178,7 @@ class ThreadTracker:
 
 
 class Harness:
-    """一台假 worker：假状态目录（**绝不碰明江的真目录**）+ 假剪贴板 + 手动跑的时间轴。"""
+    """一台假 worker：假状态目录（**绝不碰用户的真目录**）+ 假剪贴板 + 手动跑的时间轴。"""
 
     def __init__(self, text=SECRET, clipboard=None):
         self.tmp = tempfile.TemporaryDirectory()
@@ -615,7 +615,7 @@ class TestCapFallbackIsNotInfinite(unittest.TestCase):
         self.assertEqual(self.h.session.state, "idle")
         diag = self.h.srv.last_inject_diag
         self.assertEqual((diag["visible"], diag["realized"], diag["mapped"]), (True, True, True),
-                         "假窗口说它还可见/还 mapped，诊断必须照实报（这正是明江现象的形状）")
+                         "假窗口说它还可见/还 mapped，诊断必须照实报（这正是用户现象的形状）")
         line = W.inject_diag_line(diag)
         self.assertTrue(line.startswith("inject_diag "), line)
         for token in ("gate=cap", "enter_ms=", "visible=1", "realized=1", "mapped=1",
@@ -672,7 +672,7 @@ class TestDiagnosticsCarryNoText(unittest.TestCase):
         for what, blob in blobs.items():
             self.assertNotIn(SECRET, blob, f"识别文本漏进 {what}：{blob}")
             self.assertNotIn(CARD, blob, f"剪贴板内容漏进 {what}：{blob}")
-        # 沙箱护栏：这些用例写的是临时状态目录，不是明江的真目录
+        # 沙箱护栏：这些用例写的是临时状态目录，不是用户的真目录
         self.assertTrue(str(P.log_path()).startswith(self.h.state_dir), P.log_path())
         self.assertNotEqual(P.log_path(), Path.home() / ".local" / "state" / "capsplus" / "voice.log")
 
@@ -708,7 +708,7 @@ class TestStatusLineAndRestoreBranch(unittest.TestCase):
         line = W.verdict_line(diag, {"branch": "restored", "still_ours": True})
         self.assertEqual(len(line.splitlines()), 1, f"verdict 不是一行：{line!r}")
         self.assertTrue(line.startswith("结论="), line)
-        self.assertLess(len(line), 220, f"一行太长，明江贴起来还是难受：{len(line)}")
+        self.assertLess(len(line), 220, f"一行太长，用户贴起来还是难受：{len(line)}")
         for token in ("gate=nowin", "Enter→注入=200ms", "后端=clipboard", "ok=1",
                       "还原=restored", "回读=还是我们写的"):
             self.assertIn(token, line, f"verdict 缺 {token}：{line}")

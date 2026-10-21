@@ -5,7 +5,7 @@
 """上屏后端的单测：命令序列、运行时探测、以及**不许假装能成功**那条红线。
 
 为什么这批用例必须全部用假 runner / 假探针：真跑一次 `ydotool key` 就是往
-明江正在用的屏幕上打键（硬边界）。所以：
+用户正在用的屏幕上打键（硬边界）。所以：
 
   * `run_probe(...)` 的四个注入口在测试里一律给假件，并断言 `Probe.ran is False`
     —— "这条用例有没有碰真系统"是**可断言的**，不是靠人记得；
@@ -101,7 +101,7 @@ class TestProbeLogic(unittest.TestCase):
                              daemon_probe=lambda: (True, "可达"),
                              header=header)
         self.assertTrue(p.verified, p.problems)
-        self.assertFalse(p.ran, "注入了假件还跑了真命令 = 这条用例在动明江的屏幕")
+        self.assertFalse(p.ran, "注入了假件还跑了真命令 = 这条用例在动用户的屏幕")
         self.assertEqual(p.keycodes, FAKE_CODES)
         self.assertEqual(sorted(p.syntax), ["click-bitmask", "keycode"])
 

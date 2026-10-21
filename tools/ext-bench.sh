@@ -9,7 +9,7 @@
 # 为什么要有它（2026-10-20）：GNOME 只在启动时扫描扩展目录（`ReloadExtension` 上游已废弃，
 # 实测返回 deprecated and does not work；Wayland 也没有 Alt+F2 r）⇒ 改一行 extension.js 就要
 # 注销重登。更坏的是**扩展坏了不报错**：现象只是 Caps+F1 没反应，于是"重登"从最后一步变成了
-# 排查手段。明江原话：「老是要重登 感觉也不好吧」。现在：改完先跑这个（1~3 秒，不碰他正在用的
+# 排查手段。用户原话：「老是要重登 感觉也不好吧」。现在：改完先跑这个（1~3 秒，不碰他正在用的
 # 会话），绿了再去重登 —— 重登只用于把新代码送进他自己的 shell。
 #
 # 输出约定（别改，脚本和人都靠它）：干净的一行结论打 **stdout**
@@ -22,7 +22,7 @@
 # 三条硬边界（都踩过，别自己发明）：
 #   ① 判活只认日志，不认 gdbus：本机 gjs 的 register_object 是原始 C 绑定，扩展导出不了对象，
 #      隔离会话里 `gdbus … --method Probe` 报 UnknownMethod「对象在路径处不存在」（2026-10-20 实测）。
-#   ② 只 kill 自己起的那个 pid（`$!`）。**绝不许** `pkill -f gnome-shell` —— 那会杀明江的会话。
+#   ② 只 kill 自己起的那个 pid（`$!`）。**绝不许** `pkill -f gnome-shell` —— 那会杀用户的会话。
 #   ③ 判词不在这里写第二遍：解析走 `python3 -m capsplus.extcheck --bench-log`（那边能单测：
 #      把日志喂给 bench_verdict 就行，不用真起 shell）。
 #
@@ -85,7 +85,7 @@ REPO_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 
 # 外层：把自己塞进一个**独立会话总线**再跑一遍（内层）。这样 headless shell 顺手激活的那些
 # 服务（nautilus / tracker / portal / evolution …）全挂在临时总线上，总线一关就一起收尸，
-# **不会**注册到明江真实的会话总线上去。
+# **不会**注册到用户真实的会话总线上去。
 # 参数改走环境变量传（POSIX sh 没有数组，别为了"好写"退回 bash）。
 # 会话噪音统一塞进 `$LOG.noise`：dbus-daemon 与它激活的那些服务继承的正是这一路 stderr，
 # 不重定向的话调用者终端会被几十行 nautilus/portal 警告糊满（2026-10-20 第一次跑就是这样）。
@@ -134,7 +134,7 @@ if ! command -v python3 >/dev/null 2>&1; then
 fi
 
 # XDG_RUNTIME_DIR 是 mutter 起 Wayland 后端的硬前置。它抢不到 wayland-0 的 lock 时会自己退到
-# wayland-1，**不会**动到明江正在用的那个 compositor（2026-10-20 实测：日志里就是
+# wayland-1，**不会**动到用户正在用的那个 compositor（2026-10-20 实测：日志里就是
 # "unable to lock lockfile …/wayland-0.lock … Using Wayland display name 'wayland-1'"）。
 : "${XDG_RUNTIME_DIR:=/run/user/$(id -u)}"
 export XDG_RUNTIME_DIR
@@ -188,4 +188,4 @@ else
     : > "$NOISE"
 fi
 say "EXT_OK（${elapsed}s）：部署副本在 headless shell 里加载成功，抓帧/贴图通道都挂上了"
-say "  ⇒ 文件层面没问题；要在明江自己的会话里生效，最后一步**仍是注销重登**"
+say "  ⇒ 文件层面没问题；要在用户自己的会话里生效，最后一步**仍是注销重登**"
