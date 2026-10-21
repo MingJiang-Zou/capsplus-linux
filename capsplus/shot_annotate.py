@@ -967,9 +967,11 @@ class Annotator:
     """标注窗。除 `run()`/`_build()` 外的方法都不碰 gi，判据能直接调（见测试的 stub 版）。"""
 
     def __init__(self, base_surface, on_pin=None, screen=(1920, 1080), directory=None, clip=None,
-                 on_ocr=None, on_translate=None):
+                 on_ocr=None, on_translate=None, copy_text=None):
         self.base = base_surface
         self._clip = clip or copy_to_clipboard      # 判据注入 stub：不许在测试里动明江的剪贴板
+        # 面板文本走**另一条**（wl-copy --type text/plain），同样可注入；默认就是生产实现
+        self._copy_text = copy_text or copy_text_to_clipboard
         self._loop = None
         self._win = None
         self.size = (base_surface.get_width(), base_surface.get_height())
@@ -1403,18 +1405,41 @@ class Annotator:
         return res["ok"]
 
     def copy_panel_text(self) -> tuple:
-        """面板上的"复制"：把当前该复制的那段喂给剪贴板（PGC：走注入的 clip，判据不动真剪贴板）。"""
+        """面板上的"复制"：把当前该复制的那段**文本**送进剪贴板。
+
+        2026-10-20 真机事故（明江："翻译以及 OCR 出来的文本点击那个复制按钮复制不出来"）。
+        这里原先写的是：
+
+            display.get_clipboard(Gdk.SELECTION_CLIPBOARD).set_text(text, -1)
+
+        `get_clipboard` 是 **GTK4** 的 API，GTK3 的 `Gdk.Display` 上没有它 —— 真机实测
+        `AttributeError: 'GdkWaylandDisplay' object has no attribute 'get_clipboard'`。
+        异常抛在 GTK 的信号处理器里，stderr 落在 keyd 那条**没人看**的路径（热键起的进程），
+        所以现象就是"按钮点了完全没反应"。（与 2026-10-20 早先那个 `cairo.Context.flush()`
+        同类：调了一个这个对象上不存在的方法，而当时 1224 条判据没一条走过这条路。）
+
+        现在改走**与 Ctrl+C 同一条** `wl-copy` 文本链路（`copy_text_to_clipboard`）：
+          · 选区由 `wl-copy` 这个**外部进程**持有 ⇒ 窗口关掉、标注器退出后文字还在。
+            GTK 自己的剪贴板做不到这点（应用一退出选区就没了），那正是"复制了却粘不出来"的另一半；
+          · 它已经带着"留守者握着 stderr"那套守护步处理（见 `_default_clipboard_runner`），
+            不会像裸 `subprocess.run` 那样卡满 5 秒把界面冻住（2026-10-19 那次"多按几次 Ctrl+C
+            程序就异常"的根因）。
+        失败**如实说并留在面板上**人能重试，不许静默；状态栏当场刷新，别让"成功"和"没反应"长得一样。
+        """
         text = self.panel.primary_text()
         if not text.strip():
             self.panel.set_error("✗ 没有可复制的内容")
+            self.say("✗ 没有可复制的内容")
             return False, "✗ 没有可复制的内容"
-        _Gtk, Gdk, GLib = _gtk()
-        display = Gdk.Display.get_default()
-        if display is None:
-            return False, "✗ 连不上显示服务器，剪贴板不可用"
-        display.get_clipboard(Gdk.SELECTION_CLIPBOARD).set_text(text, -1)
-        self.message = "✓ 已复制面板文本"
-        return True, self.message
+        ok, msg = self._copy_text(text)
+        self.say("✓ 已复制文本" if ok else msg)
+        return ok, msg
+
+    def say(self, message: str) -> None:
+        """写一句给人看的话并**立刻刷到状态栏**（窗口没建起来时只记着，`_build` 末尾会刷）。"""
+        self.message = message
+        if getattr(self, "_status", None) is not None:
+            self.refresh_status()
 
     # ---- GTK ----
     def _build(self):

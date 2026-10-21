@@ -25,6 +25,11 @@
      （方法不存在 / 参数不兼容当场红）；**新绘制函数不登记就红**（不许静默漏掉）；
   ④ 全仓体检：源码里对 cairo 上下文 / gi 模块调的每个方法名，逐个拿**真对象** `hasattr` 核
      —— 不靠人眼 grep，也不靠一张写死的方法名白名单（那等于把"哪些方法存在"抄成第二份真相）。
+  ⑤ 同一形状的第二个实例（2026-10-20 晚）：结果面板的"复制"按钮用了 **GTK4** 的
+     `Gdk.Display.get_clipboard()`，而本仓是 GTK3 —— 真机上 `AttributeError: 'GdkWaylandDisplay'
+     object has no attribute 'get_clipboard'`，异常抛在信号处理器里没人看见，现象就是"点了没反应"。
+     ④ 只核了 `Gtk./Gdk.` 这类**模块级**引用，漏了**实例方法**。⑤ 补上：
+     `display = Gdk.Display.get_default()` 之后所有 `display.xxx` 都拿真 `Gdk.Display` 类 `hasattr` 核。
 
 反例具型：把 `cr.flush()` 加回 `draw_colour_readout()` ⇒ 本文件必红（`TestTheIncidentShapeIsCaught`
 在进程内复现同一条错误；真改文件跑一遍的现场见交付报告）。
@@ -679,6 +684,84 @@ class TestNoCallsToMethodsThatDoNotExist(unittest.TestCase):
                    for (mod, attr), where in sorted(seen.items())
                    if not hasattr(GI_MODULES[mod], attr)]
         self.assertEqual(bad, [], "这些 gi 模块级属性在真 PyGObject 上不存在：\n  " + "\n  ".join(bad))
+
+
+
+# ---------------------------------------------------------------------------
+# ⑤ 实例方法也要核：`display.xxx` 必须真的在 Gdk.Display 上存在
+# ---------------------------------------------------------------------------
+DISPLAY_ASSIGN = "Gdk.Display.get_default()"
+
+
+def display_methods_that_do_not_exist(source: str, display_cls) -> list[str]:
+    """返回 `display.<方法>` 里那些**在真 `Gdk.Display` 上不存在**的（纯函数：判据与反例具型共用）。
+
+    只认"从 `Gdk.Display.get_default()` 赋出来的那个变量名"，别的同名变量不碰 ——
+    宁可漏（少抓一处）也不要误报（那会让人为了绿去改无关代码）。
+    """
+    tree = ast.parse(source)
+    names = set()
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Assign) or not isinstance(node.value, ast.Call):
+            continue
+        func = node.value.func
+        if not isinstance(func, ast.Attribute) or func.attr != "get_default":
+            continue
+        # 形状：<什么>.get_default()，且整条表达式文本里有 Gdk.Display
+        if not any(isinstance(t, ast.Name) and t.id == "Gdk" for t in ast.walk(func.value)):
+            continue
+        for target in node.targets:
+            if isinstance(target, ast.Name):
+                names.add(target.id)
+    bad = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name) \
+                and node.value.id in names and not hasattr(display_cls, node.attr):
+            bad.append(f"line {node.lineno}: {node.value.id}.{node.attr}() "
+                       f"在 {display_cls.__name__} 上不存在")
+    return bad
+
+
+@unittest.skipUnless(HAVE_GI, "没有 gi：这条要拿真 Gdk.Display 类 hasattr")
+class TestNoGtk4ApisInGtk3Code(unittest.TestCase):
+    """判据：GTK3 的地盘里不许出现只属于 GTK4 的实例方法。
+
+    事故来源见文件头 ⑤：`display.get_clipboard()` 是 GTK4 的 API，GTK3 的 `Gdk.Display` 上没有，
+    于是结果面板的「复制」按钮点了完全没反应（异常埋在 GTK 信号处理器里）。
+    """
+
+    def test_repo_never_calls_methods_missing_on_gdk_display(self):
+        bad = []
+        for name in ("capsplus", "settings", "qbar", "tray"):
+            root = REPO / name
+            if not root.is_dir():
+                continue
+            for path in sorted(root.rglob("*.py")):
+                if "__pycache__" in path.parts:
+                    continue
+                bad += [f"{path.relative_to(REPO)}: {msg}"
+                        for msg in display_methods_that_do_not_exist(
+                            path.read_text(encoding="utf-8"), Gdk.Display)]
+        self.assertEqual(bad, [], "这些调用在本机 GTK3 上不存在（多半是抄了 GTK4 的写法）：\n  "
+                                  + "\n  ".join(bad))
+
+    def test_the_guard_catches_the_incident_line(self):
+        """反例具型：2026-10-20 真机那行必须被抓到；合法的 GTK3 方法不许误报。"""
+        self.assertFalse(hasattr(Gdk.Display, "get_clipboard"), "本机 Gdk.Display 居然有 get_clipboard？")
+        src = (
+            "def f():\n"
+            "    display = Gdk.Display.get_default()\n"
+            "    if display is None:\n"
+            "        return\n"
+            "    display.get_clipboard(Gdk.SELECTION_CLIPBOARD).set_text('x', -1)\n"
+        )
+        self.assertTrue(display_methods_that_do_not_exist(src, Gdk.Display), "判据抓不住那行事故代码")
+        ok = (
+            "def f():\n"
+            "    display = Gdk.Display.get_default()\n"
+            "    return display.get_primary_monitor() or display.get_monitor(0)\n"
+        )
+        self.assertEqual(display_methods_that_do_not_exist(ok, Gdk.Display), [], "合法用法被误报了")
 
 
 if __name__ == "__main__":

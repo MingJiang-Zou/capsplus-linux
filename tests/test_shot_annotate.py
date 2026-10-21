@@ -1608,6 +1608,73 @@ class TestRealWindow(unittest.TestCase):
         self.assertEqual(state["width"], 6, "线宽选择没生效")
 
 
+
+@unittest.skipUnless(HAVE_CAIRO, "没有 pycairo：起不了标注器的底图（nogi 口径）")
+class TestPanelCopyGoesThroughWlCopy(unittest.TestCase):
+    """判据：结果面板那个「复制」按钮**真的把文字送出去了**，而且走的是能活过退出的那条路。
+
+    2026-10-20 明江真机报"翻译 / OCR 的文本点复制按钮复制不出来"。根因不是剪贴板工具坏了，是那行代码用了
+    **GTK4** 的 `Gdk.Display.get_clipboard()` —— GTK3 的 `Gdk.Display` 上没有这个方法（真机实测
+    `AttributeError: 'GdkWaylandDisplay' object has no attribute 'get_clipboard'`），异常抛在
+    GTK 信号处理器里、stderr 落在 keyd 热键那条没人看的路径上 ⇒ 现象就是"点了完全没反应"。
+    而且那段代码既没刷新状态栏、也没汇报失败，"成功"和"没反应"长得一模一样。
+
+    这一组钉四件事：
+      ① 送出去的内容就是面板当前该复制的那段（有译文优先译文）；
+      ② 走的是注入的文本复制器（生产实现 = `copy_text_to_clipboard` → `wl-copy`，选区由外部进程持有，
+         窗口关掉文字还在；GTK 自己的剪贴板做不到）；
+      ③ 成功/失败**都要在状态栏说出来**，失败要把原因原样带出去；
+      ④ 面板没内容时**不许**去碰剪贴板。
+    """
+
+    def make(self, copy_text=None):
+        seen = []
+
+        def stub(text):
+            seen.append(text)
+            return (True, "✓ 已复制 %s" % text)
+
+        an = AN.Annotator(white_surface(80, 40), screen=(80, 40),
+                          clip=lambda _d: (True, "stub"), copy_text=copy_text or stub)
+        return an, seen
+
+    def test_button_copies_the_panel_text_through_the_injected_copier(self):
+        an, seen = self.make()
+        an.panel.set_ocr("发票号码 12345", "local", 12)
+        ok, msg = an.copy_panel_text()
+        self.assertTrue(ok, msg)
+        self.assertEqual(seen, ["发票号码 12345"], "没把面板文字交出去（或交错了）")
+        self.assertIn("已复制", an.message, "状态栏没告诉人复制成了")
+
+    def test_translation_wins_over_source_text(self):
+        an, seen = self.make()
+        an.panel.set_ocr("原文字", "local", 9)
+        an.panel.set_translation("原文字", "译文", "cloud", 20)
+        an.copy_panel_text()
+        self.assertEqual(seen, ["译文"], "有译文时该复制译文（primary_text 的口径）")
+
+    def test_failure_is_reported_not_swallowed(self):
+        """"复制不出来"必须当场说出来 —— 静默失败正是这次被报上来的形状本身。"""
+        an, _ = self.make(copy_text=lambda _t: (False, "✗ 这台机没有 wl-copy（Wayland 剪贴板工具没装）"))
+        an.panel.set_ocr("文字", "local", 5)
+        ok, msg = an.copy_panel_text()
+        self.assertFalse(ok)
+        self.assertIn("wl-copy", msg)
+        self.assertEqual(an.message, msg, "失败原因没落到状态栏")
+
+    def test_empty_panel_never_touches_the_clipboard(self):
+        an, seen = self.make()
+        ok, msg = an.copy_panel_text()
+        self.assertFalse(ok)
+        self.assertEqual(seen, [], "面板没内容却去碰了剪贴板")
+        self.assertIn("没有可复制的内容", msg)
+
+    def test_default_copier_is_the_wl_copy_text_path(self):
+        """默认实现必须是 `copy_text_to_clipboard`（wl-copy），不是 GTK 自己的剪贴板。"""
+        an = AN.Annotator(white_surface(80, 40), screen=(80, 40), clip=lambda _d: (True, "stub"))
+        self.assertIs(an._copy_text, AN.copy_text_to_clipboard)
+
+
 if __name__ == "__main__":
     unittest.main()
 
