@@ -14,6 +14,7 @@
 全程**不打真网**：post / get 都是注入的桩。
 """
 
+import contextlib
 import json
 import os
 import tempfile
@@ -59,7 +60,7 @@ class _HttpError(Exception):
 class TestThinkingIsTurnedOff(unittest.TestCase):
     """① 关思考：**实测唯一有效的开关是 `chat_template_kwargs`**，判据直接抓请求体。
 
-    2026-10-20 真机（明江报"翻译无效"）：本机 12087 上换成推理模型后，`content` **恒为空**、
+    2026-10-20 真机（用户报"翻译无效"）：本机 12087 上换成推理模型后，`content` **恒为空**、
     token 全花在 `reasoning_content` 里；`parse_completion` 读的是 `.content` ⇒ 翻译结果永远空白。
     实测数据：
       * 不关思考：`max_tokens=32` 全用光、`content=""`、`finish_reason=length`（3/3 复现）；
@@ -570,7 +571,7 @@ if __name__ == "__main__":
 
 
 class TestDefaultBackendIsLocal(unittest.TestCase):
-    """默认档必须是 `local`（2026-10-19 明江的口径："翻译最好用免费的"）。
+    """默认档必须是 `local`（2026-10-19 用户的口径："翻译最好用免费的"）。
 
     为什么这条要有判据：`auto` 的含义是"本机没起就静默切云"，而云那条是**按 token 计费**的
     LLM API（且那把 key 已 401）—— 默认档一旦回到 auto，用户就会在不知情的情况下花额度/报错。
@@ -642,7 +643,7 @@ class TestCredentialSources(unittest.TestCase):
     """凭据来源**三级**：`CAPSPLUS_CLOUD_KEY` → `~/.bailian/config.json` → `~/.dsh/.credentials.yaml`。
 
     纪律（都进判据）：只读、**绝不打印**、绝不改写任何一个凭据文件；判据一律用**注入的 fixture 路径**
-    （不碰明江真实的 `~/.dsh/.credentials.yaml`）；报错文案要可操作。
+    （不碰用户真实的 `~/.dsh/.credentials.yaml`）；报错文案要可操作。
     """
 
     FAKE = "sk-FAKE-TEST-TOKEN-0123456789-DO-NOT-LEAK"
@@ -748,6 +749,322 @@ class TestCredentialSources(unittest.TestCase):
             for write_call in ("write_text", "open(", '"w"', "'w'", "mkdir", "unlink", "rename"):
                 self.assertNotIn(write_call, body,
                                  f"{fn} 里出现了写操作 {write_call} —— 凭据文件只许读")
+
+
+if __name__ == "__main__":
+    unittest.main()
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# 2026-10-21：服务配置可配（`services.toml`）—— 端点从配置来，优先级 环境变量 > 配置 > 默认
+# ══════════════════════════════════════════════════════════════════════════
+# 为什么老判据一条没改：这一轮**没有改任何既有行为** ——
+#   · 没有配置文件时，端点/档位/凭据候选顺序与 2026-10-21 之前**逐字一致**（见下面的
+#     `TestWithoutAConfigFileNothingChanged`）；
+#   · 有配置文件时，老的环境变量（`CAPSPLUS_TRANSLATE` / `CAPSPLUS_TRANSLATE_URL` /
+#     `CAPSPLUS_TRANSLATE_MODEL` / `CAPSPLUS_CLOUD_*`）**仍然认，而且优先级更高**。
+# 所以老判据（含 `TestBackendChoice` / `TestDefaultBackendIsLocal` / `TestCloudCredentialFailover`）
+# 必须**一条都不红** —— 它们红了就说明"加配置层"把老用法弄坏了。
+
+CONFIG_ALL = """
+[translate]
+mode = "auto"
+
+[translate.local]
+kind = "local"
+style = "openai"
+base_url = "http://127.0.0.1:12087/v1"
+model = "qwen3.8-27b"
+
+[translate.cloud]
+kind = "remote"
+style = "openai"
+base_url = "https://token-plan.cn-beijing.maas.aliyuncs.com/compatible-mode/v1"
+model = "deepseek-v4.1-flash"
+
+[translate.nas]
+kind = "remote"
+style = "openai"
+base_url = "http://192.0.2.10:8080/v1"
+model = "qwen3-32b"
+api_key_env = "NAS_TRANSLATE_KEY"
+"""
+
+CONFIG_NAS_FIRST = """
+[translate]
+mode = "auto"
+
+[translate.nas]
+kind = "remote"
+style = "openai"
+base_url = "http://192.0.2.10:8080/v1"
+model = "qwen3-32b"
+api_key_env = "NAS_TRANSLATE_KEY"
+
+[translate.local]
+kind = "local"
+style = "openai"
+base_url = "http://127.0.0.1:12087/v1"
+model = "qwen3.8-27b"
+"""
+
+CONFIG_LOCAL_ONLY = """
+[translate.local]
+kind = "local"
+style = "openai"
+base_url = "http://192.0.2.10:8080/v1"
+model = "qwen3-32b"
+"""
+
+
+@contextlib.contextmanager
+def services_file(text: str):
+    """把服务配置指到一段临时 TOML。
+
+    为什么必须注入路径：判据**不许碰用户真配的那份** `~/.config/capsplus/services.toml`
+    —— 一碰，它就会随用户的设置漂移（今天绿、明天红），而且判据还会读到真凭据。
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        path = pathlib.Path(tmp) / "services.toml"
+        path.write_text(text, encoding="utf-8")
+        with mock.patch.dict(os.environ, {"CAPSPLUS_SERVICES_FILE": str(path)}):
+            yield path
+
+
+def setUpModule():
+    """**没配置**的状态是这一批老判据的前提 —— 先把真配置挡在外面。"""
+    os.environ["CAPSPLUS_SERVICES_FILE"] = "/tmp/capsplus-no-such-services.toml"
+
+
+def tearDownModule():
+    os.environ.pop("CAPSPLUS_SERVICES_FILE", None)
+
+
+class TestEndpointsComeFromTheConfig(unittest.TestCase):
+    """① 端点从 `services.toml` 来（可配远程），且**默认行为不变**。"""
+
+    def test_the_config_lists_the_endpoints_in_written_order(self):
+        with services_file(CONFIG_ALL):
+            eps = T.translate_endpoints()
+        self.assertEqual([e.name for e in eps], ["local", "cloud", "nas"],
+                         "端点清单 = 配置里写的那几个，顺序就是书写顺序")
+        self.assertEqual(eps[2].base_url, "http://192.0.2.10:8080/v1")
+        self.assertEqual(eps[2].kind, "remote")
+
+    def test_local_url_and_model_follow_the_config(self):
+        with services_file(CONFIG_LOCAL_ONLY):
+            self.assertEqual(T.local_url(), "http://192.0.2.10:8080/v1")
+            self.assertEqual(T.local_model(), "qwen3-32b")
+
+    def test_a_named_endpoint_can_be_selected_by_name(self):
+        """自建远程端点：用**端点名**就能选它（`CAPSPLUS_TRANSLATE=nas`）。"""
+        with services_file(CONFIG_ALL):
+            with mock.patch.dict(os.environ, {"CAPSPLUS_TRANSLATE": "nas",
+                                              "NAS_TRANSLATE_KEY": "k"}):
+                self.assertEqual(T.mode(), "nas")
+                backend, why = T.resolve_backend(local_probe=lambda: True)
+        self.assertEqual(backend, "nas")
+        self.assertIn("nas", why)
+
+    def test_an_unknown_endpoint_name_is_refused_with_the_usable_ones(self):
+        with services_file(CONFIG_ALL):
+            with mock.patch.dict(os.environ, {"CAPSPLUS_TRANSLATE": "nope"}):
+                backend, why = T.resolve_backend(local_probe=lambda: True)
+        self.assertIsNone(backend, "配置里没有的端点不许瞎猜")
+        self.assertIn("nas", why, "要说清现在能用哪些")
+
+    def test_the_configured_endpoint_is_actually_called(self):
+        """端点不只是"列出来"—— 请求必须真的发到配置里那个地址。"""
+        seen = {}
+
+        def post(url, data, headers, timeout=T.TIMEOUT_S):
+            seen["url"] = url
+            seen["auth"] = headers.get("Authorization", "")
+            return reply("译文")
+
+        with services_file(CONFIG_ALL):
+            with mock.patch.dict(os.environ, {"NAS_TRANSLATE_KEY": "secret-key"}):
+                ep = T.endpoint_by_name("nas")
+                result = T.translate_endpoint("hello", ep, post=post)
+        self.assertTrue(result["ok"], result.get("hint"))
+        self.assertTrue(seen["url"].startswith("http://192.0.2.10:8080/v1/"),
+                        f"请求没发到配置的地址：{seen['url']}")
+        self.assertIn("secret-key", seen["auth"], "凭据要按配置给的来源用")
+
+
+class TestAutoFollowsTheWrittenOrder(unittest.TestCase):
+    """② `auto` = 按**端点书写顺序**挨个试（配置里 local 在前就 local 优先）。"""
+
+    def test_the_first_written_endpoint_wins_even_if_the_later_one_works(self):
+        """配置里 nas 写在 local 前面 ⇒ auto 先用 nas（哪怕本机探得到）。"""
+        with services_file(CONFIG_NAS_FIRST):
+            with mock.patch.dict(os.environ, {"NAS_TRANSLATE_KEY": "k"}):
+                backend, _why = T.resolve_backend(local_probe=lambda: True)
+        self.assertEqual(backend, "nas", "auto 不认书写顺序 = 用户写的顺序就没意义了")
+
+    def test_local_first_means_local_first(self):
+        with services_file(CONFIG_ALL):
+            backend, _why = T.resolve_backend(local_probe=lambda: True)
+        self.assertEqual(backend, "local")
+
+    def test_an_unusable_first_endpoint_falls_through_to_the_next(self):
+        """第一个端点探不到 ⇒ 接着试下一个（这才是 auto 的意义）。"""
+        with services_file(CONFIG_ALL):
+            with mock.patch.dict(os.environ, {"NAS_TRANSLATE_KEY": "k"}):
+                backend, _why = T.resolve_backend(
+                    local_probe=lambda: False,
+                    cloud={"base_url": "https://x.invalid/v1", "api_key": "k",
+                           "model": "m", "config_file": "/tmp/none.json"})
+        self.assertEqual(backend, "cloud")
+
+
+class TestEnvironmentBeatsTheConfigFile(unittest.TestCase):
+    """③ **环境变量 > 配置文件 > 内置默认**（仓库口径，三条链路统一）。"""
+
+    def test_the_url_env_var_beats_the_config(self):
+        with services_file(CONFIG_LOCAL_ONLY):
+            with mock.patch.dict(os.environ, {"CAPSPLUS_TRANSLATE_URL":
+                                               "http://127.0.0.1:19999/v1"}):
+                self.assertEqual(T.local_url(), "http://127.0.0.1:19999/v1")
+
+    def test_the_model_env_var_beats_the_config(self):
+        with services_file(CONFIG_LOCAL_ONLY):
+            with mock.patch.dict(os.environ, {"CAPSPLUS_TRANSLATE_MODEL": "other-model"}):
+                self.assertEqual(T.local_model(), "other-model")
+
+    def test_the_mode_env_var_beats_the_config(self):
+        with services_file(CONFIG_ALL):
+            with mock.patch.dict(os.environ, {"CAPSPLUS_TRANSLATE": "cloud"}):
+                self.assertEqual(T.mode(), "cloud")
+
+    def test_the_cloud_env_vars_still_win_over_the_config(self):
+        """云端那几个环境变量（现场救火用）不许因为加了配置层就失效。"""
+        with services_file(CONFIG_ALL):
+            with mock.patch.dict(os.environ, {"CAPSPLUS_CLOUD_BASE_URL":
+                                               "https://env.example/v1",
+                                               "CAPSPLUS_CLOUD_MODEL": "env-model",
+                                               "CAPSPLUS_CLOUD_KEY": "env-key"}):
+                cfg = T.cloud_config("/tmp/definitely-missing.json",
+                                     credentials_path="/tmp/definitely-missing.yaml")
+        self.assertEqual(cfg["base_url"], "https://env.example/v1")
+        self.assertEqual(cfg["model"], "env-model")
+        self.assertEqual(cfg["api_key"], "env-key")
+
+
+class TestConfiguredCredentialsKeepTheOldOrderAsFallback(unittest.TestCase):
+    """④ 凭据：配置里显式写的排**第一**，老的三级顺序（env → bailian → dsh）留作兜底。"""
+
+    def setUp(self):
+        self.dir = pathlib.Path(tempfile.mkdtemp(prefix="capsplus-svc-cred-"))
+        self.addCleanup(lambda: shutil.rmtree(self.dir, ignore_errors=True))
+        self.json_path = self.dir / "config.json"
+        self.cred_path = self.dir / "credentials.yaml"
+        self.json_path.write_text(json.dumps(
+            {"active_config": "token-plan",
+             "token-plan": {"base_url": "https://json.example.com", "api_key": "KEY-FROM-JSON"}}),
+            encoding="utf-8")
+        self.cred_path.write_text("version: 1\nrefs:\n  AL_TOKEN_PLAN_API_KEY: KEY-FROM-YAML\n",
+                                  encoding="utf-8")
+        self.addCleanup(lambda: os.environ.pop("CAPSPLUS_CLOUD_KEY", None))
+        os.environ.pop("CAPSPLUS_CLOUD_KEY", None)
+
+    def test_the_configured_source_comes_first_and_the_old_order_stays_behind(self):
+        config = """
+[translate.cloud]
+credentials_file = "%s"
+credentials_key = "AL_TOKEN_PLAN_API_KEY"
+""" % self.cred_path
+        with services_file(config):
+            cands = T.cloud_candidates(str(self.json_path),
+                                        credentials_path=str(self.cred_path))
+        keys = [c["api_key"] for c in cands]
+        self.assertEqual(keys[0], "KEY-FROM-YAML", "配置里写的来源要排第一")
+        self.assertIn("KEY-FROM-JSON", keys, "老的三级顺序要留在后面当兜底")
+        self.assertIn("KEY-FROM-YAML", keys)
+
+    def test_without_a_config_the_old_order_is_untouched(self):
+        """**没有配置文件时，老的顺序一字不变**（这是"不许把老用法弄坏"的底线）。"""
+        cands = T.cloud_candidates(str(self.json_path), credentials_path=str(self.cred_path))
+        self.assertEqual([c["api_key"] for c in cands], ["KEY-FROM-JSON", "KEY-FROM-YAML"])
+        self.assertIn("bailian", cands[0]["source"])
+        self.assertIn("credentials.yaml", cands[1]["source"])
+
+    def test_the_configured_base_url_is_used_and_not_normalised(self):
+        """配置里那个地址是**用户自己写的** —— 不许被"补兼容路径"改掉（自建端点会打错地方）。"""
+        config = """
+[translate.cloud]
+base_url = "http://192.0.2.10:8080/v1"
+"""
+        with services_file(config):
+            cfg = T.cloud_config(str(self.json_path),
+                                 credentials_path=str(self.cred_path))
+        self.assertEqual(cfg["base_url"], "http://192.0.2.10:8080/v1")
+
+
+class TestWithoutAConfigFileNothingChanged(unittest.TestCase):
+    """⑤ **没配置时行为逐字不变**（模块头 ②：内置默认 = 与 2026-10-21 之前一致）。"""
+
+    def test_defaults_are_the_old_hardcoded_ones(self):
+        self.assertEqual(T.local_url(), T.DEFAULT_LOCAL_URL)
+        self.assertEqual(T.local_model(), T.DEFAULT_LOCAL_MODEL)
+        self.assertEqual(T.mode(), "local")
+
+    def test_the_default_endpoints_are_the_old_ones(self):
+        eps = {e.name: e for e in T.translate_endpoints()}
+        self.assertEqual(eps["local"].base_url, "http://127.0.0.1:12087/v1")
+        self.assertEqual(eps["local"].model, "qwen3.8-27b")
+        self.assertEqual(eps["cloud"].base_url,
+                         "https://token-plan.cn-beijing.maas.aliyuncs.com/compatible-mode/v1")
+
+    def test_a_config_without_a_translate_section_keeps_the_local_default(self):
+        """**关键一条**：配置文件里没有 `[translate]` 时，默认档**不许**变成 `auto`。
+
+        为什么：`services.default_services()` 给的默认是 `auto`，而本模块的默认是 `local`
+        （2026-10-19 用户定的口径："翻译最好用免费的"，默认档绝不许静默切到计费云）。
+        库分不清"用户写了 auto"和"没写"，所以这里按**用户显式写了没有**来判。
+        """
+        with services_file("[asr]\nlang = \"zh\"\n"):
+            self.assertEqual(T.mode(), "local",
+                             "默认档被配置文件带成 auto 了 ⇒ 会静默切到计费云")
+
+
+class TestCounterExamples(unittest.TestCase):
+    """反例具型：每条判据都得能红。**判据抓不住东西 = 没有判据。**"""
+
+    def test_counterexample_config_beating_the_env_var_is_caught(self):
+        """反例 ①：把优先级反过来（配置压过环境变量）⇒ 判据必须红。"""
+        with services_file(CONFIG_ALL):
+            with mock.patch.dict(os.environ, {"CAPSPLUS_TRANSLATE": "cloud"}):
+                good = T.mode()
+                with mock.patch.object(T, "_pick", lambda e, c, d: c or e or d):
+                    bad = T.mode()
+        self.assertEqual(good, "cloud", "判据本体：环境变量必须压过配置文件")
+        self.assertNotEqual(bad, "cloud",
+                            "优先级写反了这条判据抓不住 —— 它就是摆设")
+
+    def test_counterexample_auto_ignoring_the_order_is_caught(self):
+        """反例 ②：让 `auto` 忽略端点顺序（老规矩"local 优先"）⇒ 判据必须红。"""
+        with services_file(CONFIG_NAS_FIRST):
+            with mock.patch.dict(os.environ, {"NAS_TRANSLATE_KEY": "k"}):
+                good, _why = T.resolve_backend(local_probe=lambda: True)
+                original = T.translate_endpoints
+                with mock.patch.object(T, "translate_endpoints",
+                                       lambda cfg=None: list(reversed(original(cfg)))):
+                    bad, _why2 = T.resolve_backend(local_probe=lambda: True)
+        self.assertEqual(good, "nas", "判据本体：auto 按端点书写顺序")
+        self.assertNotEqual(bad, "nas", "auto 忽略顺序这条判据抓不住 —— 它就是摆设")
+
+    def test_counterexample_the_old_env_var_dying_is_caught(self):
+        """反例 ③：让老的环境变量失效（`CAPSPLUS_TRANSLATE` 不再被认）⇒ 判据必须红。"""
+        with services_file(CONFIG_ALL):
+            with mock.patch.dict(os.environ, {"CAPSPLUS_TRANSLATE": "cloud"}):
+                good = T.mode()
+                with mock.patch.object(T, "_known_mode",
+                                       lambda value, cfg=None: value.lower() == "auto"):
+                    bad = T.mode()
+        self.assertEqual(good, "cloud", "判据本体：老的环境变量必须仍然生效")
+        self.assertNotEqual(bad, "cloud",
+                            "老环境变量失效这条判据抓不住 —— 它就是摆设")
 
 
 if __name__ == "__main__":

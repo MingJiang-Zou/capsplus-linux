@@ -23,6 +23,24 @@
 
 覆盖口子：`CAPSPLUS_ASR_HOST` / `CAPSPLUS_ASR_PORT` / `CAPSPLUS_ASR_LANG`
 （测试把端口指到本机临时 stub，CI 不需要真服务）。
+
+**服务在哪现在是可配的**（2026-10-21，用户原话：「关于 capsplus 工具，我希望关于翻译 OCR 语音识别
+的服务都是可以配置的，方便配置远程的服务或者是本地的」）：落点从
+`~/.config/capsplus/services.toml` 的 `[asr]` 段读（底座是 `capsplus/services.py`，
+**本模块只读不改**）：
+
+    [asr]
+    lang = "zh"
+    timeout_s = 20
+
+    [asr.local]
+    base_url = "http://127.0.0.1:18090"     # 或 host = "…" / port = 18090
+    # 远端就换成另一台机器的地址，例如：
+    # base_url = "http://192.0.2.10:18090"
+
+    优先级（全仓口径）：**环境变量 > 配置文件 > 内置默认**。
+    环境变量那三个**保留**（现场救火用），而且**压过**配置文件 ——
+    认它们的人（脚本、临时排查）不该被一份长期配置挡住。
 """
 
 from __future__ import annotations
@@ -38,6 +56,11 @@ import urllib.request
 import wave
 from dataclasses import dataclass
 
+try:                                    # 包内导入（正常路径）
+    from . import services as S
+except ImportError:                     # 直接当脚本跑（`python3 capsplus/voice_asr.py`）
+    import services as S
+
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 18090
 UPLOAD_PATH = "/asr-upload"
@@ -49,7 +72,7 @@ HEALTH_TIMEOUT_S = 1.5
 MAX_BODY_BYTES = 8 * 1024 * 1024   # daemon 侧硬上限：超过它直接回 bad-size
 
 # ── 诊断留证：把最近送识别的 WAV 留一份（默认**关**）──────────────────────────
-# 为什么要有（2026-10-20）：明江抱怨"识别不准"时，我们没有音频可复盘 ——
+# 为什么要有（2026-10-20）：用户抱怨"识别不准"时，我们没有音频可复盘 ——
 # 能看的只有 `voice.log` 里那行状态（`noise_rms=… gate=…`），它连"当时说了什么"都不该有。
 # 于是每次只能靠复述现象去猜。开了这个开关，最近的音频就躺在状态目录里，直接拿去服务上重跑。
 # 默认关的理由：这是**用户说的话**，落盘要用户自己点头（0o600，只给本人读）。
@@ -60,18 +83,115 @@ KEEP_LAST_GLOB = "voice-last-*.wav"
 # 错误码 → 人话下一步（照 capsplus/extcheck.py 的 HINTS 口径：状态必须带动作，不让人再翻文档）
 HINTS = {
     "unreachable": "识别服务没在跑：`systemctl --user start voice-svc`，"
-                   "再 `curl -s http://127.0.0.1:{p}/health` 应回 \"ok\":true；"
+                   "再 `curl -s {url}/health` 应回 \"ok\":true；"
                    "unit 不存在就前台跑 `python3 ~/voice-svc/daemon.py` 看它报什么",
     "timeout": "等识别回音超时（{t}s）：服务在但卡住了 —— "
-               "`systemctl --user restart voice-svc`，看 `~/.dsh/logs/voice-svc.log`",
+               "`systemctl --user restart voice-svc`（{url}），看 `~/.dsh/logs/voice-svc.log`",
     "http_error": "服务答了个 {code}：路径/版本对不上（期望 POST {path}?lang=zh）",
-    "bad_json": "服务答的不是 JSON：`curl -sv http://{host}:{p}{path}` 看一眼真实返回",
+    "bad_json": "服务答的不是 JSON：`curl -sv {url}{path}` 看一眼真实返回",
     "svc_error": "服务自己报了错（见 message）；模型/依赖没装好时最常见，"
                  "看 `~/.dsh/logs/voice-svc.log` 里那行的 traceback",
     "bad_size": "音频字节数服务不收（空或超 {max} MiB）：缩短录音或检查采样率",
     "empty": "识别结果为空：多半是没说话/声音太小 —— 离麦克风近一点再说一遍",
     "no_pcm": "没有可送的数据：录音那步就没成",
 }
+
+# **远程**识别服务的话术（2026-10-21 新增）：服务在别的机器上时，
+# "在你这台机上 systemctl --user start" 是**错的** —— 那台机上的 unit 得在那台机起。
+# 所以远程另有一套话：说清"在哪台机器上做什么" + 网络这一层也要看。
+REMOTE_HINTS = {
+    "unreachable": "连不上远端识别服务 {url}：那台机器上的服务没在跑 —— "
+                   "在**那台机器**上 `systemctl --user start voice-svc`；"
+                   "再 `curl -sv {url}/health` 应回 \"ok\":true（顺带看防火墙与网络通不通）",
+    "timeout": "等远端识别回音超时（{t}s）：服务在但卡住了 —— 在那台机器上 "
+               "`systemctl --user restart voice-svc`（{url}），看 `~/.dsh/logs/voice-svc.log`",
+}
+
+# ── 服务配置（2026-10-21 新增）────────────────────────────────────────────
+# 底座是 `capsplus/services.py`（Lead 写的那份，**本模块只读不改**）。
+# 三个客户端各留一份薄封装（不新建共享模块）：`services.py` 是别人写的地基，不该由我改；
+# 而新建共享模块就得动仓的结构，那要先问人。
+CONFIG_ENV = "CAPSPLUS_SERVICES_FILE"      # 指到别的 services.toml（多套配置 / 判据用）
+LOCAL_HOSTS = ("127.0.0.1", "localhost", "::1", "0.0.0.0")
+
+
+def services_config_path(path=None) -> str:
+    """服务配置文件的落点：入参 > `CAPSPLUS_SERVICES_FILE` > 默认落点。
+
+    为什么给环境变量留这个口子：判据要拿**注入的 fixture 文件**跑（不许碰用户真配的那份）。
+    """
+    return path or os.environ.get(CONFIG_ENV) or str(S.SERVICES_PATH)
+
+
+def load_config(path=None):
+    """读服务配置。**读不了 / 语法错都不抛栈** —— `services.load_services()` 自己兜住了。"""
+    return S.load_services(services_config_path(path))
+
+
+def asr_endpoint(cfg=None):
+    """`[asr]` 段里那个端点（按 `mode` 选；mode=auto 时取第一个有地址的）。"""
+    cap = (cfg if cfg is not None else load_config()).get("asr")
+    if cap is None:
+        return None
+    ep = cap.endpoint()
+    if ep is not None and (ep.base_url or ep.extra.get("host")):
+        return ep
+    for candidate in cap.ordered_endpoints():
+        if candidate.base_url or candidate.extra.get("host"):
+            return candidate
+    return ep
+
+
+def _config_base_url(cfg=None) -> str:
+    """服务配置里 `[asr]` 那一段的地址（没配就是空串）。
+
+    除了 `base_url`，也认 `host` + `port` 两种写法（那两键在 `services.py` 里进 `extra`）。
+    """
+    ep = asr_endpoint(cfg)
+    if ep is None:
+        return ""
+    if ep.base_url:
+        return ep.base_url.strip().rstrip("/")
+    host_part = str(ep.extra.get("host") or "").strip()
+    if host_part:
+        port_part = str(ep.extra.get("port") or DEFAULT_PORT).strip()
+        return f"http://{host_part}:{port_part}"
+    return ""
+
+
+def _env_port() -> int:
+    """环境变量里的端口（`CAPSPLUS_ASR_PORT` → `VOICE_SVC_PORT`）；没有就 0。"""
+    for var in ("CAPSPLUS_ASR_PORT", "VOICE_SVC_PORT"):     # 后者是 daemon 自己的变量，跟着它走
+        value = os.environ.get(var)
+        if value:
+            try:
+                return int(value)
+            except ValueError:
+                pass
+    return 0
+
+
+def _url_host(url: str) -> str:
+    try:
+        return urllib.parse.urlsplit(url).hostname or ""
+    except ValueError:
+        return ""
+
+
+def _url_port(url: str) -> int:
+    try:
+        return urllib.parse.urlsplit(url).port or 0
+    except ValueError:
+        return 0
+
+
+def _pick(env_value: str, config_value: str, default: str) -> str:
+    """「谁说了算」的**优先级本体**：环境变量 > 配置文件 > 内置默认。
+
+    单独抽成一个函数，是为了让判据能**反例具型**：把这里的顺序反过来，判据必须红
+    （见 `tests/test_voice_asr.py::TestCounterExamples`）。
+    """
+    return env_value or config_value or default
 
 
 @dataclass
@@ -94,35 +214,87 @@ class AsrResult:
 
 
 def host() -> str:
-    return os.environ.get("CAPSPLUS_ASR_HOST") or DEFAULT_HOST
+    """识别服务的主机名（**环境变量 > 服务配置 > 内置默认**）。"""
+    env = (os.environ.get("CAPSPLUS_ASR_HOST") or "").strip()
+    if env:
+        return env
+    return _url_host(_config_base_url()) or DEFAULT_HOST
 
 
 def port() -> int:
-    for var in ("CAPSPLUS_ASR_PORT", "VOICE_SVC_PORT"):     # 后者是 daemon 自己的变量，跟着它走
-        value = os.environ.get(var)
-        if value:
-            try:
-                return int(value)
-            except ValueError:
-                pass
-    return DEFAULT_PORT
+    """识别服务的端口（**环境变量 > 服务配置 > 内置默认**）。
+
+    `VOICE_SVC_PORT` 也认 —— 那是 daemon 自己的变量，跟着它走（老口径，2026-10-17 起就有）。
+    """
+    value = _env_port()
+    if value:
+        return value
+    return _url_port(_config_base_url()) or DEFAULT_PORT
 
 
 def lang() -> str:
-    return os.environ.get("CAPSPLUS_ASR_LANG") or DEFAULT_LANG
+    """识别语言（**环境变量 > 服务配置 > 内置默认**）。"""
+    cap = load_config().get("asr")
+    config_value = str(cap.lang if cap else "").strip()
+    env = (os.environ.get("CAPSPLUS_ASR_LANG") or "").strip()
+    return _pick(env, config_value, DEFAULT_LANG)
+
+
+def base_url() -> str:
+    """识别服务的落点（协议 + 主机 + 端口 + 可选路径）。
+
+    优先级（全仓口径）：**环境变量 > 配置文件 > 内置默认**。
+      · 环境变量 `CAPSPLUS_ASR_HOST` / `CAPSPLUS_ASR_PORT`（`VOICE_SVC_PORT` 也认）——
+        现场救火用；一旦设了，按老口径拼成 `http://{host}:{port}`；
+      · 配置文件 `[asr]` 那一段的 `base_url`（可以带 https 与路径，
+        比如 `https://asr.example.com/asr`）；
+      · 内置默认 `http://127.0.0.1:18090`。
+    """
+    env_host = (os.environ.get("CAPSPLUS_ASR_HOST") or "").strip()
+    env_port = _env_port()
+    cfg = _config_base_url()
+    if env_host or env_port:
+        # 主机与端口各自按"环境变量 > 配置 > 默认"来（`_pick` 是这条优先级本体）
+        host_part = _pick(env_host, _url_host(cfg), DEFAULT_HOST)
+        port_part = _pick(str(env_port) if env_port else "",
+                          str(_url_port(cfg) or ""), str(DEFAULT_PORT))
+        return f"http://{host_part}:{port_part}"
+    return (cfg or f"http://{DEFAULT_HOST}:{DEFAULT_PORT}").rstrip("/")
+
+
+def recognize_timeout(cfg=None) -> float:
+    """识别超时（秒）：**服务配置里的 `timeout_s` > 内置默认**。
+
+    为什么可配（2026-10-21）：20s 是**本机那台**的数（实测 5.5s 音频约 0.3s）；
+    远程那台机器慢一点很正常（网络 + 那边自己在忙），一刀切 20s 会把"慢"报成"坏了"。
+    """
+    cap = (cfg if cfg is not None else load_config()).get("asr")
+    value = float(cap.timeout_s or 0) if cap else 0.0
+    if not value:
+        ep = asr_endpoint(cfg)
+        value = float(ep.timeout_s or 0) if ep is not None else 0.0
+    return value if value > 0 else RECOGNIZE_TIMEOUT_S
+
+
+def is_remote() -> bool:
+    """目标是不是**别的机器**（远程识别服务）—— 话术分两套的原因。"""
+    return host().strip().lower() not in LOCAL_HOSTS
 
 
 def _hint(name: str, **kw) -> str:
+    """错误码 → 下一步。**远程目标用另一套话**（在别的机器上，命令得在那台机器敲）。"""
     kw.setdefault("p", port())
     kw.setdefault("host", host())
-    kw.setdefault("t", int(RECOGNIZE_TIMEOUT_S))
+    kw.setdefault("t", int(recognize_timeout()))
     kw.setdefault("max", MAX_BODY_BYTES // (1024 * 1024))
     kw.setdefault("path", UPLOAD_PATH)
     kw.setdefault("code", "")
+    kw.setdefault("url", base_url())
+    table = REMOTE_HINTS if (is_remote() and name in REMOTE_HINTS) else HINTS
     try:
-        return HINTS.get(name, "").format(**kw)
+        return table.get(name, "").format(**kw)
     except (KeyError, IndexError):
-        return HINTS.get(name, "")
+        return table.get(name, "")
 
 
 def pcm_to_wav(pcm: bytes, sample_rate: int = 16000, channels: int = 1,
@@ -214,10 +386,11 @@ def recognize(pcm: bytes, *, sample_rate: int = 16000, lang_code: str | None = N
     if len(wav) > MAX_BODY_BYTES:
         return AsrResult(code="bad_size", message=f"{len(wav)} 字节超过服务上限",
                          hint=_hint("bad_size"), body_bytes=len(wav))
-    url = (f"http://{host()}:{port()}{UPLOAD_PATH}"
+    url = (f"{base_url()}{UPLOAD_PATH}"
            f"?lang={urllib.parse.quote(lang_code or lang())}")
     try:
-        status, text = _request(url, wav, timeout)
+        status, text = _request(url, wav,
+                                timeout if timeout is not None else recognize_timeout())
     except urllib.error.HTTPError as exc:            # 4xx/5xx：服务在，但不是 200
         body = ""
         try:
@@ -289,7 +462,7 @@ def _try_json(text: str) -> dict | None:
 
 def health(timeout: float = HEALTH_TIMEOUT_S) -> AsrResult:
     """`GET /health` 的体检。给 `capsplus-voice status` 用，同样不抛。"""
-    url = f"http://{host()}:{port()}{HEALTH_PATH}"
+    url = f"{base_url()}{HEALTH_PATH}"
     try:
         status, text = _request(url, None, timeout)
     except (urllib.error.URLError, OSError, socket.timeout) as exc:

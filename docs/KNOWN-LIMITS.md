@@ -330,7 +330,7 @@ r = searchParams.get("q")?.trim() ?? e.get("prompt")
 ### 扩展的部署 / 校验 / 自检：三件事分开管（2026-10-20）
 
 **为什么要把它们分开**：GNOME 生效只有一条路（注销重登），而"重登"被当成排查手段以后，
-每次改一行 `extension.js` 都要陪上一次会话重启 —— 明江的原话是「老是要重登 感觉也不好吧」。
+每次改一行 `extension.js` 都要陪上一次会话重启 —— 用户的原话是「老是要重登 感觉也不好吧」。
 更糟的是登录时那一步 `cp` 会与 shell 扫描扩展目录撞车，读出**半截文件**：
 
     gnome-shell: Extension raise-browser@capsplus.example:
@@ -354,9 +354,9 @@ r = searchParams.get("q")?.trim() ?? e.get("prompt")
   后者就是 shell 加载期报错的口径（实例：`Extension …: SyntaxError: unexpected token … :990:6`）。
 * **自检必须隔离**：`dbus-run-session` 起独立会话总线（headless shell 顺手激活的
   nautilus / tracker / portal 全挂在临时总线上跟着收尸），只 `kill` 自己起的那个 pid
-  —— 绝不能 `pkill -f gnome-shell`，那杀的是明江正在用的会话。它抢不到 `wayland-0` 的 lock
+  —— 绝不能 `pkill -f gnome-shell`，那杀的是用户正在用的会话。它抢不到 `wayland-0` 的 lock
   时会自己退到 `wayland-1`，不影响真 compositor。
-* **自检 ≠ 生效**：它证明的是"仓里这份文件能被 shell 加载"，明江自己会话里跑的仍是旧代码。
+* **自检 ≠ 生效**：它证明的是"仓里这份文件能被 shell 加载"，用户自己会话里跑的仍是旧代码。
   所以最后一步仍是注销重登 —— 但那时已经**确定**新代码没问题，重登不再是排查。
 * **失败一定出声**：`Caps+F1` 是 keyd 的 `command(...)` 起的进程，stdout/stderr 落在 journal 里
   没人看。抓帧超时 / 贴图失败 / 登录校验发现落后，除了 stderr 还会发桌面通知（GIO
@@ -377,7 +377,7 @@ r = searchParams.get("q")?.trim() ?? e.get("prompt")
 | `GLib.MainLoop()` + `timeout_add(ms, quit)` 跑起来 | **每次都收到** ✓ A/B 由此测出 +0（原窗口开标签页） |
 
 这条为什么值钱：Qbar 里原本写的就是第一种（`GLib.usleep`），所以扩展明明已经 ACTIVE、
-`capsplus status` 也说正常，明江手动测出来仍然是"新窗口"——**发送方自己把包咽回去了**。
+`capsplus status` 也说正常，用户手动测出来仍然是"新窗口"——**发送方自己把包咽回去了**。
 判据层面还有个教训：那条分支没人跑过，所以改名/改常量时工作树破了也全绿
 （现已加"未导入的大写常量"门 + 泵门，见 `tests/test_raise_browser.py`）。
 
@@ -644,3 +644,82 @@ r = searchParams.get("q")?.trim() ?? e.get("prompt")
   → `sudo keyd reload` → 试"轻按 Caps+Z 松手、再按 N"，看 N 是被吃掉还是照原样出；
   验完 `sudo rm` 那个文件再 reload 就回到现状（`capsplus apply` 只管自己那份 `capslock-plus.conf`）。
   救命组合仍然是 `backspace+escape+enter`。
+
+---
+
+## 服务配置（`services.toml`）：三条链路的"服务在哪"可配（2026-10-21）
+
+这一节解释的是 `capsplus/shot_translate.py` / `capsplus/shot_ocr.py` / `capsplus/voice_asr.py`
+为什么长成现在这样（它们都只读 `capsplus/services.py`，**客户端这侧只读不写**）。
+
+**需求原话**（用户，2026-10-21）：「关于 capsplus 工具，我希望关于翻译 OCR 语音识别 的服务都是可以配置的，
+方便配置远程的服务或者是本地的」。改之前"服务在哪"是**写死在代码里**的三个地址
+（本机 `http://127.0.0.1:12087/v1`、百度 `aip.baidubce.com`、本机 `http://127.0.0.1:18090`），
+"把服务搬到另一台机器上"除了改代码没别的办法。
+
+### 能配什么（配置文件 `~/.config/capsplus/services.toml`）
+
+| 能力 | 键 | 例子 | 不配时 |
+| --- | --- | --- | --- |
+| 翻译 | `[translate.local] base_url / model` | `http://192.0.2.10:8080/v1`（另一台机器上的兼容服务） | `http://127.0.0.1:12087/v1` + `qwen3.8-27b` |
+| 翻译 | `[translate.<自建名>] kind=remote / api_key_env` | `[translate.nas]` | —— |
+| 翻译 | `[translate] mode` | `local` / `cloud` / `auto` / 端点名 | `local` |
+| OCR | `[ocr.local] base_url`（助手脚本路径）、`python` / `venv` | `/opt/other/shot_ocr_local.py` | 仓里那份 + 内置两个 venv 候选 |
+| OCR | `[ocr.cloud] base_url / env_file / env_key` | 百度那套 | `aip.baidubce.com` + `~/.dsh/skills/ocr/.env` |
+| OCR | `[ocr.vlm] style=openai`（能读图的视觉端点） | `http://…:12087/v1` | 不存在（**默认行为不许变**） |
+| 识别 | `[asr.local] base_url`（或 `host` + `port`）、`[asr] lang / timeout_s` | `http://192.0.2.10:18090` | `http://127.0.0.1:18090` + `zh` + 20s |
+
+**优先级：环境变量 > 配置文件 > 内置默认**（全仓口径，三条链路统一）。环境变量是"临时覆盖"
+（现场救火用），配置文件是"长期设置"，内置默认 = **与 2026-10-21 之前的行为逐字一致**
+（老环境变量 `CAPSPLUS_TRANSLATE` / `CAPSPLUS_TRANSLATE_URL` / `CAPSPLUS_TRANSLATE_MODEL` /
+`CAPSPLUS_CLOUD_*` / `CAPSPLUS_OCR` / `CAPSPLUS_OCR_PYTHON` / `CAPSPLUS_OCR_ENV` /
+`CAPSPLUS_ASR_HOST` / `CAPSPLUS_ASR_PORT` / `CAPSPLUS_ASR_LANG` **全部保留**，且压过配置文件）。
+
+### 六条不许踩的坑（都是本轮踩出来的）
+
+1. **翻译的默认档是 `local`，不是 `auto`**：本仓的口径是**默认永远先走本机**（2026-10-19 用户定的：
+   "翻译最好用免费的"，云那条是**按 token 计费**的 LLM API）⇒ `auto = 挨个试`若成了默认档，
+   就意味着**本机没起时静默切到计费云端**（钱与隐私都不该默认往外走）。
+   `services.default_services()`（2026-10-21 复核时改）现在也是 `local`；
+   客户端另外按**用户显式写了没有**来判（`declared_endpoint()` 自己读那一个键）——
+   这样即使库的默认再变，客户端的口径也不跟着漂。
+   判据：`tests/test_shot_translate.py::TestWithoutAConfigFileNothingChanged`。
+2. **配置文件是唯一真相（不是"与内置默认合并"）**：`services.load_services()` 的口径是
+   "文件里写过就完全以文件为准" ⇒ ① 端点的**书写顺序**就是 `auto` 的优先级
+   （把 `nas` 写在 `local` 前面就真的先试 `nas`）；② 文件里只写了 `[translate.local]` 的话，
+   **`cloud` 端点就不在了**（要云端就把两段都写上）—— 这与"合并"语义是两回事，别按合并理解。
+   没写这个能力的那一段时，内置默认原样保留，行为一个字不变。
+   判据：`tests/test_shot_translate.py::TestAutoFollowsTheWrittenOrder`。
+3. **云端那把 key 实测是 401 的**（`~/.bailian/config.json` 那把，`Invalid API-key provided`），
+   而 `~/.dsh/.credentials.yaml` 的 `AL_TOKEN_PLAN_API_KEY` 同一时刻 HTTP 200 正常出字
+   ⇒ "有凭据"不等于"能用"，老的三级候选顺序（env → bailian → dsh）**必须留着当兜底**；
+   配置里显式写的凭据来源排**第一**（用户明确说了"这条链路的 key 在这"）。
+4. **本机那档模型只吃文本**（`/v1/models` 里 `modalities.vision=false`，2026-10-19 实测）
+   ⇒ 本地链路必须"本地 OCR → 本地翻译"，图不能直接喂给它。`style=openai` 的**视觉端点**
+   只在配置里**显式建了**才走（默认那档云端是**百度协议**，不是 OpenAI 兼容 ——
+   判错协议会把请求打到错地方）。
+5. **远程识别服务不可达时，提示是另一套话**：服务在别的机器上，"在你这台机上
+   `systemctl --user start`"是**错的** ⇒ 远程另有 `REMOTE_HINTS`：说清"在**那台机器**上做什么"
+   + 网络这一层也要看。
+6. **端点名打错要说得出来**：`CAPSPLUS_TRANSLATE=nsa` 现在报「档位 `nsa` 认不出来 ——
+   可用的是：local、cloud」，**不许**静默退回默认（用户以为在用远程，其实在用本机）。
+
+### 本机实测（2026-10-21，真机端到端，走的是**配置驱动**那条路）
+
+| 链路 | 落点 | 实测 | 结果 |
+| --- | --- | --- | --- |
+| 翻译 | 本机 `:12087`（`qwen3.8-27b`） | 1.58 s（冷）／11.3 s／48.7 s | 「你好世界，这是一个真正的端到端测试。」「早上好，CapsLock。」 |
+| OCR | 本机 rapidocr（`~/.local/share/capsplus/ocr-venv`） | 1.24 s | `Hello` / `CapsLock 2026` / `OCR test line` |
+| 识别 | 本机 `:18090`（voice-svc） | 274 ms | 「放时间早上九点至下午五点」 |
+
+翻译那三次的差别不是代码问题，是**服务端串行排队**（同一分钟里另一个会话在用模型；
+这正是 `TIMEOUT_S` 定成 120 s 而不是 60 s 的原因，见 `shot_translate.py` 常量注）。
+
+### 还没做的
+
+- **设置窗与命令行那一半**（写回 `services.toml`、`capsplus services`）由另一处代码负责，
+  客户端这侧**只读**；两边共用 `capsplus/services.py` 这一份形状，别各造一份真相。
+- 端点**健康检查**（谁活着）目前是各链路自己探（翻译探 `/v1/models`、识别探 `/health`、
+  OCR 探解释器），没有统一的"把所有端点探一遍"的那条命令。
+- 凭据**只存来源**（`api_key_env` / `credentials_file`+键 / `env_file`+键）；实在要写明文也允许，
+  但文件权限 0600，且任何输出都脱敏（`describe()` 只说"来自哪"，绝不打印值）。

@@ -12,13 +12,19 @@
   * 所以：本地 OCR = `capsplus/shot_ocr.py` 用子进程调本文件，本文件只 import rapidocr。
 
 协议（**只认 stdout 最后一行 JSON**，前后可以有引擎自己的日志）：
-    {"ok": true, "text": "识别到的文字\n按行", "ms": 123, "engine": "rapidocr_onnxruntime 1.2.3"}
+    {"ok": true, "text": "识别到的文字\n按行", "ms": 123, "engine": "rapidocr_onnxruntime 1.2.3",
+     "python": "/home/…/ocr-venv/bin/python", "helper": "/…/capsplus/shot_ocr_local.py"}
     {"ok": false, "hint": "✗ …（一句可操作的话）"}
 
 用法：`<ocr-venv>/bin/python capsplus/shot_ocr_local.py /path/to.png`
+
+为什么要把 `python` / `helper` 也报出来（2026-10-21）：本地 OCR 的**助手脚本路径与 venv 解释器
+都变成可配的了**（服务配置 `services.toml` 的 `[ocr.local]`）。面板上光说"本地 OCR 成功"，
+用户根本不知道**跑的是哪一份** —— 装了两份 rapidocr 时尤其要看得见。
 """
 
 import json
+import os
 import sys
 import time
 
@@ -46,7 +52,9 @@ def main(argv) -> int:
         return 4
     text = "\n".join(line[1] for line in (result or []) if len(line) > 1 and line[1])
     ms = int((time.perf_counter() - t0) * 1000)
-    print(json.dumps({"ok": True, "text": text, "ms": ms, "engine": _VERSION},
+    print(json.dumps({"ok": True, "text": text, "ms": ms, "engine": _VERSION,
+                      "python": sys.executable,
+                      "helper": os.path.abspath(__file__)},
                      ensure_ascii=False))
     return 0
 

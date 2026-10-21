@@ -13,12 +13,15 @@
 全程**不打真网、不起真模型**：runner / post / get 都是注入的桩。
 """
 
+import contextlib
 import json
 import os
 import pathlib
+import tempfile
 import subprocess
 import sys
 import unittest
+from unittest import mock
 
 REPO = pathlib.Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO))
@@ -290,7 +293,10 @@ class TestOcrEntrypoint(unittest.TestCase):
         empty_creds = {"api_key": "", "secret_key": "", "env_file": "/tmp/none.env"}
         with mock.patch.dict(os.environ, {"CAPSPLUS_OCR": "auto"}):
             with mock.patch.object(O, "candidate_pythons", lambda exists=None: []):
-                with mock.patch.object(O, "ocr_credentials", lambda env_file=None: empty_creds):
+                # `ocr_credentials` 2026-10-21 起多了个 `cfg` 参数（服务配置驱动），
+                # 桩跟着补一个 —— 断的仍是"两个后端都没有"这条主张，不许因此改断言。
+                with mock.patch.object(O, "ocr_credentials",
+                                       lambda env_file=None, cfg=None: empty_creds):
                     result = O.ocr("/tmp/a.png")
         self.assertFalse(result["ok"])
         self.assertIn("rapidocr", result["hint"])
@@ -385,3 +391,288 @@ class TestMeasuredNumbersAreDocumented(unittest.TestCase):
         self.assertIn("392", source)
         self.assertIn("136", source)
         self.assertIn("镜像", source)
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# 2026-10-21：服务配置可配（`services.toml`）—— 端点/助手路径/venv 都从配置来
+# ══════════════════════════════════════════════════════════════════════════
+# 老判据一条没改的理由：这一轮**没有改任何既有行为** ——
+#   · 没有配置文件时，端点/档位/凭据落点与 2026-10-21 之前一致；
+#   · 有配置文件时，老的环境变量（`CAPSPLUS_OCR` / `CAPSPLUS_OCR_PYTHON` /
+#     `CAPSPLUS_OCR_ENV`）仍然认，而且优先级更高。
+# 唯一的例外是 `TestOcrEntrypoint.test_no_backend_available_returns_the_hint`：
+# 那个桩（`lambda env_file=None`）得跟着 `ocr_credentials` 新增的 `cfg` 参数补一个 ——
+# 断的仍是"两个后端都没有 ⇒ 话要说清怎么装"这条主张，断言一个字没改。
+
+CONFIG_OCR = """
+[ocr]
+mode = "auto"
+
+[ocr.local]
+kind = "local"
+style = "script"
+base_url = "shot_ocr_local.py"
+venv = "/opt/other-venv"
+
+[ocr.cloud]
+kind = "remote"
+style = "openai"
+base_url = "https://aip.baidubce.com/rest/2.0/ocr/v1/accurate_basic"
+model = "baidu-accurate-basic"
+env_file = "/tmp/capsplus-ocr-fixture.env"
+env_key = "BAIDU_OCR_API_KEY"
+"""
+
+CONFIG_VLM = """
+[ocr.vlm]
+kind = "remote"
+style = "openai"
+base_url = "http://192.0.2.10:12087/v1"
+model = "qwen3-vl"
+api_key_env = "VLM_KEY"
+"""
+
+
+@contextlib.contextmanager
+def services_file(text: str):
+    """把服务配置指到一段临时 TOML（判据**不许碰**用户真配的那份）。"""
+    with tempfile.TemporaryDirectory() as tmp:
+        path = pathlib.Path(tmp) / "services.toml"
+        path.write_text(text, encoding="utf-8")
+        with mock.patch.dict(os.environ, {"CAPSPLUS_SERVICES_FILE": str(path)}):
+            yield path
+
+
+def setUpModule():
+    """**没配置**的状态是老判据的前提 —— 先把真配置挡在外面。"""
+    os.environ["CAPSPLUS_SERVICES_FILE"] = "/tmp/capsplus-no-such-services.toml"
+
+
+def tearDownModule():
+    os.environ.pop("CAPSPLUS_SERVICES_FILE", None)
+
+
+class TestOcrEndpointsComeFromTheConfig(unittest.TestCase):
+    """① 端点从配置来（可配远程）。"""
+
+    def test_the_endpoint_list_follows_the_file(self):
+        with services_file(CONFIG_OCR):
+            eps = {e.name: e for e in O.ocr_endpoints()}
+        self.assertIn("local", eps)
+        self.assertEqual(eps["cloud"].base_url,
+                         "https://aip.baidubce.com/rest/2.0/ocr/v1/accurate_basic")
+        self.assertEqual(eps["cloud"].env_key, "BAIDU_OCR_API_KEY")
+
+    def test_the_protocol_of_each_endpoint_is_recognised(self):
+        """默认那档云端**是百度协议**（不是 OpenAI 兼容）—— 判错协议会把请求打到错地方。"""
+        with services_file(CONFIG_OCR):
+            eps = {e.name: e for e in O.ocr_endpoints()}
+        self.assertEqual(O.endpoint_protocol(eps["local"]), "script")
+        self.assertEqual(O.endpoint_protocol(eps["cloud"]), "baidu")
+
+    def test_the_helper_path_can_be_configured(self):
+        config = """
+[ocr.local]
+base_url = "/opt/other/shot_ocr_local.py"
+"""
+        with services_file(config):
+            self.assertEqual(str(O.helper_path()), "/opt/other/shot_ocr_local.py")
+
+    def test_the_default_helper_is_the_one_in_the_repo(self):
+        self.assertEqual(O.helper_path().name, "shot_ocr_local.py")
+        self.assertEqual(O.helper_path().parent,
+                         pathlib.Path(O.__file__).resolve().parent)
+
+    def test_the_venv_interpreter_can_be_configured(self):
+        with services_file(CONFIG_OCR):
+            cands = O.candidate_pythons(exists=lambda p: True)
+        self.assertIn("/opt/other-venv/bin/python", cands,
+                      "配置里写的 venv 要能当解释器候选")
+
+    def test_a_python_path_can_be_configured_too(self):
+        config = """
+[ocr.local]
+python = "/opt/rapidocr/bin/python"
+"""
+        with services_file(config):
+            cands = O.candidate_pythons(exists=lambda p: True)
+        self.assertIn("/opt/rapidocr/bin/python", cands)
+
+    def test_the_credentials_file_can_be_configured(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            env_file = pathlib.Path(tmp) / "baidu.env"
+            env_file.write_text("BAIDU_OCR_API_KEY=ak\nBAIDU_OCR_SECRET_KEY=sk\n",
+                                 encoding="utf-8")
+            config = f"""
+[ocr.cloud]
+env_file = "{env_file}"
+env_key = "BAIDU_OCR_API_KEY"
+"""
+            with services_file(config):
+                creds = O.ocr_credentials()
+        self.assertEqual(creds["api_key"], "ak")
+        self.assertEqual(creds["secret_key"], "sk")
+        self.assertEqual(creds["env_file"], str(env_file),
+                         "要报「钥匙是从哪个文件读到的」，别让人找错地方")
+
+
+class TestOcrEnvironmentBeatsTheConfigFile(unittest.TestCase):
+    """② **环境变量 > 配置文件 > 内置默认**。"""
+
+    def test_the_mode_env_var_beats_the_config(self):
+        with services_file(CONFIG_OCR):
+            with mock.patch.dict(os.environ, {"CAPSPLUS_OCR": "cloud"}):
+                self.assertEqual(O.mode(), "cloud")
+
+    def test_the_python_env_var_beats_the_config(self):
+        with services_file(CONFIG_OCR):
+            with mock.patch.dict(os.environ, {"CAPSPLUS_OCR_PYTHON": "/env/python"}):
+                cands = O.candidate_pythons(exists=lambda p: True)
+        self.assertEqual(cands[0], "/env/python", "环境变量必须排第一")
+
+    def test_the_env_file_env_var_beats_the_config(self):
+        with services_file(CONFIG_OCR):
+            with mock.patch.dict(os.environ, {"CAPSPLUS_OCR_ENV": "/tmp/from-env.env"}):
+                creds = O.ocr_credentials()
+        self.assertEqual(creds["env_file"], "/tmp/from-env.env")
+
+    def test_the_old_env_file_still_works_when_nothing_is_configured(self):
+        """老落点（`~/.dsh/skills/ocr/.env`）**不许丢** —— 没配置时仍按它去找。"""
+        creds = O.ocr_credentials("/tmp/definitely-missing.env")
+        self.assertEqual((creds["api_key"], creds["secret_key"]), ("", ""))
+        self.assertTrue(creds["env_file"].endswith(".env"))
+
+
+class TestOcrAutoFollowsTheWrittenOrder(unittest.TestCase):
+    """③ `auto` = 按**端点书写顺序**挨个试。"""
+
+    def test_the_first_written_endpoint_wins(self):
+        config = """
+[ocr.cloud]
+kind = "remote"
+style = "openai"
+base_url = "https://aip.baidubce.com/rest/2.0/ocr/v1/accurate_basic"
+env_file = "/tmp/capsplus-ocr-fixture.env"
+
+[ocr.local]
+kind = "local"
+style = "script"
+base_url = "shot_ocr_local.py"
+"""
+        with services_file(config):
+            creds = {"api_key": "ak", "secret_key": "sk", "env_file": "/tmp/x.env"}
+            backend, _why = O.resolve_backend(
+                local_probe=lambda: "/opt/ocr/bin/python", creds=creds)
+        self.assertEqual(backend, "cloud", "配置里 cloud 写在前面 ⇒ auto 先用它")
+
+    def test_local_first_means_local_first(self):
+        with services_file(CONFIG_OCR):
+            creds = {"api_key": "ak", "secret_key": "sk", "env_file": "/tmp/x.env"}
+            backend, _why = O.resolve_backend(
+                local_probe=lambda: "/opt/ocr/bin/python", creds=creds)
+        self.assertEqual(backend, "local")
+
+
+class TestVisionEndpointOnlyWhenExplicitlyConfigured(unittest.TestCase):
+    """④ `style=openai` 的**视觉端点**：只在配置里显式建了才走；默认行为不许变。"""
+
+    def test_the_default_cloud_endpoint_stays_on_the_baidu_path(self):
+        with services_file(CONFIG_OCR):
+            eps = {e.name: e for e in O.ocr_endpoints()}
+        self.assertEqual(O.endpoint_protocol(eps["cloud"]), "baidu",
+                         "默认那档云端是百度协议 —— 判成 openai 就会把请求打到错地方")
+
+    def test_a_configured_vision_endpoint_sends_the_image(self):
+        png = pathlib.Path("/tmp/capsplus-ocr-vision.png")
+        png.write_bytes(b"\x89PNG\r\n\x1a\n" + b"0" * 32)
+        seen = {}
+
+        def post(url, data, headers, timeout=15):
+            seen["url"] = url
+            seen["body"] = json.loads(data.decode())
+            return json.dumps({"choices": [{"message": {"content": "识别到的字"}}]}).encode()
+
+        with services_file(CONFIG_VLM):
+            with mock.patch.dict(os.environ, {"VLM_KEY": "vk"}):
+                ep = O.endpoint_by_name("vlm")
+                result = O.ocr(str(png), "vlm", post=post)
+        self.assertTrue(result["ok"], result.get("hint"))
+        self.assertEqual(result["text"], "识别到的字")
+        self.assertTrue(seen["url"].startswith("http://192.0.2.10:12087/v1/"),
+                        f"请求没发到配置的地址：{seen['url']}")
+        content = seen["body"]["messages"][0]["content"]
+        self.assertIsInstance(content, list, "带图时 content 必须是数组")
+        url = [p for p in content if p["type"] == "image_url"][0]["image_url"]["url"]
+        self.assertTrue(url.startswith("data:image/png;base64,"),
+                        "图要内联成 data URL（本地没有图床）")
+
+    def test_an_unconfigured_cloud_endpoint_never_takes_the_vision_path(self):
+        """没配视觉端点时，`ocr()` 走的是**百度**那条（老行为）。"""
+        called = []
+
+        def post(url, data, headers, timeout=15):
+            called.append(url)
+            if "oauth" in url:
+                return json.dumps({"access_token": "tk", "expires_in": 100}).encode()
+            return json.dumps({"words_result": [{"words": "第一行"}]}).encode()
+
+        png = pathlib.Path("/tmp/capsplus-ocr-baidu.png")
+        png.write_bytes(b"\x89PNG\r\n\x1a\n" + b"0" * 32)
+        with services_file(CONFIG_OCR):
+            creds = {"api_key": "ak", "secret_key": "sk", "env_file": "/tmp/x.env"}
+            result = O.ocr(str(png), "cloud", creds=creds, post=post)
+        self.assertTrue(result["ok"], result.get("hint"))
+        self.assertTrue(any("aip.baidubce.com" in u for u in called),
+                        f"默认那档云端必须走百度：{called}")
+
+
+class TestCounterExamples(unittest.TestCase):
+    """反例具型：每条判据都得能红。**判据抓不住东西 = 没有判据。**"""
+
+    def test_counterexample_config_beating_the_env_var_is_caught(self):
+        """反例 ①：把优先级反过来（配置压过环境变量）⇒ 判据必须红。"""
+        with services_file(CONFIG_OCR):
+            with mock.patch.dict(os.environ, {"CAPSPLUS_OCR": "cloud"}):
+                good = O.mode()
+                with mock.patch.object(O, "_pick", lambda e, c, d: c or e or d):
+                    bad = O.mode()
+        self.assertEqual(good, "cloud", "判据本体：环境变量必须压过配置文件")
+        self.assertNotEqual(bad, "cloud", "优先级写反了这条判据抓不住 —— 它就是摆设")
+
+    def test_counterexample_auto_ignoring_the_order_is_caught(self):
+        """反例 ②：让 `auto` 忽略端点顺序 ⇒ 判据必须红。"""
+        config = """
+[ocr.cloud]
+kind = "remote"
+style = "openai"
+base_url = "https://aip.baidubce.com/rest/2.0/ocr/v1/accurate_basic"
+
+[ocr.local]
+kind = "local"
+style = "script"
+base_url = "shot_ocr_local.py"
+"""
+        creds = {"api_key": "ak", "secret_key": "sk", "env_file": "/tmp/x.env"}
+        with services_file(config):
+            good, _why = O.resolve_backend(local_probe=lambda: "/p/python", creds=creds)
+            original = O.ocr_endpoints
+            with mock.patch.object(O, "ocr_endpoints",
+                                   lambda cfg=None: list(reversed(original(cfg)))):
+                bad, _why2 = O.resolve_backend(local_probe=lambda: "/p/python", creds=creds)
+        self.assertEqual(good, "cloud", "判据本体：auto 按端点书写顺序")
+        self.assertNotEqual(bad, "cloud", "auto 忽略顺序这条判据抓不住 —— 它就是摆设")
+
+    def test_counterexample_the_old_env_var_dying_is_caught(self):
+        """反例 ③：让老的环境变量失效（`CAPSPLUS_OCR` 不再被认）⇒ 判据必须红。"""
+        with services_file(CONFIG_OCR):
+            with mock.patch.dict(os.environ, {"CAPSPLUS_OCR": "cloud"}):
+                good = O.mode()
+                with mock.patch.object(O, "_known_mode",
+                                       lambda value, cfg=None: value.lower() == "auto"):
+                    bad = O.mode()
+        self.assertEqual(good, "cloud", "判据本体：老的环境变量必须仍然生效")
+        self.assertNotEqual(bad, "cloud", "老环境变量失效这条判据抓不住 —— 它就是摆设")
+
+
+if __name__ == "__main__":
+    unittest.main()

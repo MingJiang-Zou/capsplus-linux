@@ -14,6 +14,7 @@
 不拿 skip 装绿（跑法见文件末尾）。
 """
 
+import contextlib
 import io
 import json
 import os
@@ -123,6 +124,12 @@ def with_stub(mode):
 
 def stop_stub(server, patch):
     patch.stop()
+    server.shutdown()
+    server.server_close()
+
+
+def close_server(server):
+    """只关服务器、不动环境变量（配置驱动的用例要的就是"环境变量没设"）。"""
     server.shutdown()
     server.server_close()
 
@@ -291,7 +298,7 @@ class TestPort(unittest.TestCase):
 class TestKeepLastIsOptIn(unittest.TestCase):
     """诊断留证（`CAPSPLUS_VOICE_KEEP_LAST=1`）—— 默认**不落盘**，开了才有上限地留。
 
-    为什么值得有判据（2026-10-20）：明江说"识别不准"时我们手里没有音频，
+    为什么值得有判据（2026-10-20）：用户说"识别不准"时我们手里没有音频，
     只能凭现象猜；这个开关就是为"下次能拿真音频复盘"装的。它同时踩两条线：
     落盘用户说的话（隐私）与磁盘上界（清理），所以默认关 + 上限 + 只清自己的文件，
     三条都得钉住，不能只钉一条。
@@ -467,6 +474,184 @@ class TestGlossaryReachesTheRecognitionText(unittest.TestCase):
         self.assertTrue(result.ok, "表坏了把识别也带崩了")
         self.assertEqual(result.text, "帮晒这个项目")
         self.assertEqual(result.terms, 0)
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# 2026-10-21：服务配置可配（`services.toml`）—— 识别服务的落点从配置来
+# ══════════════════════════════════════════════════════════════════════════
+# 老判据一条没改的理由：这一轮**没有改任何既有行为** ——
+#   · 没有配置文件时，落点/语言/超时与 2026-10-21 之前一致；
+#   · 有配置文件时，老的三个环境变量（`CAPSPLUS_ASR_HOST` / `CAPSPLUS_ASR_PORT` /
+#     `CAPSPLUS_ASR_LANG`）仍然认，而且优先级更高。
+
+CONFIG_ASR = """
+[asr]
+mode = "local"
+lang = "zh"
+timeout_s = 25
+
+[asr.local]
+kind = "local"
+style = "http"
+base_url = "http://192.0.2.10:18090"
+model = "sense_voice"
+"""
+
+CONFIG_ASR_HOSTPORT = """
+[asr.local]
+host = "192.0.2.11"
+port = 18091
+"""
+
+
+@contextlib.contextmanager
+def services_file(text: str):
+    """把服务配置指到一段临时 TOML（判据**不许碰**用户真配的那份）。"""
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "services.toml"
+        path.write_text(text, encoding="utf-8")
+        with mock.patch.dict(os.environ, {"CAPSPLUS_SERVICES_FILE": str(path)}):
+            yield path
+
+
+def setUpModule():
+    """**没配置**的状态是老判据的前提 —— 先把真配置挡在外面。"""
+    os.environ["CAPSPLUS_SERVICES_FILE"] = "/tmp/capsplus-no-such-services.toml"
+
+
+def tearDownModule():
+    os.environ.pop("CAPSPLUS_SERVICES_FILE", None)
+
+
+class TestAsrBaseUrlComesFromTheConfig(unittest.TestCase):
+    """① 识别服务的落点从 `[asr]` 来（本机 or 远程任选）。"""
+
+    def test_the_base_url_is_read_from_the_config(self):
+        with services_file(CONFIG_ASR):
+            self.assertEqual(A.base_url(), "http://192.0.2.10:18090")
+            self.assertEqual(A.host(), "192.0.2.10")
+            self.assertEqual(A.port(), 18090)
+
+    def test_host_and_port_may_be_written_instead_of_a_base_url(self):
+        with services_file(CONFIG_ASR_HOSTPORT):
+            self.assertEqual(A.base_url(), "http://192.0.2.11:18091")
+
+    def test_the_request_really_goes_to_the_configured_address(self):
+        """不只是"读出来"—— 请求必须真的打到配置里那个地址。"""
+        server = start_stub("ok")
+        self.addCleanup(close_server, server)
+        port = server.server_address[1]
+        with services_file(f'[asr.local]\nbase_url = "http://127.0.0.1:{port}"\n'):
+            with mock.patch.dict(os.environ, {"CAPSPLUS_ASR_HOST": "",
+                                              "CAPSPLUS_ASR_PORT": "",
+                                              "VOICE_SVC_PORT": ""}):
+                result = A.recognize(pcm_silence(50))
+        self.assertTrue(result.ok, result.describe())
+        self.assertEqual(len(server.seen), 1, "请求没落到配置的地址上")
+
+    def test_the_lang_comes_from_the_config(self):
+        with services_file("[asr]\nlang = \"en\"\n"):
+            self.assertEqual(A.lang(), "en")
+
+    def test_the_timeout_comes_from_the_config(self):
+        with services_file("[asr]\ntimeout_s = 45\n"):
+            self.assertEqual(A.recognize_timeout(), 45.0)
+
+    def test_without_a_config_the_old_defaults_hold(self):
+        self.assertEqual(A.base_url(), f"http://{A.DEFAULT_HOST}:{A.DEFAULT_PORT}")
+        self.assertEqual(A.lang(), A.DEFAULT_LANG)
+        self.assertEqual(A.recognize_timeout(), A.RECOGNIZE_TIMEOUT_S)
+
+
+class TestAsrEnvironmentBeatsTheConfigFile(unittest.TestCase):
+    """② **环境变量 > 配置文件 > 内置默认**（那三个变量是现场救火用的，不许被配置挡住）。"""
+
+    def test_the_host_and_port_env_vars_beat_the_config(self):
+        with services_file(CONFIG_ASR):
+            with mock.patch.dict(os.environ, {"CAPSPLUS_ASR_HOST": "127.0.0.1",
+                                              "CAPSPLUS_ASR_PORT": "18123"}):
+                self.assertEqual(A.base_url(), "http://127.0.0.1:18123")
+                self.assertEqual(A.port(), 18123)
+
+    def test_the_lang_env_var_beats_the_config(self):
+        with services_file("[asr]\nlang = \"en\"\n"):
+            with mock.patch.dict(os.environ, {"CAPSPLUS_ASR_LANG": "ja"}):
+                self.assertEqual(A.lang(), "ja")
+
+    def test_the_voice_svc_port_still_wins_when_capsplus_port_is_empty(self):
+        with services_file(CONFIG_ASR):
+            with mock.patch.dict(os.environ, {"CAPSPLUS_ASR_PORT": "",
+                                              "VOICE_SVC_PORT": "19999"}):
+                self.assertEqual(A.port(), 19999)
+
+
+class TestRemoteOutageSaysWhatToDoNext(unittest.TestCase):
+    """③ **远端**不可达时，提示要带"下一步"（而且是**在那台机器上**做什么）。"""
+
+    def test_a_remote_outage_names_the_target_and_the_next_step(self):
+        with services_file('[asr.local]\nbase_url = "http://192.0.2.99:18090"\n'):
+            result = A.recognize(pcm_silence(50), timeout=0.6)
+        self.assertFalse(result.ok)
+        self.assertIn(result.code, ("unreachable", "timeout"))
+        self.assertIn("192.0.2.99", result.hint, "要报出连的是哪台")
+        self.assertIn("那台机器", result.hint,
+                      "远程的提示必须说清『在**那台机器**上』做什么 —— 在本机敲 systemctl 是错的")
+        self.assertIn("voice-svc", result.hint, "要给出能照着敲的命令")
+
+    def test_a_local_outage_keeps_the_local_wording(self):
+        """本机那档的话术不许被远程那套覆盖（老判据钉的就是它）。"""
+        probe = socket.socket()
+        probe.bind(("127.0.0.1", 0))
+        dead_port = probe.getsockname()[1]
+        probe.close()
+        with mock.patch.dict(os.environ, {"CAPSPLUS_ASR_HOST": "127.0.0.1",
+                                          "CAPSPLUS_ASR_PORT": str(dead_port)}):
+            result = A.recognize(pcm_silence(50), timeout=1.0)
+        self.assertEqual(result.code, "unreachable")
+        self.assertIn("systemctl --user start voice-svc", result.hint)
+        self.assertNotIn("那台机器", result.hint, "本机故障不该说『那台机器』")
+
+
+class TestCounterExamples(unittest.TestCase):
+    """反例具型：每条判据都得能红。**判据抓不住东西 = 没有判据。**"""
+
+    def test_counterexample_config_beating_the_env_var_is_caught(self):
+        """反例 ①：把优先级反过来（配置压过环境变量）⇒ 判据必须红。"""
+        with services_file(CONFIG_ASR):
+            with mock.patch.dict(os.environ, {"CAPSPLUS_ASR_HOST": "127.0.0.1",
+                                              "CAPSPLUS_ASR_PORT": "18123"}):
+                good = A.base_url()
+                with mock.patch.object(A, "_pick", lambda e, c, d: c or e or d):
+                    bad = A.base_url()
+        self.assertEqual(good, "http://127.0.0.1:18123",
+                         "判据本体：环境变量必须压过配置文件")
+        self.assertNotEqual(bad, "http://127.0.0.1:18123",
+                            "优先级写反了这条判据抓不住 —— 它就是摆设")
+
+    def test_counterexample_the_old_env_var_dying_is_caught(self):
+        """反例 ②：让老的 `CAPSPLUS_ASR_PORT` 失效 ⇒ 判据必须红。"""
+        with services_file(CONFIG_ASR):
+            with mock.patch.dict(os.environ, {"CAPSPLUS_ASR_PORT": "18123"}):
+                good = A.port()
+                with mock.patch.object(A, "_env_port", lambda: 0):
+                    bad = A.port()
+        self.assertEqual(good, 18123, "判据本体：老的端口环境变量必须仍然生效")
+        self.assertNotEqual(bad, 18123, "老环境变量失效这条判据抓不住 —— 它就是摆设")
+
+    def test_counterexample_the_config_being_ignored_is_caught(self):
+        """反例 ③：配置里的地址不生效（退回写死的本机端口）⇒ 判据必须红。"""
+        with services_file(CONFIG_ASR):
+            good = A.base_url()
+            with mock.patch.object(A, "_config_base_url", lambda cfg=None: ""):
+                bad = A.base_url()
+        self.assertEqual(good, "http://192.0.2.10:18090",
+                         "判据本体：地址必须来自服务配置")
+        self.assertNotEqual(bad, "http://192.0.2.10:18090",
+                            "配置不生效这条判据抓不住 —— 它就是摆设")
 
 
 if __name__ == "__main__":

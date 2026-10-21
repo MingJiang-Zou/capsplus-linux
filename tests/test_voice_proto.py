@@ -329,7 +329,7 @@ class TestLevelsAndTruncationReachTheUser(unittest.TestCase):
     """录音**结束后**的两个可感知出口：电平进了 status，截断进了事件与 status。
 
     为什么单独立类（2026-10-20）：`voice_vad` / `voice_levels` 里算得再对，只要这两条没接到
-    worker 的出口上，明江看到的仍然是"识别率低"和"我后半句没了" —— 判据必须钉在**看得见的地方**。
+    worker 的出口上，用户看到的仍然是"识别率低"和"我后半句没了" —— 判据必须钉在**看得见的地方**。
     全程假麦克风 + 假识别服务 + 不弹窗（`CAPSPLUS_VOICE_UI=0`）。
     """
 
@@ -466,7 +466,7 @@ class TestWorkerEndToEnd(unittest.TestCase):
         self._tmp = tempfile.TemporaryDirectory()
         self._patch = mock.patch.dict(os.environ, {
             "CAPSPLUS_STATE_DIR": self._tmp.name,
-            "CAPSPLUS_VOICE_UI": "0",          # 明江红线：不许弹窗
+            "CAPSPLUS_VOICE_UI": "0",          # 用户红线：不许弹窗
         })
         self._patch.start()
         self.addCleanup(self._patch.stop)
@@ -778,3 +778,55 @@ class TestGuardHasTeeth(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+class TestWorkerFollowsTheConfiguredAsrAddress(unittest.TestCase):
+    """2026-10-21：识别服务的落点可配（`services.toml` 的 `[asr]`）—— **worker 这条路也要跟着走**。
+
+    为什么这条要判在 worker 上（而不只判 `voice_asr`）：真正按键上屏的是 worker，
+    它自己调 `ASR.recognize()`。配置读对了、worker 却还按写死的地址打，用户看到的
+    还是"我配了但没用"。这条用例把**整条路**（worker → 识别服务）走一遍。
+
+    环境变量那三个（`CAPSPLUS_ASR_HOST` / `CAPSPLUS_ASR_PORT` / `CAPSPLUS_ASR_LANG`）
+    **优先级更高** —— 这条用例把它们**清空**，才能证明配置那条路真的通。
+    """
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self._patch = mock.patch.dict(os.environ, {
+            "CAPSPLUS_STATE_DIR": self._tmp.name,
+            "CAPSPLUS_VOICE_UI": "0",
+            "CAPSPLUS_ASR_HOST": "",
+            "CAPSPLUS_ASR_PORT": "",
+            "VOICE_SVC_PORT": "",
+        })
+        self._patch.start()
+        self.addCleanup(self._patch.stop)
+        self.addCleanup(self._tmp.cleanup)
+
+    def test_the_recognition_goes_to_the_address_from_the_config(self):
+        server, port, seen = start_stub(reply={"ok": True, "text": "配置里的地址", "ms": 5})
+        self.addCleanup(close_stub, server)
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = Path(tmp) / "services.toml"
+            cfg.write_text(f'[asr.local]\nbase_url = "http://127.0.0.1:{port}"\n',
+                           encoding="utf-8")
+            with mock.patch.dict(os.environ, {"CAPSPLUS_SERVICES_FILE": str(cfg)}):
+                from capsplus import voice_inject as INJ
+                from capsplus import voice_vad as V
+
+                srv = W.Server(params=V.VadParams(max_ms=4000),
+                               popener=lambda argv, **kw: FakeProc([]),
+                               run_command=lambda argv, **kw: type("R", (), {"returncode": 0,
+                                                                            "stderr": b""})(),
+                               review_ui=False)
+                srv.probe = lambda: INJ.Probe(wl_copy="/bin/true")
+                session = srv._ensure_session()
+                session.start_recording()
+                self.assertTrue(session.wait_done(20), "会话没走完")
+        self.assertTrue(seen, "识别请求没发出去 —— 服务配置里的地址没被用上")
+        self.assertIn("/asr-upload", seen[0]["path"])
+
+
+if __name__ == "__main__":
+    unittest.main()
