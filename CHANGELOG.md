@@ -7,6 +7,39 @@ GitHub 仓库的 Releases 页。版本号唯一落点是 `capsplus/__init__.py` 
 
 ---
 
+## 未发布 —— 修 bug 的一轮（2026-10-21）
+
+### 2026-10-21 事故：结果面板的「复制」按钮点了没反应（翻译 / OCR 的文本复制不出来）
+
+**现象**（明江原话）：「翻译以及 OCR 出来的文本点击那个复制按钮复制不出来」。
+
+**根因**：`Annotator.copy_panel_text()` 里那行是
+`display.get_clipboard(Gdk.SELECTION_CLIPBOARD).set_text(text, -1)` —— `get_clipboard` 是
+**GTK4** 的 API，本仓是 GTK3，真机上是
+`AttributeError: 'GdkWaylandDisplay' object has no attribute 'get_clipboard'`。
+异常抛在 GTK 的信号处理器里，而这条链是 `Caps+F1` 由 keyd 起的进程、stderr 落在 journal 里没人看
+⇒ 现象就是"按钮点了完全没反应"。与 2026-10-20 那个 `cairo.Context.flush()` 同一类：调了一个
+**这个对象上不存在**的方法。另外一半原因：即便换成 GTK3 的 `Gtk.Clipboard`，GTK 自己的剪贴板由
+**本进程**持有选区，标注窗一关、进程一退文字就没了 —— 那也照样"复制了粘不出来"。
+
+**修复**：
+· 改走**与 Ctrl+C 同一条** `wl-copy` 文本链路（`copy_text_to_clipboard`，可注入）—— 选区由外部进程
+  持有，窗口关掉文字还在；它已带"留守者握着 stderr"那套守护步处理，不会卡满 5 秒把界面冻住；
+· 新增 `Annotator.say()`：成功 / 失败都立刻刷到状态栏（"复制成功"和"点了没反应"不许长得一样）；
+· 抽屉按钮的 tooltip 从「复制（Ctrl+C）」改成「复制这段文字」（Ctrl+C 在标注窗里复制的是**图片**，
+  那行提示当时也在把排查带偏）。
+
+**判据（都带反例具型）**：
+· `tests/test_shot_annotate.py::TestPanelCopyGoesThroughWlCopy`（5 条）—— 送出去的就是面板该复制的那段
+  （有译文优先译文）/ 默认实现必须是 `copy_text_to_clipboard` / 失败原因原样落到状态栏 /
+  面板没内容时**不许**碰剪贴板。**这条路径过去一条判据都没有**，所以它能一直坏着。
+· `tests/test_shot_draw_smoke.py::TestNoGtk4ApisInGtk3Code`（2 条）—— 把"调了不存在的方法"体检从
+  **模块级**（`Gtk.xxx` / `Gdk.xxx`）扩到**实例方法**：`display = Gdk.Display.get_default()` 之后所有
+  `display.xxx` 逐个拿真 `Gdk.Display` 类 `hasattr` 核。反例真红过：把那行塞回去 →
+  `line 1435: display.get_clipboard() 在 Display 上不存在`，还原后 md5 逐字节一致。
+
+**真机复验**（明江："可以复制出来了"）；本机三口径 1539 OK（skip 81 / 273 / 1），`compileall` rc=0。
+
 ## 未发布 —— 文档与判据卫生：生成器不再能吃正文 + 一条"只在有桌面时才对"的判据
 
 两件收尾上的小事，都属"会反复伤人"那一类（各配反例具型，红过才留）。
