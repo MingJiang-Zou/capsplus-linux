@@ -26,6 +26,7 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO))
@@ -74,6 +75,7 @@ if RUN_GUI:
     os.environ.setdefault("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}")   # 别处不一定是 1000
 
 from capsplus import mapping_overrides as MO    # noqa: E402
+from capsplus import services as SV             # noqa: E402
 from capsplus.env import keyd_cli_hint          # noqa: E402  跳过文案里的命令名跟着本机走
 from capsplus.render import binding_rows        # noqa: E402
 from qbar.search_config import (                # noqa: E402
@@ -204,10 +206,12 @@ class TestSettingsWindow(unittest.TestCase):
         self.qbar = self.dir / "qbar.toml"
         self.qbar.write_text(SAMPLE, encoding="utf-8")
         self.overrides = self.dir / "mappings.toml"
+        self.services = self.dir / "services.toml"
         self.state = self.dir / "state"
         self.window = self.app_module.SettingsWindow(qbar_path=self.qbar,
                                                      overrides_path=self.overrides,
-                                                     state_dir=self.state)
+                                                     state_dir=self.state,
+                                                     services_path=self.services)
         self.window.show_all()
         self.pump(0.8, until=self.window.get_mapped)
 
@@ -412,14 +416,24 @@ class TestSettingsWindow(unittest.TestCase):
             self.assertIn("wayland", disp.get_name().lower())
         self.assertTrue(display is None or True)
 
-    def test_four_pages_exist_with_the_right_titles(self):
-        """四页：状态在最前（2026-10-20 起它是总入口 —— 打开窗口就是来看"哪个键没反应"的）。"""
+    def test_five_pages_exist_with_the_right_titles(self):
+        """五页：状态在最前（2026-10-20 起它是总入口 —— 打开窗口就是来看"哪个键没反应"的），
+        「服务」在最后（2026-10-21 加：翻译 / OCR / 语音识别的服务可配置）。"""
         labels = [self.window.notebook.get_tab_label(self.window.notebook.get_nth_page(i))
                   .get_text() for i in range(self.window.notebook.get_n_pages())]
-        self.assertEqual(labels, ["状态", "快速链接", "通用", "按键映射"])
+        self.assertEqual(labels, ["状态", "快速链接", "通用", "按键映射", "服务"])
         self.assertIsInstance(self.window.links_page, self.app_module.LinksPage)
         self.assertIsInstance(self.window.general_page, self.app_module.GeneralPage)
         self.assertIsInstance(self.window.mapping_page, self.app_module.MappingPage)
+        self.assertIsInstance(self.window.services_page, self.app_module.ServicesPage)
+
+    def test_status_page_is_still_the_landing_page_with_five_pages(self):
+        """加了「服务」页之后，**打开窗口仍然落在「状态」**（总入口不许被挤掉）。"""
+        self.assertEqual(self.window.notebook.get_n_pages(), 5)
+        self.assertEqual(self.window.notebook.get_current_page(), 0)
+        label = self.window.notebook.get_tab_label(
+            self.window.notebook.get_nth_page(self.window.notebook.get_current_page()))
+        self.assertEqual(label.get_text(), "状态")
 
     def test_status_page_is_the_landing_page_and_says_something(self):
         """状态页必须真建出来、并且一打开就落在它上面。
@@ -434,7 +448,11 @@ class TestSettingsWindow(unittest.TestCase):
         buf = self.window.status_page.view.get_buffer()
         text = buf.get_text(buf.get_start_iter(), buf.get_end_iter(), False)
         self.assertTrue(text.strip(), "状态页打开是空的 —— reload() 没跑？")
-        self.assertIn("检查中", text)
+        # ⚠ 原来这里断言的是「检查中」三个字，那是**竞态**：探测在后台线程里，
+        # 机器闲的时候它会在断言之前就探完、把缓冲换成整页报告（2026-10-21 加第五页后
+        # 在本机复现过一次）。所以只判"有内容"，内容是"检查中"还是探完的报告都算过。
+        self.assertTrue("检查中" in text or "一页看全" in text,
+                        f"状态页既不是「检查中」也不是报告：{text[:120]!r}")
 
     # ------------------------------------------------------------------
     # 第①页
@@ -840,6 +858,252 @@ def load_config_write_back(text: str):
         cfg = load_config(path, create=False)
         assert cfg.error == "", cfg.error
         return [(l.trigger, l.resolved_type) for l in cfg.links]
+
+
+# ⚠ 必须带这道闸（2026-10-21 踩到）：**默认不许在用户的真桌面上弹窗**。
+# 本机是 Wayland + Xwayland，`Gtk.init_check()` 会**成功** —— 于是少了这道闸，
+# 「默认跑法」（不带 CAPSPLUS_GUI=1）就会把窗口弹到用户屏幕上、抢键盘焦点
+# （仓库 2026-10-16 那次投诉就是这么来的）。
+@unittest.skipUnless(RUN_GUI and not real_desktop_risk(),
+                     '没设 CAPSPLUS_GUI=1（或 GDK 连着真实 Wayland 桌面）：界面测试跳过，避免弹窗抢焦点')
+class TestServicesPage(unittest.TestCase):
+    """第④页「服务」的界面判据（真起窗跑）。
+
+    三条要害：
+      ① 三个区块（翻译 / OCR / 语音识别）与**只读**端点表真建出来了；
+      ② 改一条端点 → 点「保存这一条」→ 点「保存服务配置」→ **文件里真的变了**；
+      ③ **界面上任何可见文本都不许出现明文 key**（这一页最容易出事的地方）。
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        # 类上的 skipUnless 已经挡住了"默认跑法"；走到这里说明是**显式要求**跑的
+        if not RUN_GUI:
+            raise unittest.SkipTest("没设 CAPSPLUS_GUI=1 —— 不在真桌面上弹窗")
+        risk = real_desktop_risk()
+        if risk:
+            raise unittest.SkipTest(risk)
+        if gi is None:
+            raise unittest.SkipTest(f"没有 python3-gi / GTK3 typelib：{GI_ERROR}")
+        if not display_works():
+            raise unittest.SkipTest("连不上任何显示服务器")
+        cls.app_module = __import__("settings_app", globals(), locals(), ["SettingsWindow"], 0)
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.dir = Path(self._tmp.name)
+        self.qbar = self.dir / "qbar.toml"
+        self.qbar.write_text(SAMPLE, encoding="utf-8")
+        self.overrides = self.dir / "mappings.toml"
+        self.services = self.dir / "services.toml"
+        self.state = self.dir / "state"
+        self.window = self.app_module.SettingsWindow(qbar_path=self.qbar,
+                                                     overrides_path=self.overrides,
+                                                     state_dir=self.state,
+                                                     services_path=self.services)
+        self.window.show_all()
+        self.pump(0.8, until=self.window.get_mapped)
+
+    def tearDown(self):
+        self.window.destroy()
+        while Gtk.events_pending():
+            Gtk.main_iteration_do(False)
+        self._tmp.cleanup()
+
+    def pump(self, seconds: float = 0.5, until=None) -> None:
+        end = time.monotonic() + seconds
+        while time.monotonic() < end:
+            while Gtk.events_pending():
+                Gtk.main_iteration_do(False)
+            if until is not None and until():
+                break
+            time.sleep(0.02)
+
+    def status_text(self) -> str:
+        return self.window.statusbar.get_text()
+
+    def status_color(self) -> str:
+        label = self.window.statusbar.get_label() or ""
+        return "red" if "#e64545" in label else (
+            "amber" if "#c98a00" in label else ("blue" if "#1a5fb4" in label else "grey"))
+
+    def page(self):
+        return self.window.services_page
+
+    # ── ① 控件真建出来了 ───────────────────────────────────────────────
+    def test_three_capability_blocks_exist_with_the_default_endpoints(self):
+        page = self.page()
+        self.assertEqual(page.sub.get_n_pages(), 3)
+        labels = [page.sub.get_tab_label(page.sub.get_nth_page(i)).get_text()
+                  for i in range(page.sub.get_n_pages())]
+        self.assertEqual(labels, ["翻译", "OCR 识别", "语音识别"])
+        self.assertEqual(len(page.blocks["translate"].store), 2)   # local / cloud
+        self.assertEqual(len(page.blocks["ocr"].store), 2)
+        self.assertEqual(len(page.blocks["asr"].store), 1)
+        # 表格只读（老规矩：编辑控件不许进表格）
+        for name, block in page.blocks.items():
+            for column in block.view.get_columns():
+                for cell in column.get_cells():
+                    self.assertFalse(cell.get_property("editable"),
+                                     f"{name} 的表格里出现了可编辑 renderer")
+
+    def test_editor_controls_exist_and_the_plain_key_box_is_hidden(self):
+        page = self.page()
+        for name in ("e_name", "e_kind", "e_style", "e_url", "e_model", "e_timeout",
+                     "e_key_env", "e_cred_file", "e_cred_key", "e_env_file", "e_env_key",
+                     "e_plain", "e_clear"):
+            self.assertTrue(hasattr(page, name), f"编辑条少了 {name}")
+        self.assertFalse(page.e_plain.get_visibility(),
+                         "明文 key 的输入框必须默认不显示（它是只写不读的）")
+
+    def test_endpoint_table_shows_the_credential_source_not_the_value(self):
+        """凭据那一列写的是「已配置（来自 …）」，**不是值**。"""
+        page = self.page()
+        row = page.blocks["translate"].store[1]          # cloud：凭据来自凭据文件
+        self.assertIn("凭据文件", row[5])
+        self.assertNotIn("AL_TOKEN_PLAN_API_KEY=", row[5])
+
+    # ── ② 改一条端点 → 真的写进文件 ─────────────────────────────────────
+    def test_editing_an_endpoint_and_saving_writes_the_file(self):
+        page = self.page()
+        page.blocks["translate"].select_row(0)
+        self.pump(0.2)
+        page.e_url.set_text("http://elsewhere:9999/v1")
+        page.on_save_endpoint(Gtk.Button())
+        self.assertEqual(self.status_color(), "blue")
+        self.assertFalse(self.services.exists(), "「保存这一条」只进内存，不许写盘")
+        page.on_save(Gtk.Button())
+        self.assertEqual(self.status_color(), "blue")
+        self.assertTrue(self.services.exists())
+        svc = SV.load_services(self.services)
+        self.assertEqual(svc.error, "")
+        self.assertEqual(svc.capability("translate").endpoints["local"].base_url,
+                         "http://elsewhere:9999/v1")
+
+    def test_adding_and_deleting_an_endpoint_reaches_the_file(self):
+        page = self.page()
+        page.on_add_endpoint(Gtk.Button())
+        self.pump(0.2)
+        page.e_name.set_text("mine")
+        page.e_url.set_text("http://mine.local/v1")
+        page.on_save_endpoint(Gtk.Button())
+        page.on_save(Gtk.Button())
+        svc = SV.load_services(self.services)
+        self.assertIn("mine", svc.capability("translate").endpoints)
+        # 删除（跳过确认框）
+        page.blocks["translate"].select_row(list(svc.capability("translate").endpoints).index("mine"))
+        self.pump(0.2)
+        original = Gtk.MessageDialog.run
+        Gtk.MessageDialog.run = lambda self: Gtk.ResponseType.YES
+        try:
+            page.on_delete_endpoint(Gtk.Button())
+        finally:
+            Gtk.MessageDialog.run = original
+        page.on_save(Gtk.Button())
+        svc = SV.load_services(self.services)
+        self.assertNotIn("mine", svc.capability("translate").endpoints)
+
+    def test_an_invalid_endpoint_is_refused_and_never_reaches_the_config(self):
+        """非法端点当场被拒 —— 而且**进不了配置**（内存里也不许留坏数据）。"""
+        page = self.page()
+        page.blocks["translate"].select_row(0)
+        self.pump(0.2)
+        page.e_url.set_text("不是网址")
+        page.on_save_endpoint(Gtk.Button())
+        self.assertEqual(self.status_color(), "red")
+        self.assertIn("http://", self.status_text())
+        self.assertEqual(page.capability("translate").endpoints["local"].base_url,
+                         "http://127.0.0.1:12087/v1", "非法值留在配置里了")
+
+    def test_a_broken_config_in_memory_is_never_written(self):
+        """内存里那份坏了 → 「保存服务配置」必须红字拦住，**一个字节都不写**。"""
+        page = self.page()
+        page.capability("translate").endpoints["local"].base_url = ""
+        page.on_save(Gtk.Button())
+        self.assertEqual(self.status_color(), "red")
+        # 两条拦截路径的文案不一样（「没写盘」/「没有写盘」），只判"没写"这个事实
+        self.assertIn("写盘", self.status_text())
+        self.assertIn("地址不能为空", self.status_text())
+        self.assertFalse(self.services.exists(), "有毛病还写盘 = 判据失败")
+
+    # ── ③ 界面上不许出现明文 key ─────────────────────────────────────────
+    def visible_texts(self, widget) -> list[str]:
+        """一个窗口里所有**看得见的文字**（标签 / 输入框 / 表格 / 文本框）。"""
+        out = []
+        stack = [widget]
+        while stack:
+            node = stack.pop()
+            if isinstance(node, Gtk.Container):
+                stack.extend(node.get_children() or [])
+            if isinstance(node, Gtk.Label):
+                out.append(node.get_text())
+            elif isinstance(node, Gtk.Entry):
+                out.append(node.get_text())
+            elif isinstance(node, Gtk.TextView):
+                buf = node.get_buffer()
+                out.append(buf.get_text(buf.get_start_iter(), buf.get_end_iter(), False))
+            elif isinstance(node, Gtk.TreeView):
+                model = node.get_model()
+                if model is not None:
+                    for row in model:
+                        for value in row:
+                            out.append(str(value))
+        return out
+
+    def test_the_plain_key_never_shows_up_in_the_window(self):
+        """配一把明文 key 写进文件，再开窗 —— **整个窗口里不许出现它**。"""
+        secret = "sk-TEST-ui-leak-please"
+        svc = SV.default_services()
+        svc.path = self.services
+        svc.capability("translate").endpoints["cloud"].api_key = secret
+        ok, _text = SV.save_services(svc, self.services)
+        self.assertTrue(ok)
+        window = self.app_module.SettingsWindow(qbar_path=self.qbar,
+                                                 overrides_path=self.overrides,
+                                                 state_dir=self.state,
+                                                 services_path=self.services)
+        window.show_all()
+        self.pump(0.5, until=window.get_mapped)
+        try:
+            # 选中那条配了明文 key 的端点 —— 编辑条下方的状态行会显示"来自哪"
+            window.services_page.blocks["translate"].select_row(1)
+            self.pump(0.3)
+            texts = self.visible_texts(window)
+            texts.append(window.statusbar.get_text())
+            joined = "\n".join(texts)
+            self.assertNotIn(secret, joined,
+                             f"明文 key 出现在界面上了：\n{joined[:800]}")
+            # 但"已配置（来自 …）"要在 —— 用户得知道凭据是从哪来的（只有来源，没有值）
+            self.assertIn("已配置", joined)
+            self.assertIn("凭据文件", joined)
+        finally:
+            window.destroy()
+            while Gtk.events_pending():
+                Gtk.main_iteration_do(False)
+
+    # ── 测试连接 ────────────────────────────────────────────────────────
+    def result_text(self) -> str:
+        buf = self.page().result_view.get_buffer()
+        return buf.get_text(buf.get_start_iter(), buf.get_end_iter(), False)
+
+    def test_test_connection_reports_elapsed_and_one_line_summary(self):
+        """「测试连接」要报**耗时 + 一行摘要**（探活是后台线程，得等它回来）。"""
+        page = self.page()
+        fake = {"ok": True, "ms": 42, "summary": "能出字（你好）", "hint": ""}
+        with mock.patch("capsplus.settings_logic.probe_endpoint", return_value=fake):
+            page.on_test(Gtk.Button())
+            self.pump(3.0, until=lambda: "42 ms" in self.result_text())
+        self.assertIn("42 ms", self.result_text())
+        self.assertIn("能出字", self.result_text())
+
+    def test_test_connection_failure_carries_a_next_step(self):
+        page = self.page()
+        fake = {"ok": False, "ms": 7, "summary": "连不上", "hint": "起服务：systemctl --user …"}
+        with mock.patch("capsplus.settings_logic.probe_endpoint", return_value=fake):
+            page.on_test(Gtk.Button())
+            self.pump(3.0, until=lambda: "下一步" in self.result_text())
+        self.assertIn("下一步", self.result_text())
+        self.assertIn("systemctl --user", self.result_text())
 
 
 if __name__ == "__main__":

@@ -22,6 +22,8 @@ sys.path.insert(0, str(REPO))
 
 from capsplus import apply as cap_apply                      # noqa: E402
 from capsplus import mapping_data as MD                      # noqa: E402
+from capsplus import services as SV                          # noqa: E402
+from capsplus import settings_logic as SL                    # noqa: E402
 from capsplus.mapping_overrides import Overrides, merge_overrides, render_overrides  # noqa: E402
 from capsplus.render import render                           # noqa: E402
 from capsplus.settings_logic import (                        # noqa: E402
@@ -313,6 +315,273 @@ class TestSnapshot(unittest.TestCase):
         self.assertEqual(len([n for n in left if n.startswith("2026")]), 2, left)
         moved = sorted(p.name for p in grave.iterdir())
         self.assertIn("20260101-000000-000000", moved)
+
+
+# ---------------------------------------------------------------------------
+# 服务页（2026-10-21）：表单值 ↔ 配置、校验、脱敏、连通性探测
+#
+# 这一层**刻意不 import gi**（判据要能离线跑），所以"界面输出里没有明文 key"
+# 这条也能在这里判死 —— 不用起窗口。
+# ---------------------------------------------------------------------------
+class TestServiceForm(unittest.TestCase):
+    """表单值 ↔ 配置的往返与校验。"""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.dir = Path(self._tmp.name)
+        self.path = self.dir / "services.toml"
+        self.svc = SV.default_services()
+        self.svc.path = self.path
+        # 给"翻译/cloud"配一把假凭据：后面判"界面输出里不许有它"
+        self.secret = "sk-TEST-do-not-leak"
+        self.svc.capability("translate").endpoints["cloud"].api_key = self.secret
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    # ── 往返 ────────────────────────────────────────────────────────────
+    def test_form_values_round_trip_unchanged(self):
+        """表单值 ↔ 配置：读出来再写回去，**逐字相同**（界面不许自己改用户的值）。"""
+        cap = self.svc.capability("translate")
+        index = 0
+        values = SL.endpoint_form_values(cap.ordered_endpoints()[index])
+        new_svc, problem = SL.set_endpoint(self.svc, "translate", index, values)
+        self.assertEqual(problem, "")
+        self.assertIsNotNone(new_svc)
+        before = cap.ordered_endpoints()[index]
+        after = new_svc.capability("translate").endpoints[before.name]
+        for field in ("name", "kind", "style", "base_url", "model", "api_key_env",
+                      "credentials_file", "credentials_key", "env_file", "env_key"):
+            self.assertEqual(getattr(after, field), getattr(before, field), field)
+        self.assertEqual(after.timeout_s, before.timeout_s)
+
+    def test_set_endpoint_does_not_touch_the_original(self):
+        """改一份配置不许就地改另一份（界面取消时不必回滚）。"""
+        before = self.svc.capability("translate").endpoints["local"].base_url
+        values = SL.endpoint_form_values(self.svc.capability("translate").endpoints["local"])
+        values["base_url"] = "http://changed/v1"
+        new_svc, problem = SL.set_endpoint(self.svc, "translate", 0, values)
+        self.assertEqual(problem, "")
+        self.assertEqual(self.svc.capability("translate").endpoints["local"].base_url, before)
+        self.assertEqual(new_svc.capability("translate").endpoints["local"].base_url,
+                         "http://changed/v1")
+
+    def test_rename_keeps_the_plain_key(self):
+        """**改名时明文 key 必须跟着搬过去** —— 按位置找旧端点，不按名字。
+
+        界面上看不见 key，所以"悄悄丢了"就等于静默删凭据（用户下次翻译就 401）。
+        """
+        values = SL.endpoint_form_values(self.svc.capability("translate").endpoints["cloud"])
+        values["name"] = "cloud2"
+        new_svc, problem = SL.set_endpoint(self.svc, "translate", 1, values)
+        self.assertEqual(problem, "")
+        moved = new_svc.capability("translate").endpoints["cloud2"]
+        self.assertEqual(moved.api_key, self.secret, "改名把明文 key 弄丢了")
+
+    def test_blank_key_field_keeps_the_stored_key(self):
+        """编辑条里那个输入框是空的（界面上看不见 key）—— 留空 = 保持原样，不许抹掉。"""
+        values = SL.endpoint_form_values(self.svc.capability("translate").endpoints["cloud"])
+        values["api_key"] = ""
+        new_svc, _problem = SL.set_endpoint(self.svc, "translate", 1, values)
+        self.assertEqual(new_svc.capability("translate").endpoints["cloud"].api_key, self.secret)
+
+    def test_clear_key_really_removes_it(self):
+        values = SL.endpoint_form_values(self.svc.capability("translate").endpoints["cloud"])
+        values["clear_key"] = True
+        new_svc, _problem = SL.set_endpoint(self.svc, "translate", 1, values)
+        self.assertEqual(new_svc.capability("translate").endpoints["cloud"].api_key, "")
+
+    # ── 校验 ────────────────────────────────────────────────────────────
+    def test_empty_base_url_is_refused(self):
+        values = SL.endpoint_form_values(self.svc.capability("translate").endpoints["local"])
+        values["base_url"] = ""
+        problems = SL.endpoint_problems(values)
+        self.assertTrue(any("地址不能为空" in p for p in problems), problems)
+
+    def test_bad_base_url_is_refused(self):
+        values = SL.endpoint_form_values(self.svc.capability("translate").endpoints["local"])
+        values["base_url"] = "127.0.0.1:12087"
+        problems = SL.endpoint_problems(values)
+        self.assertTrue(any("http://" in p for p in problems), problems)
+
+    def test_incomplete_credential_source_is_refused(self):
+        """凭据来源只填一半 = 读不出值（还容易被误当成"没配"）。"""
+        values = SL.endpoint_form_values(self.svc.capability("translate").endpoints["local"])
+        values["credentials_file"] = "~/.dsh/.credentials.yaml"
+        problems = SL.endpoint_problems(values)
+        self.assertTrue(any("键名" in p for p in problems), problems)
+        values = SL.endpoint_form_values(self.svc.capability("translate").endpoints["local"])
+        values["env_file"] = "~/.dsh/.env"
+        problems = SL.endpoint_problems(values)
+        self.assertTrue(any("键名" in p for p in problems), problems)
+
+    def test_duplicate_name_is_refused(self):
+        values = SL.endpoint_form_values(self.svc.capability("translate").endpoints["local"])
+        problems = SL.endpoint_problems(values, ["local", "cloud"])
+        self.assertTrue(any("重复" in p for p in problems), problems)
+
+    def test_bad_kind_or_style_is_refused(self):
+        values = SL.endpoint_form_values(self.svc.capability("translate").endpoints["local"])
+        values["kind"] = "半本机"
+        values["style"] = "smoke-signals"
+        problems = SL.endpoint_problems(values)
+        self.assertTrue(any("local" in p for p in problems), problems)
+        self.assertTrue(any("openai" in p for p in problems), problems)
+
+    def test_script_style_may_have_a_path_instead_of_a_url(self):
+        """script 型的地址是脚本名（本地 OCR 就是 `shot_ocr_local.py`），不许逼它写 http。"""
+        values = SL.endpoint_form_values(self.svc.capability("ocr").endpoints["local"])
+        values["base_url"] = "shot_ocr_local.py"
+        self.assertEqual(SL.endpoint_problems(values), [])
+
+    def test_mode_must_be_auto_or_an_existing_endpoint(self):
+        _new, problem = SL.set_capability_mode(self.svc, "translate", "nosuch")
+        self.assertTrue(problem)
+        _new, problem = SL.set_capability_mode(self.svc, "translate", "auto")
+        self.assertEqual(problem, "")
+
+    def test_translate_needs_a_target_language(self):
+        values = SL.capability_form_values(self.svc.capability("translate"))
+        values["target"] = ""
+        problems = SL.capability_problems(values)
+        self.assertTrue(any("目标语言" in p for p in problems), problems)
+
+    def test_delete_endpoint_falls_back_to_auto(self):
+        """删掉的正好是被指定的那个端点 → 用法退回 auto（不许指着一个不存在的端点）。"""
+        svc, _p = SL.set_capability_mode(self.svc, "translate", "cloud")
+        new_svc, problem = SL.delete_endpoint(svc, "translate", "cloud")
+        self.assertEqual(problem, "")
+        self.assertEqual(new_svc.capability("translate").mode, "auto")
+
+    def test_add_endpoint_gets_a_free_name(self):
+        new_svc, problem = SL.add_endpoint(self.svc, "translate")
+        self.assertEqual(problem, "")
+        names = [ep.name for ep in new_svc.capability("translate").ordered_endpoints()]
+        self.assertEqual(len(names), len(set(names)), f"重名了：{names}")
+
+    def test_broken_config_is_never_written(self):
+        """有毛病就**一个字都不写**（文件不许被写坏）。"""
+        broken = SL.copy_services(self.svc)
+        broken.capability("translate").endpoints["local"].base_url = ""
+        ok, text = SL.save_services_form(broken, self.path)
+        self.assertFalse(ok)
+        self.assertIn("没有写盘", text)
+        self.assertFalse(self.path.exists(), "有毛病还写盘 = 判据失败")
+
+    def test_good_config_is_written_and_read_back(self):
+        ok, text = SL.save_services_form(self.svc, self.path)
+        self.assertTrue(ok, text)
+        self.assertTrue(self.path.exists())
+        back = SV.load_services(self.path)
+        self.assertEqual(back.error, "")
+
+    # ── 脱敏：界面输出里不许有明文 key ──────────────────────────────────
+    def test_form_values_never_contain_the_plain_key(self):
+        """**表单值里根本没有明文 key 这一项**（界面回填时拿不到它）。"""
+        values = SL.endpoint_form_values(self.svc.capability("translate").endpoints["cloud"])
+        self.assertNotIn(self.secret, repr(values))
+        self.assertNotIn("api_key", values)
+        self.assertTrue(values["has_plain_key"])
+        self.assertIn("已配置", values["key_state"])
+
+    def test_credential_state_never_contains_the_value(self):
+        state = SL.credential_state(self.svc.capability("translate").endpoints["cloud"])
+        self.assertNotIn(self.secret, state)
+        self.assertIn("已配置", state)
+
+    def test_summary_never_contains_the_value(self):
+        text = SV.format_describe(self.svc)
+        self.assertNotIn(self.secret, text)
+
+    def test_short_credential_source_is_short_and_says_nothing_secret(self):
+        """表格那一列用**短版**（长句塞进列里只会被截断 —— 截断了等于没显示）。"""
+        ep = self.svc.capability("translate").endpoints["cloud"]
+        short = SL.credential_source_short(ep)
+        self.assertEqual(short, "凭据文件")
+        self.assertNotIn(self.secret, short)
+        self.assertLess(len(short), 12, f"短版还是太长，列里放不下：{short}")
+        # 长版（编辑条下方的状态行）才带路径
+        long_text = SL.credential_state(ep)
+        self.assertIn("凭据文件", long_text)
+        self.assertNotIn(self.secret, long_text)
+
+    # ── 连通性探测 ──────────────────────────────────────────────────────
+    def test_probe_openai_reports_text_and_elapsed(self):
+        def get(url, timeout):
+            return 200, b'{"data": [{"id": "m1"}]}'
+
+        def post(url, body, headers, timeout):
+            return 200, b'{"choices": [{"message": {"content": "\u4f60\u597d"}}]}'
+
+        ep = SV.Endpoint(name="e", kind="remote", style="openai",
+                         base_url="http://x/v1", model="m1")
+        result = SL.probe_endpoint(ep, get=get, post=post)
+        self.assertTrue(result["ok"], result)
+        self.assertIn("能出字", result["summary"])
+        self.assertGreaterEqual(result["ms"], 0)
+
+    def test_probe_openai_treats_empty_content_as_failure(self):
+        """**答了 200 但 content 空 = 不许报"通了"**（推理模型的坑，2026-10-20 真机）。"""
+        def get(url, timeout):
+            return 200, b'{"data": []}'
+
+        def post(url, body, headers, timeout):
+            return 200, b'{"choices": [{"message": {"content": ""}}]}'
+
+        ep = SV.Endpoint(name="e", kind="remote", style="openai", base_url="http://x/v1")
+        result = SL.probe_endpoint(ep, get=get, post=post)
+        self.assertFalse(result["ok"], result)
+        self.assertIn("没出字", result["summary"])
+        self.assertTrue(result["hint"], "失败了必须给下一步动作")
+
+    def test_probe_openai_treats_a_foreign_shape_as_failure(self):
+        """答的不是 OpenAI 形状（百度那类 REST 地址对任何路径都回 200）→ 不许报通了。"""
+        def get(url, timeout):
+            return 200, b'{"error_code": 123}'
+
+        def post(url, body, headers, timeout):
+            return 200, b'{"error_code": 123}'
+
+        ep = SV.Endpoint(name="e", kind="remote", style="openai", base_url="http://x/v1")
+        result = SL.probe_endpoint(ep, get=get, post=post)
+        self.assertFalse(result["ok"], result)
+
+    def test_probe_never_prints_the_credential(self):
+        """服务端把 key 回显出来时，摘要里也不许有它。"""
+        secret = "sk-TEST-echo"
+
+        def get(url, timeout):
+            return 200, b'{"data": []}'
+
+        def post(url, body, headers, timeout):
+            return 200, ('{"choices": [{"message": {"content": "%s"}}]}' % secret).encode()
+
+        ep = SV.Endpoint(name="e", kind="remote", style="openai",
+                         base_url="http://x/v1", api_key=secret)
+        result = SL.probe_endpoint(ep, get=get, post=post)
+        self.assertNotIn(secret, result["summary"], f"摘要里漏出了凭据：{result}")
+        self.assertNotIn(secret, result["hint"])
+
+    def test_probe_http_uses_health(self):
+        def get(url, timeout):
+            self.assertTrue(url.endswith("/health"), url)
+            return 200, b'{"ok": true, "model_loaded": true}'
+
+        ep = SV.Endpoint(name="e", kind="local", style="http",
+                         base_url="http://127.0.0.1:18090")
+        result = SL.probe_endpoint(ep, get=get)
+        self.assertTrue(result["ok"], result)
+        self.assertIn("model_loaded", result["summary"])
+
+    def test_probe_http_failure_carries_a_next_step(self):
+        def get(url, timeout):
+            return 404, b""
+
+        ep = SV.Endpoint(name="e", kind="local", style="http", base_url="http://127.0.0.1:18090")
+        result = SL.probe_endpoint(ep, get=get)
+        self.assertFalse(result["ok"])
+        self.assertIn("404", result["summary"])
+        self.assertTrue(result["hint"])
 
 
 if __name__ == "__main__":

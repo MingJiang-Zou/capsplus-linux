@@ -4,7 +4,7 @@
 #   上游 https://github.com/wo52616111/capslock-plus （GPL-2.0，© wo52616111）；改动见 README「许可与上游」。
 """capsplus 总入口：装 / 起 / 停 / 查 / 修 / 开，全部收在这**一条命令**里。
 
-为什么要有它（2026-10-20，明江原话：「不要这里开一个东西那边开一个东西，还没有统一的管理与启动器」）：
+为什么要有它（2026-10-20，用户原话：「不要这里开一个东西那边开一个东西，还没有统一的管理与启动器」）：
 项目原先的入口是散的 —— `install.sh` 装 bin 与桌面入口、`tools/install-extension.sh` 装 GNOME 扩展、
 `capsplus apply` 写 keyd 配置、托盘走 autostart、两个 systemd unit 靠人手 sed 渲染再 enable。
 每一样单独看都对，合起来就是"半残状态随处可见，出问题不知道去哪看"。
@@ -67,6 +67,9 @@ USAGE = """\
   apply [--dry-run]         写 /etc/keyd 并 reload（有备份、出错回滚）
   ext sync|verify|status|bench
                             扩展：同步副本 / 只校验 / 进状态页 / 隔离会话自检（不用重登）
+  services [test [translate|ocr|asr]|path]
+                            服务配置（翻译 / OCR / 语音识别各连哪台机器）：
+                            脱敏摘要 / 连通性测试 / 配置文件路径
   voice <toggle|start|stop|status|meter>
   shot  <--region|--capture|--annotate|--pin ...>
   qbar | settings | tray    打开对应组件
@@ -534,6 +537,70 @@ def extension_cmd(argv: list[str]) -> int:
     return 2
 
 
+def services_cmd(argv: list[str]) -> int:
+    """`capsplus services` —— 翻译 / OCR / 语音识别 的服务配置。
+
+    三个子动作：
+      · 不带参数 → 打印**脱敏**摘要（凭据只说"来自哪"，绝不打印值）；
+      · `test [能力]` → 真跑一次连通性测试（报耗时与一行摘要，不报凭据）；
+      · `path` → 打印配置文件路径。
+
+    为什么摘要与测试都走 `capsplus/services.py` + `capsplus/settings_logic.py`：
+    设置窗的「服务」页吃的是同一份 —— 命令行与窗口看到的必须是同一份真相。
+    """
+    from . import services as SV
+    from . import settings_logic as SL
+
+    sub = argv[0] if argv else ""
+    if sub == "path":
+        print(str(SV.SERVICES_PATH))
+        return 0
+    if sub not in ("", "show", "list", "test"):
+        print("用法: capsplus services [test [translate|ocr|asr]|path]", file=sys.stderr)
+        return 2
+    svc = SV.load_services(SV.SERVICES_PATH)
+    if sub != "test":
+        print(SV.format_describe(svc))
+        if svc.error:
+            print()
+            print(f"下一步：{svc.error}"
+                  "（改法：管理器窗口的「服务」页，或直接编辑这个文件）")
+        return 0
+
+    wanted = argv[1] if len(argv) > 1 else ""
+    if wanted and wanted not in SV.CAPABILITIES:
+        print(f"不认识的能力：{wanted}（只能测 {' / '.join(SV.CAPABILITIES)}）", file=sys.stderr)
+        return 2
+    targets = [wanted] if wanted else list(SV.CAPABILITIES)
+    failed = []
+    for name in targets:
+        cap = svc.get(name)
+        label = SV.CAPABILITY_LABELS.get(name, name)
+        if cap is None or not cap.endpoints:
+            print(f"[{label}] 这一栏一个端点都没有")
+            failed.append(name)
+            continue
+        print(f"[{label}] 模式 {cap.mode}")
+        any_ok = False
+        for ep in cap.ordered_endpoints():
+            result = SL.probe_endpoint(ep)
+            mark = "✓" if result["ok"] else "✗"
+            print(f"  {mark} {ep.name}（{ep.kind}/{ep.style}） "
+                  f"{ep.base_url or '（没填地址）'} — {result['ms']} ms — {result['summary']}")
+            if result["hint"]:
+                print(f"      下一步：{result['hint']}")
+            any_ok = any_ok or result["ok"]
+        if not any_ok:
+            failed.append(name)
+    print()
+    if failed:
+        print(f"✗ 这些能力一个端点都没通：{'、'.join(failed)}")
+        print(f"下一步：管理器窗口的「服务」页改端点，或直接编辑 {SV.SERVICES_PATH}")
+        return 1
+    print("✓ 每个被测能力至少有一个端点通了")
+    return 0
+
+
 def logs_cmd(argv: list[str]) -> int:
     lines = "60"
     follow = False
@@ -611,6 +678,8 @@ def main(argv: list[str] | None = None) -> int:
         return apply_main(argv)
     if cmd == "ext":
         return extension_cmd(rest)
+    if cmd in ("services", "svc"):
+        return services_cmd(rest)
     if cmd == "voice":
         return launch("capsplus-voice", rest, wait=True)
     if cmd == "shot":

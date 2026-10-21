@@ -3,7 +3,7 @@
 # Copyright (c) 2026 capsplus-linux contributors
 # 本文件属 capsplus-linux —— CapsLock+ v3.3.0 的 Linux 移植（衍生作品）；按键映射数据译自上游：
 #   上游 https://github.com/wo52616111/capslock-plus （GPL-2.0，© wo52616111）；改动见 README「许可与上游」。
-"""capsplus-settings —— CapsPlus 管理器（GTK3，中文，四页）。
+"""capsplus-settings —— CapsPlus 管理器（GTK3，中文，五页）。
 
     ⓪ 状态       **本工具的总入口**：keyd / 扩展 / 语音 / 截图 / 用户侧栈一页看全，
                  每条红项配一个按钮（同步扩展、应用键位、重启托盘、一键修复）。
@@ -15,6 +15,9 @@
     ③ 按键映射   只读生效表（层/键/动作/说明/来源）+ 表格下方的**编辑条**，
                  改动写覆盖层 `mappings.toml`，「应用」走 render_with_overrides() + 现有
                  apply 流程（出错自动回滚）
+    ④ 服务       翻译 / OCR / 语音识别 各自"用哪台机器上的哪个服务"（2026-10-21 加）。
+                 数据来自 `capsplus/services.py`，**这里不另算一份**；凭据只显示
+                 "已配置（来自 X）"，**界面上任何地方都不出现明文 key**。
 
 **表格一律只读**（2026-10-15 治本方案 A，用户实测截图定案）：Wayland/GTK3 下 TreeView 的
 cell editor 是独立 surface、**不跟随表格滚动** —— 表格滚了、编辑框的像素坐标不动，于是编辑框
@@ -60,6 +63,7 @@ gi.require_version("Gtk", "3.0")
 from gi.repository import GLib, Gtk, Pango  # noqa: E402
 
 from capsplus import mapping_overrides as MO  # noqa: E402
+from capsplus import services as SV  # noqa: E402
 from capsplus import settings_logic as SL  # noqa: E402
 from capsplus.render import binding_rows, render  # noqa: E402
 from qbar import search_config as SC  # noqa: E402
@@ -217,13 +221,15 @@ class StatusPage(Gtk.Box):
 # ===========================================================================
 class SettingsWindow(Gtk.Window):
     def __init__(self, qbar_path: Path | None = None, overrides_path: Path | None = None,
-                 state_dir: Path | None = None):
+                 state_dir: Path | None = None, services_path: Path | None = None):
         super().__init__(title="CapsPlus 管理器")
         self.set_default_size(960, 680)
 
         self.qbar_path = Path(qbar_path) if qbar_path else SC.CONFIG_PATH
         self.overrides_path = Path(overrides_path) if overrides_path else MO.OVERRIDES_PATH
         self.state_dir = Path(state_dir) if state_dir else STATE_DIR
+        # 服务配置（翻译 / OCR / 识别各连哪台机器）—— 2026-10-21 加的第五页
+        self.services_path = Path(services_path) if services_path else SV.SERVICES_PATH
         self.backup_dir = self.state_dir / "config-backup"
         # keyd 的键名表；取不到 = None = 不校验键名（没装 keyd 的机器也要能开界面）
         self.known_keys = MO.load_known_keys()
@@ -247,8 +253,10 @@ class SettingsWindow(Gtk.Window):
         self.links_page = LinksPage(self)
         self.general_page = GeneralPage(self)
         self.mapping_page = MappingPage(self)
+        self.services_page = ServicesPage(self)
         for title, page in (("状态", self.status_page), ("快速链接", self.links_page),
-                            ("通用", self.general_page), ("按键映射", self.mapping_page)):
+                            ("通用", self.general_page), ("按键映射", self.mapping_page),
+                            ("服务", self.services_page)):
             self.notebook.append_page(page, Gtk.Label(label=title))
         # 打开就落在「状态」：它是总入口 —— 谁点开这个窗口，十有八九是某个键没反应。
         self.notebook.set_current_page(0)
@@ -262,12 +270,16 @@ class SettingsWindow(Gtk.Window):
             self.status(f"覆盖层现有 {self.ov.count} 条改动（{self.ov.path}）。", GREY)
         else:
             self.status(f"配置：{self.qbar_path} ／ 覆盖层：{self.overrides_path}", GREY)
+        if self.services_page.services.error:
+            self.status(f"服务配置读不了，已按内置默认处理：{self.services_page.services.error}"
+                        "（下一步：改完点「保存服务配置」会写出一份好的；原件会先备份到 "
+                        f"{self.backup_dir}）", RED)
 
         self.connect("delete-event", self._on_delete)
 
     # ------------------------------------------------------------------
     def status(self, text: str, color: str = GREY) -> None:
-        """四页共用一条状态栏：红=拦住了、黄=提醒、灰=说明、蓝=写成了。"""
+        """五页共用一条状态栏：红=拦住了、黄=提醒、灰=说明、蓝=写成了。"""
         self.statusbar.set_markup(markup(text or "", color))
         self.statusbar.set_tooltip_text(text or "")
 
@@ -291,6 +303,7 @@ class SettingsWindow(Gtk.Window):
         self.links_page.reload_from_memory()
         self.general_page.reload_from_memory()
         self.mapping_page.reload_from_memory()
+        self.services_page.reload_from_memory()
 
     # ------------------------------------------------------------------
     # qbar.toml：第①②页共用这两个口子（别各写一份）
@@ -1094,6 +1107,534 @@ class MappingPage(Gtk.Box):
 
 
 # ===========================================================================
+# 第④页：服务（翻译 / OCR / 语音识别 的"服务在哪"可配置）
+#
+#   数据**不是这里另算的**：配置读写走 `capsplus/services.py`，
+#   校验与表单往返走 `capsplus/settings_logic.py`（不 import gi，有单测），
+#   这一节只负责摆控件 —— 与其它三页同一条规矩。
+#
+#   **凭据纪律**（这一页最容易出事的地方）：
+#     · 表格里那列写的是「已配置（来自 环境变量 XXX）」，**永远不是 key 的值**；
+#     · 明文 key 的输入框默认**不显示**（`visibility=False`），而且**永远是空的**
+#       —— 留空 = 保持原样，填了 = 换掉，勾「清掉明文 key」= 真的删掉；
+#     · 端点改名时旧端点的明文 key 必须**跟着搬过去**（按位置找旧端点，
+#       不按名字 —— 按名字就找不到它，key 被悄悄丢掉 = 静默删凭据）。
+# ===========================================================================
+class ServiceBlock(Gtk.Box):
+    """一栏能力（翻译 / OCR 识别 / 语音识别）：用法下拉 + 语言输入 + **只读**端点表。
+
+    表格只读这条老规矩照样适用（见文件头）：编辑走页面下方那条**共用**的编辑条，
+    所以三个能力共用一套编辑控件，也就不会出现"三份表单各写错一处"。
+    """
+
+    COLUMNS = ("名字", "本机/远程", "类型", "地址", "模型", "凭据来源", "超时")
+
+    def __init__(self, page: "ServicesPage", capability: str):
+        super().__init__(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        self.page = page
+        self.capability = capability
+        self._loading = False
+        self._modes: list[str] = []
+
+        top = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        top.pack_start(Gtk.Label(label="用法：", xalign=0), False, False, 0)
+        self.mode_combo = Gtk.ComboBoxText()
+        # ComboBoxText 没有 set_width_chars（那是 Entry 的）—— 用尺寸请求代替
+        self.mode_combo.set_size_request(200, -1)
+        self.mode_combo.connect("changed", lambda *_a: self._on_mode_changed())
+        top.pack_start(self.mode_combo, False, False, 0)
+        self.lang_label = Gtk.Label(xalign=0)
+        top.pack_start(self.lang_label, False, False, 0)
+        self.lang_entry = Gtk.Entry()
+        self.lang_entry.set_width_chars(10)
+        top.pack_start(self.lang_entry, False, False, 0)
+        top.pack_end(Gtk.Box(), True, True, 0)
+        self.pack_start(top, False, False, 0)
+
+        # 端点表：只读（判据见 tests/test_table_readonly.py）
+        self.store = Gtk.ListStore(str, str, str, str, str, str, str)
+        self.view = Gtk.TreeView(model=self.store)
+        self.view.set_headers_visible(True)
+        # 每列的最小宽度：别把「凭据来源」那一列挤没了 ——
+        # 那一列写的是「已配置（来自 凭据文件 … 的 KEY）」，被截断就等于没显示。
+        widths = (90, 90, 100, 220, 130, 260, 70)
+        for index, title in enumerate(self.COLUMNS):
+            renderer = Gtk.CellRendererText()
+            renderer.set_property("editable", False)    # 只读
+            column = Gtk.TreeViewColumn(title, renderer, text=index)
+            column.set_resizable(True)
+            column.set_min_width(widths[index])
+            column.set_expand(index in (3, 5))      # 地址与凭据来源各占一份富余
+            self.view.append_column(column)
+        self.view.get_selection().connect("changed", self._on_selection_changed)
+
+        scroll = Gtk.ScrolledWindow()
+        scroll.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
+        scroll.set_min_content_height(140)
+        scroll.add(self.view)
+        self.pack_start(scroll, True, True, 0)
+
+    # ------------------------------------------------------------------
+    def reload_from_memory(self) -> None:
+        """按内存里的配置重画这一栏（表格 + 用法下拉 + 语言框）。"""
+        cap = self.page.capability(self.capability)
+        self._loading = True
+        self.store.clear()
+        if cap is None:
+            self.mode_combo.remove_all()
+            self._modes = []
+            self.lang_label.set_text("")
+            self.lang_entry.set_text("")
+            self._loading = False
+            return
+        for ep in cap.ordered_endpoints():
+            self.store.append([
+                ep.name,
+                SL.KIND_LABELS.get(ep.kind, ep.kind),
+                SL.STYLE_LABELS.get(ep.style, ep.style),
+                ep.base_url or "（没填地址）",
+                ep.model or "—",
+                SL.credential_source_short(ep),    # ← 只有"来自哪"，没有值（短版，列才放得下）
+                f"{ep.timeout_s:g} 秒" if ep.timeout_s else "—",
+            ])
+        self._rebuild_mode(cap)
+        if self.capability == "translate":
+            self.lang_label.set_text("目标语言：")
+            self.lang_entry.set_text(cap.target)
+        elif self.capability == "asr":
+            self.lang_label.set_text("识别语言：")
+            self.lang_entry.set_text(cap.lang)
+        else:
+            self.lang_label.set_text("")
+            self.lang_entry.set_text("")
+        self._loading = False
+
+    def _rebuild_mode(self, cap) -> None:
+        """用法下拉 = auto + 每个端点（**顺序 = auto 的优先级**）。"""
+        self.mode_combo.remove_all()
+        self._modes = []
+        self.mode_combo.append_text("auto（按顺序挨个试）")
+        self._modes.append(SV.MODE_AUTO)
+        for ep in cap.ordered_endpoints():
+            self.mode_combo.append_text(ep.name)
+            self._modes.append(ep.name)
+        active = self._modes.index(cap.mode) if cap.mode in self._modes else 0
+        self.mode_combo.set_active(active)
+
+    def mode_value(self) -> str:
+        index = self.mode_combo.get_active()
+        return self._modes[index] if 0 <= index < len(self._modes) else SV.MODE_AUTO
+
+    def lang_value(self) -> str:
+        return self.lang_entry.get_text().strip()
+
+    def _on_mode_changed(self) -> None:
+        """换用法只改内存态（不写盘）：写盘只有一个入口 ——「保存服务配置」。"""
+        if self._loading:
+            return
+        self.page.set_mode(self.capability, self.mode_value())
+
+    def _on_selection_changed(self, *_args) -> None:
+        model, it = self.view.get_selection().get_selected()
+        if it is None:
+            return
+        index = model.get_path(it).get_indices()[0]
+        self.page.select_endpoint(self.capability, index)
+
+    def select_row(self, index: int) -> None:
+        if 0 <= index < len(self.store):
+            self.view.get_selection().select_path(Gtk.TreePath.new_from_indices([index]))
+
+
+class ServicesPage(Gtk.Box):
+    """第五页：翻译 / OCR / 语音识别 各自用哪台机器上的哪个服务。
+
+    结构（从上到下）：
+      · 三个子标签（翻译 / OCR 识别 / 语音识别），每个一栏：用法下拉 + 语言 + 只读端点表；
+      · **一条共用的端点编辑条**（表格只读的老规矩：编辑控件不许进表格）；
+      · `保存服务配置` `重读文件` `测试连接` + 一个结果框（耗时 + 一行摘要）。
+    """
+
+    def __init__(self, app):
+        super().__init__(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        self.app = app
+        self.set_border_width(10)
+        self.services = SV.load_services(app.services_path)
+        self.selected: tuple[str, int] | None = None      # (能力名, 端点下标)
+        self._loading = False
+
+        hint = Gtk.Label(xalign=0)
+        hint.set_line_wrap(True)
+        # ⚠ `markup()` 只转义 + 上色，**不会**把 `**…**` 变粗（pango 不认 markdown）——
+        # 要加粗就用 `bold()`，别在 markup 里写星号（页面上会露出星号）。
+        hint.set_markup(markup(
+            "这一页配的是「翻译 / OCR / 语音识别 各自连哪台机器上的哪个服务」。"
+            f"配置文件：{app.services_path}（改完不用重启，各链路每次调用都会重读）。", GREY)
+            + bold("凭据只写来源不写值")
+            + markup("：环境变量名 / 凭据文件+键 / env 文件+键；"
+                     "实在要写明文就用编辑条里那个输入框 —— 它默认不显示，"
+                     "而且界面上任何地方都不会把已保存的 key 显示出来。", GREY))
+        self.pack_start(hint, False, False, 0)
+
+        self.sub = Gtk.Notebook()
+        self.blocks: dict[str, ServiceBlock] = {}
+        for name in SV.CAPABILITIES:
+            block = ServiceBlock(self, name)
+            self.blocks[name] = block
+            self.sub.append_page(block, Gtk.Label(label=SV.CAPABILITY_LABELS.get(name, name)))
+        self.sub.connect("switch-page", self._on_switch_page)
+        self.pack_start(self.sub, True, True, 0)
+
+        # ── 端点编辑条（三个能力共用一条）────────────────────────────────
+        editor = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+        self.editor_target = Gtk.Label(xalign=0)
+        self.editor_target.set_selectable(True)
+        self.editor_target.set_markup(markup("（先在上面的表里点一个端点，或点「新增端点」）", GREY))
+        editor.pack_start(self.editor_target, False, False, 0)
+
+        grid = Gtk.Grid(row_spacing=6, column_spacing=10)
+        self.e_name = Gtk.Entry()
+        self.e_name.set_width_chars(14)
+        self.e_kind = Gtk.ComboBoxText()
+        for kind in SL.SERVICE_KINDS:
+            self.e_kind.append_text(f"{SL.KIND_LABELS[kind]}（{kind}）")
+        self.e_style = Gtk.ComboBoxText()
+        for style in SL.SERVICE_STYLES:
+            self.e_style.append_text(f"{SL.STYLE_LABELS[style]}（{style}）")
+        self.e_url = Gtk.Entry()
+        self.e_url.set_width_chars(40)
+        self.e_model = Gtk.Entry()
+        self.e_model.set_width_chars(18)
+        self.e_timeout = Gtk.Entry()
+        self.e_timeout.set_width_chars(7)
+        self.e_key_env = Gtk.Entry()
+        self.e_key_env.set_width_chars(20)
+        self.e_cred_file = Gtk.Entry()
+        self.e_cred_file.set_width_chars(24)
+        self.e_cred_key = Gtk.Entry()
+        self.e_cred_key.set_width_chars(22)
+        self.e_env_file = Gtk.Entry()
+        self.e_env_file.set_width_chars(24)
+        self.e_env_key = Gtk.Entry()
+        self.e_env_key.set_width_chars(18)
+        self.e_plain = Gtk.Entry()
+        self.e_plain.set_width_chars(20)
+        # 明文 key 的输入框默认**不显示**：它是"只写不读"的，肩并肩看着更安全
+        self.e_plain.set_visibility(False)
+        self.e_clear = Gtk.CheckButton(label="清掉明文 key")
+        self.key_state = Gtk.Label(xalign=0)
+        self.key_state.set_markup(markup("凭据：—", GREY))
+
+        for row, fields in enumerate((
+                (("名字", self.e_name), ("本机/远程", self.e_kind), ("类型", self.e_style),
+                 ("地址", self.e_url)),
+                (("模型", self.e_model), ("超时(秒)", self.e_timeout),
+                 ("环境变量名", self.e_key_env)),
+                (("凭据文件", self.e_cred_file), ("文件里的键", self.e_cred_key),
+                 ("env 文件", self.e_env_file), ("env 里的键", self.e_env_key)),
+                (("明文 key", self.e_plain), (None, self.e_clear)))):
+            column = 0
+            for label, widget in fields:
+                if label is not None:
+                    grid.attach(Gtk.Label(label=label, xalign=0), column, row, 1, 1)
+                    column += 1
+                grid.attach(widget, column, row, 1, 1)
+                column += 1
+        # 凭据状态**单独占一行**（放同一行会跟「清掉明文 key」那个复选框重叠 —— 实测截图里撞过）
+        self.key_state.set_line_wrap(True)
+        self.key_state.set_max_width_chars(110)
+        grid.attach(self.key_state, 0, 4, 6, 1)
+        editor.pack_start(grid, False, False, 0)
+
+        row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        self.save_endpoint_button = Gtk.Button(label="保存这一条")
+        self.save_endpoint_button.get_style_context().add_class("suggested-action")
+        self.save_endpoint_button.connect("clicked", self.on_save_endpoint)
+        row.pack_start(self.save_endpoint_button, False, False, 0)
+        for label, handler in (("新增端点", self.on_add_endpoint),
+                               ("删除端点（带确认）", self.on_delete_endpoint)):
+            button = Gtk.Button(label=label)
+            button.connect("clicked", handler)
+            row.pack_start(button, False, False, 0)
+        row.pack_end(Gtk.Box(), True, True, 0)
+        editor.pack_start(row, False, False, 0)
+        self.pack_start(editor, False, False, 0)
+
+        # ── 文件级动作 + 结果框 ───────────────────────────────────────────
+        bar = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        save = Gtk.Button(label="保存服务配置")
+        save.get_style_context().add_class("suggested-action")
+        save.connect("clicked", self.on_save)
+        bar.pack_start(save, False, False, 0)
+        for label, handler in (("重读文件", self.on_reload),
+                               ("测试连接", self.on_test)):
+            button = Gtk.Button(label=label)
+            button.connect("clicked", handler)
+            bar.pack_start(button, False, False, 0)
+        bar.pack_end(Gtk.Box(), True, True, 0)
+        self.pack_start(bar, False, False, 0)
+
+        self.result_view = Gtk.TextView()
+        self.result_view.set_editable(False)
+        self.result_view.set_cursor_visible(False)
+        self.result_view.set_monospace(True)
+        self.result_view.set_wrap_mode(Gtk.WrapMode.WORD_CHAR)
+        self.result_view.set_left_margin(8)
+        self.result_view.set_top_margin(6)
+        scroll = Gtk.ScrolledWindow()
+        scroll.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
+        scroll.set_min_content_height(120)
+        scroll.add(self.result_view)
+        self.pack_start(scroll, False, False, 0)
+
+        self.reload_from_memory()
+        if self.services.error:
+            self.append_result(f"! 服务配置读不了，下面显示的是内置默认：\n  {self.services.error}")
+
+    # ------------------------------------------------------------------
+    # 内存态
+    # ------------------------------------------------------------------
+    def capability(self, name: str):
+        return self.services.get(name)
+
+    def current_capability(self) -> str:
+        """当前子标签对应哪个能力（给「测试连接」用）。"""
+        index = self.sub.get_current_page()
+        if 0 <= index < len(SV.CAPABILITIES):
+            return SV.CAPABILITIES[index]
+        return SV.CAPABILITIES[0]
+
+    def reload_from_memory(self) -> None:
+        """按内存态重画三个表 + 编辑条（不动文件）。"""
+        for block in self.blocks.values():
+            block.reload_from_memory()
+        if self.selected:
+            capability, index = self.selected
+            cap = self.capability(capability)
+            if cap is not None and 0 <= index < len(cap.ordered_endpoints()):
+                self.select_endpoint(capability, index)
+                return
+        self.clear_editor()
+
+    def clear_editor(self) -> None:
+        self.selected = None
+        self._loading = True
+        for widget in (self.e_name, self.e_url, self.e_model, self.e_timeout,
+                       self.e_key_env, self.e_cred_file, self.e_cred_key,
+                       self.e_env_file, self.e_env_key, self.e_plain):
+            widget.set_text("")
+        self.e_kind.set_active(0)
+        self.e_style.set_active(0)
+        self.e_clear.set_active(False)
+        self.key_state.set_markup(markup("凭据：—", GREY))
+        self.editor_target.set_markup(markup("（先在上面的表里点一个端点，或点「新增端点」）", GREY))
+        self._loading = False
+
+    # ------------------------------------------------------------------
+    # 编辑条 ↔ 选中的端点
+    # ------------------------------------------------------------------
+    def select_endpoint(self, capability: str, index: int) -> None:
+        cap = self.capability(capability)
+        if cap is None:
+            return
+        ordered = cap.ordered_endpoints()
+        if not (0 <= index < len(ordered)):
+            return
+        ep = ordered[index]
+        self.selected = (capability, index)
+        self._loading = True
+        self.e_name.set_text(ep.name)
+        self.e_kind.set_active(SL.SERVICE_KINDS.index(ep.kind)
+                               if ep.kind in SL.SERVICE_KINDS else 0)
+        self.e_style.set_active(SL.SERVICE_STYLES.index(ep.style)
+                                if ep.style in SL.SERVICE_STYLES else 0)
+        self.e_url.set_text(ep.base_url)
+        self.e_model.set_text(ep.model)
+        self.e_timeout.set_text(f"{ep.timeout_s:g}" if ep.timeout_s else "")
+        self.e_key_env.set_text(ep.api_key_env)
+        self.e_cred_file.set_text(ep.credentials_file)
+        self.e_cred_key.set_text(ep.credentials_key)
+        self.e_env_file.set_text(ep.env_file)
+        self.e_env_key.set_text(ep.env_key)
+        self.e_plain.set_text("")            # ← 明文 key 永远不进编辑条
+        self.e_clear.set_active(False)
+        self.key_state.set_markup(markup(f"凭据：{SL.credential_state(ep)}", GREY))
+        label = SV.CAPABILITY_LABELS.get(capability, capability)
+        self.editor_target.set_markup(
+            bold(f"{label} / {ep.name}") + markup("　（改的是这一条；点「保存这一条」才进内存）", GREY))
+        self._loading = False
+
+    def current_form(self) -> dict:
+        """编辑条当前的表单值（明文 key 只从输入框取，**不来自已保存的配置**）。"""
+        kind_index = self.e_kind.get_active()
+        style_index = self.e_style.get_active()
+        return {
+            "name": self.e_name.get_text().strip(),
+            "kind": SL.SERVICE_KINDS[kind_index] if 0 <= kind_index < len(SL.SERVICE_KINDS)
+                    else SL.SERVICE_KINDS[0],
+            "style": SL.SERVICE_STYLES[style_index] if 0 <= style_index < len(SL.SERVICE_STYLES)
+                     else SL.SERVICE_STYLES[0],
+            "base_url": self.e_url.get_text().strip(),
+            "model": self.e_model.get_text().strip(),
+            "api_key_env": self.e_key_env.get_text().strip(),
+            "credentials_file": self.e_cred_file.get_text().strip(),
+            "credentials_key": self.e_cred_key.get_text().strip(),
+            "env_file": self.e_env_file.get_text().strip(),
+            "env_key": self.e_env_key.get_text().strip(),
+            "timeout_s": self.e_timeout.get_text().strip(),
+            "api_key": self.e_plain.get_text(),      # 只写不读：填了才换
+            "clear_key": self.e_clear.get_active(),
+        }
+
+    # ------------------------------------------------------------------
+    # 增 / 改 / 删
+    # ------------------------------------------------------------------
+    def on_save_endpoint(self, _button) -> None:
+        """把编辑条写进内存态（**不写盘** —— 写盘只有一个入口「保存服务配置」）。"""
+        if self.selected is None:
+            self.app.status("先在上面的表里点一个端点，或点「新增端点」。", AMBER)
+            return
+        capability, index = self.selected
+        new_services, problem = SL.set_endpoint(self.services, capability, index,
+                                                self.current_form())
+        if new_services is None:
+            self.app.status(f"没改：{problem}", RED)
+            return
+        self.services = new_services
+        self.e_plain.set_text("")            # 存过的明文 key 不留在输入框里
+        self.reload_from_memory()
+        self.app.status(f"这一条已改好（还在内存里，点「保存服务配置」才写进 "
+                        f"{self.app.services_path}）。", BLUE)
+
+    def on_add_endpoint(self, _button) -> None:
+        capability = self.current_capability()
+        new_services, problem = SL.add_endpoint(self.services, capability)
+        if new_services is None:
+            self.app.status(f"没新增：{problem}", RED)
+            return
+        self.services = new_services
+        self.reload_from_memory()
+        block = self.blocks[capability]
+        block.select_row(len(block.store) - 1)
+        self.app.status(f"新增了一个端点（还没写盘）：填好名字、地址、凭据来源，"
+                        "再点「保存这一条」，最后点「保存服务配置」。", GREY)
+
+    def on_delete_endpoint(self, _button) -> None:
+        if self.selected is None:
+            self.app.status("先在上面的表里点一个端点。", AMBER)
+            return
+        capability, index = self.selected
+        cap = self.capability(capability)
+        if cap is None:
+            return
+        ordered = cap.ordered_endpoints()
+        if not (0 <= index < len(ordered)):
+            return
+        name = ordered[index].name
+        dialog = Gtk.MessageDialog(transient_for=self.app, modal=True,
+                                   buttons=Gtk.ButtonsType.YES_NO,
+                                   message_type=Gtk.MessageType.QUESTION,
+                                   text=f"删除端点「{name}」？")
+        dialog.format_secondary_text("只是从这一栏里去掉；点「保存服务配置」才会真的写文件。")
+        answer = dialog.run()
+        dialog.destroy()
+        if answer != Gtk.ResponseType.YES:
+            return
+        new_services, problem = SL.delete_endpoint(self.services, capability, name)
+        if new_services is None:
+            self.app.status(f"没删除：{problem}", RED)
+            return
+        self.services = new_services
+        self.clear_editor()
+        self.reload_from_memory()
+        self.app.status(f"已删除端点「{name}」（还没写盘，点「保存服务配置」）。", GREY)
+
+    def set_mode(self, capability: str, mode: str) -> None:
+        """改这一栏的用法（auto / 直接指定某个端点）。只改内存态。"""
+        cap = self.capability(capability)
+        if cap is None:
+            return
+        new_services, problem = SL.set_capability_mode(self.services, capability, mode)
+        if new_services is None:
+            self.app.status(f"用法没改成「{mode}」：{problem}", RED)
+            return
+        self.services = new_services
+
+    # ------------------------------------------------------------------
+    # 文件级动作
+    # ------------------------------------------------------------------
+    def on_save(self, _button) -> None:
+        """把三个栏的用法与语言收进内存态 → 校验 → 写盘（原子写 + 0600 + 回读自证）。"""
+        for name, block in self.blocks.items():
+            cap = self.capability(name)
+            if cap is None:
+                continue
+            target = block.lang_value() if name == "translate" else cap.target
+            lang = block.lang_value() if name == "asr" else cap.lang
+            new_services, problem = SL.set_capability_mode(self.services, name,
+                                                           block.mode_value(), target, lang)
+            if new_services is None:
+                self.app.status(f"没写盘：{SV.CAPABILITY_LABELS.get(name, name)} —— {problem}", RED)
+                return
+            self.services = new_services
+        # 写盘前把原件快照到 state 目录（用户手写的服务配置不许被静默覆盖）
+        saved = SL.snapshot_config(self.app.services_path, self.app.backup_dir)
+        ok, text = SL.save_services_form(self.services, self.app.services_path)
+        if not ok:
+            self.app.status(text, RED)
+            return
+        self.services = SV.load_services(self.app.services_path)
+        self.reload_from_memory()
+        hint = f"（原件存到 {saved.parent}）" if saved else ""
+        self.app.status(f"{text}{hint}；不用重启，各链路每次调用都会重读这个文件。", BLUE)
+
+    def on_reload(self, _button) -> None:
+        """从磁盘重读（丢掉没保存的改动 —— 所以要说清楚）。"""
+        self.services = SV.load_services(self.app.services_path)
+        self.clear_editor()
+        self.reload_from_memory()
+        if self.services.error:
+            self.app.status(f"服务配置读不了，已按内置默认处理：{self.services.error}"
+                            "（下一步：改完点「保存服务配置」会写出一份好的）", RED)
+        else:
+            self.app.status(f"已从 {self.app.services_path} 重读。", GREY)
+
+    # ------------------------------------------------------------------
+    # 测试连接（真跑一次往返；**报耗时与一行摘要，不报凭据**）
+    # ------------------------------------------------------------------
+    def on_test(self, _button) -> None:
+        capability = self.current_capability()
+        cap = self.capability(capability)
+        endpoints = list(cap.ordered_endpoints()) if cap is not None else []
+        if not endpoints:
+            self.app.status(f"「{SV.CAPABILITY_LABELS.get(capability, capability)}」这一栏"
+                            "一个端点都没有 —— 先点「新增端点」。", AMBER)
+            return
+        self.append_result(f"正在测「{SV.CAPABILITY_LABELS.get(capability, capability)}」"
+                           f"这一栏的 {len(endpoints)} 个端点……")
+        threading.Thread(target=self._probe, args=(endpoints,), daemon=True).start()
+
+    def _probe(self, endpoints) -> None:
+        """探测放线程里：一次往返可能好几秒，堵住主线程窗口就假死了。"""
+        lines = []
+        for ep in endpoints:
+            result = SL.probe_endpoint(ep)
+            mark = "✓" if result["ok"] else "✗"
+            lines.append(f"{mark} {ep.name} — {result['ms']} ms — {result['summary']}")
+            if result["hint"]:
+                lines.append(f"    下一步：{result['hint']}")
+        GLib.idle_add(self.append_result, "\n".join(lines))
+
+    def append_result(self, text: str) -> bool:
+        buffer = self.result_view.get_buffer()
+        buffer.insert(buffer.get_end_iter(), (text or "") + "\n")
+        return False        # 只跑一次（GLib.idle_add 的约定）
+
+    def _on_switch_page(self, *_args) -> None:
+        self.app.status(f"现在看的是「{SV.CAPABILITY_LABELS.get(self.current_capability(), '')}」"
+                        "这一栏 —— 点「测试连接」就测这一栏的端点。", GREY)
+
+# ===========================================================================
 # 单实例：Unix socket（第二次启动只把已经开着的窗口拉到前台）
 # ===========================================================================
 def try_focus_existing() -> bool:
@@ -1162,7 +1703,8 @@ def main(argv: list[str]) -> int:
         return 0
     window = SettingsWindow(qbar_path=_arg_value(argv, "--qbar"),
                             overrides_path=_arg_value(argv, "--overrides"),
-                            state_dir=_arg_value(argv, "--state-dir"))
+                            state_dir=_arg_value(argv, "--state-dir"),
+                            services_path=_arg_value(argv, "--services"))
     window.connect("destroy", lambda _w: SOCK_PATH.unlink(missing_ok=True))
     window.show_all()
     _install_signal_handlers()

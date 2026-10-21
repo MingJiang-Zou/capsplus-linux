@@ -234,7 +234,10 @@ capsplus shot --region   # 截图（等价 capsplus-shot --region）
 
 capsplus tray            # 托盘：打开 Qbar / 设置… / 编辑快速链接 / 启停映射 / 重载 / 打开映射文件 / 最近日志 / 关于
 capsplus qbar            # Qbar：第一次起窗口，已在运行则切换显示/隐藏
-capsplus settings        # 管理器窗口（GTK3，四页）：状态 / 快速链接 / 通用 / 按键映射
+capsplus settings        # 管理器窗口（GTK3，五页）：状态 / 快速链接 / 通用 / 按键映射 / 服务
+capsplus services        # 服务配置：脱敏摘要（翻译 / OCR / 语音识别各连哪台机器）
+capsplus services test   # 真跑一次连通性测试（报耗时与一行摘要，不报凭据）
+capsplus services path   # 配置文件路径（~/.config/capsplus/services.toml）
 ```
 
 旧的 `capsplus-tray` / `capsplus-qbar` / `capsplus-settings` / `capsplus-shot` / `capsplus-voice`
@@ -243,7 +246,7 @@ capsplus settings        # 管理器窗口（GTK3，四页）：状态 / 快速�
 ## 管理器窗口 `capsplus-settings`
 
 **应用菜单里唯一的入口**（托盘「设置…」、Qbar 的 `-> settings`、`capsplus settings` 都开它）。
-四页（`Gtk.Notebook`），第一页是「状态」——打开窗口的人十有八九是某个键没反应：
+五页（`Gtk.Notebook`），第一页是「状态」——打开窗口的人十有八九是某个键没反应：
 
 | 页 | 管的东西 | 写到哪个文件 |
 | --- | --- | --- |
@@ -251,6 +254,7 @@ capsplus settings        # 管理器窗口（GTK3，四页）：状态 / 快速�
 | **快速链接** | **只读**表格（前缀 / 名称 / 类型 / 目标 / 备注）+ 表格下方**表单条**（`前缀` `名称` `类型`下拉五选一 `目标`）；按钮 `保存这一条` `新增` `删除（带确认）` `上移` `下移` `重读文件` `保存快速链接`。选中/输入即更新**实时预览**（`输入 b 关键词 → 最终 URL`，`file`/`app` 显示展开 `~` 后的真实目标，`ask` 多一行灰字写清"回车做哪两件事"）；前缀完全重复 = 红字拦下、**拒绝写盘** | `~/.config/capsplus/qbar.toml` |
 | **通用** | `default_search`（下拉只列 search 类）、`browser`（留空=系统默认）、`hide_on_focus_out` 开关；每项右侧一行灰字解释 | 同上（两页写同一个文件，任一页点保存都会整体写回） |
 | **按键映射** | **只读**生效表（层/键/动作/说明/**来源=默认\|覆盖**，覆盖行加粗）+ 表格下方**编辑条**：`目标：capl / t`（加粗）+ 该行说明 + `动作：`下拉（`ComboBox.new_with_entry`，常用动作可点选也能自由输入）+ `改这一格` `恢复默认（删这条覆盖）`。单击行同步编辑条，**双击行焦点进输入框**，框内回车 = 点「改这一格」；当场用 `validate_action` + `load_known_keys` 校验（非法 = 红字不写盘），宏超 15 事件 = 黄字。「改这一格」立刻写覆盖层并刷表（来源变「覆盖」），但**不碰系统**；「应用」才装进 `/etc/keyd` | `~/.config/capsplus/mappings.toml`（覆盖层） |
+| **服务** | 翻译 / OCR / 语音识别 三个子标签，每个一栏：**用法**下拉（`auto` = 按顺序挨个试，或直接指定某个端点）+ 语言框（翻译=目标语言 / 识别=识别语言）+ **只读**端点表（名字/本机远程/类型/地址/模型/**凭据来源**/超时）；下面一条**共用**的端点编辑条（名字/本机远程/类型/地址/模型/凭据来源三个/明文 key/超时）+ `保存这一条` `新增端点` `删除端点（带确认）`；最下面 `保存服务配置` `重读文件` `测试连接`。**凭据只显示「已配置（来自 X）」，界面上任何地方都不出现明文 key**（输入框默认不显示、留空=保持原样、勾「清掉」=真的删） | `~/.config/capsplus/services.toml` |
 
 **两页表格为什么一律只读**（2026-10-15 用户实测截图定案，治本方案 A）：GTK3/Wayland 下 TreeView 的
 cell editor 是**独立 surface、不跟随表格滚动** —— 表格滚了、编辑框的像素坐标不动，于是编辑框视觉上
@@ -306,6 +310,74 @@ t = "up"
 
 `capsplus apply` 的输出语义：成功打印 `OK 已应用并 reload；备份: <路径>`；
 keyd 报错时**自动回滚**到被本次替换掉的那一版、再 reload，然后以非 0 退出并把 `ERROR:` 行打出来。
+
+### 服务配置 `~/.config/capsplus/services.toml`
+
+**翻译 / OCR / 语音识别 各自"用哪台机器上的哪个服务"都可以配了**（2026-10-21 加，
+需求原话：「关于 capsplus 工具，我希望关于翻译 OCR 语音识别 的服务都是可以配置的，
+方便配置远程的服务或者是本地的」）。
+
+改之前这三条链路的"服务在哪"是**写死在代码里**的：翻译连本机 `127.0.0.1:12087`，
+OCR 走 rapidocr 助手脚本或百度云端，识别连 `127.0.0.1:18090` —— 想换台机器，
+除了改代码没有别的办法。现在它们共用一个配置文件：
+
+```toml
+[translate]
+mode = "auto"          # auto = 按下面端点的书写顺序挨个试；也可直接写端点名
+target = "zh"          # 翻译目标语言
+
+[translate.local]      # 本机模型（OpenAI 兼容）
+kind = "local"         # local = 本机 / remote = 远程
+style = "openai"       # openai | script | http
+base_url = "http://127.0.0.1:12087/v1"
+model = "qwen3.8-27b"
+
+[translate.cloud]      # 远程服务；**凭据只写来源，不写值**
+kind = "remote"
+style = "openai"
+base_url = "https://token-plan.cn-beijing.maas.aliyuncs.com/compatible-mode/v1"
+model = "deepseek-v4.1-flash"
+credentials_file = "~/.dsh/.credentials.yaml"
+credentials_key = "AL_TOKEN_PLAN_API_KEY"
+
+[ocr]
+mode = "auto"
+[ocr.local]
+kind = "local"
+style = "script"       # 本机助手脚本（rapidocr）
+base_url = "shot_ocr_local.py"
+
+[asr]
+mode = "local"
+lang = "zh"            # 识别语言
+[asr.local]
+kind = "local"
+style = "http"         # 自家 HTTP 协议（/asr-upload + /health）
+base_url = "http://127.0.0.1:18090"
+```
+
+三条口径（与 `capsplus/services.py` 模块头一致，改之前先读）：
+
+- **凭据只存"来源"，不存值** —— `api_key_env`（环境变量名）、`credentials_file`+`credentials_key`、
+  `env_file`+`env_key`；实在要写明文才用 `api_key`（那个文件会被写成 **0600**）。
+  **任何输出都脱敏**：`capsplus services`、设置窗、状态页都只说"来自哪"，绝不打印值。
+- **优先级：环境变量 > 配置文件 > 内置默认** —— 环境变量是"现场救火"的临时覆盖，
+  配置文件是长期设置，内置默认与 2026-10-21 之前的行为**逐字一致**（老用法不受影响）。
+- **坏配置不许崩** —— TOML 语法错会变成"带错误说明的配置对象"，界面照常能开并把原因显示出来。
+
+两种改法：管理器窗口的**「服务」页**（第五页，图形界面），或者命令行：
+
+```bash
+capsplus services          # 脱敏摘要（一页看全三个能力）
+capsplus services test     # 真跑一次连通性测试：报耗时与一行结果摘要
+capsplus services test asr # 只测某一个能力
+capsplus services path     # 配置文件路径
+```
+
+「测试连接」**真跑一次往返**，不是看个开关：OpenAI 兼容的端点先打 `/models` 再打一次
+最小 chat（**两个都做** —— "端点活着"≠"能出字"，推理模型会把 token 花在 thinking 上、
+`content` 恒为空而 HTTP 仍是 200）；自家 HTTP 协议的端点打 `/health`；
+本机脚本型端点**真跑一次助手脚本**（所以本地 OCR 那条会真的加载一次引擎）。
 
 ### 交给 keyd 唤起 Qbar
 
@@ -384,7 +456,7 @@ keyd `command()`（**以 root 执行**）→ `bin/capsplus-voice` 降权（runus
 
 ### 录音期看得见（2026-10-20）
 
-明江原话「语音转文字几乎不可用，**只可以是短语音**，且识别率有点低」。查下来三件事都不是服务端问题，
+用户原话「语音转文字几乎不可用，**只可以是短语音**，且识别率有点低」。查下来三件事都不是服务端问题，
 全在客户端自己身上，而且**过程中屏幕上什么都没有**，所以他只能靠感觉描述。这一轮把它们都摆到台面上：
 
 | 症状 | 根因 | 改前 → 改后（同一段真人语音，`test_wavs/zh.wav`） |
@@ -500,9 +572,9 @@ voice-svc-user.service`，模型在 `~/.cache/sherpa-onnx/sherpa-onnx-sense-voic
 但没在真输入法下跑过；④ 打字中途按 `Caps+M`，键声会不会被误判成语音（完全未测）；
 ⑤ 跨线程碰 GTK 会**段错误 rc=139**（试过，已在代码里禁止，但真 Wayland 下的长期稳定性未测）；
 ⑥ **录音期牌子在真 Wayland 桌面上到底抢不抢焦点 —— 没测**（也不敢在自己干活的机器上测：一测就把
-窗口弹到明江脸上）。判据只能验到"牌子的 `accept_focus` 是假、建窗点在主线程、关窗会销毁"，
+窗口弹到用户脸上）。判据只能验到"牌子的 `accept_focus` 是假、建窗点在主线程、关窗会销毁"，
 以及"默认根本不建窗"；`CAPSPLUS_VOICE_BADGE=1` 是**自担风险**的开关，谁开谁自己看那一轮会不会掉焦点。
-⑦ 明江**说话时的真实电平没量到**（本节所有"语音 RMS≈3000"都是 sherpa 参考音频的数，不是他的）。
+⑦ 用户**说话时的真实电平没量到**（本节所有"语音 RMS≈3000"都是 sherpa 参考音频的数，不是他的）。
 这正是 `capsplus-voice meter` / `meter --live` 存在的理由：他对着麦克风跑一次，那个数是他的。
 
 ## 键位表（由 `capsplus/mapping_data.py` 生成，`tools/gen-readme.py` 重新生成）
@@ -573,7 +645,7 @@ voice-svc-user.service`，模型在 `~/.cache/sherpa-onnx/sherpa-onnx-sense-voic
 | `-> date` / `-> time` | 日期 / 时间（回车复制） |
 | `-> calc <表达式>` | 算术，同上 |
 | `-> link` | 打开快速链接配置文件（TOML） |
-| `-> settings` | **打开管理器窗口**（状态 / 快速链接 / 通用 / 按键映射四页）；窗口已开着就拉到前台 |
+| `-> settings` | **打开管理器窗口**（状态 / 快速链接 / 通用 / 按键映射 / 服务五页）；窗口已开着就拉到前台 |
 | `http(s)://…` / `xxx.com` | 浏览器打开（真网址优先，不会被单字母 trigger 抢走） |
 
 键盘：`Esc` 关闭、`↑/↓` 选择、`Enter` 打开。历史记在
@@ -823,7 +895,7 @@ keyd 的一条 `macro(...)` 里累计发出的按键事件**超过 15 个就不�
 | 用户键位覆盖层 | 上游是改源码；本仓是 `~/.config/capsplus/mappings.toml` 只存"改过的那几条"，没改的键跟着仓库走 |
 | Qbar | 上游 Qbar 是 AHK 实现的启动器；本仓用 GTK3 重写，并把搜索改成**可配置**（`qbar.toml` 五种链接类型） |
 | 托盘 | 上游没有；本仓新增（GTK3 + AyatanaAppIndicator3：启停映射 / 重载 / 唤起 Qbar / 看日志） |
-| 设置界面 | 上游没有；本仓新增 `capsplus-settings`（GTK3 四页：**状态** / 快速链接 / 通用 / 按键映射），同时是应用菜单里的唯一入口 |
+| 设置界面 | 上游没有；本仓新增 `capsplus-settings`（GTK3 五页：**状态** / 快速链接 / 通用 / 按键映射 / 服务），同时是应用菜单里的唯一入口 |
 | 明确没做的 | 独立剪贴板 B 组、WinBind 切窗口、热字符串、F2/F3/F4/F6/F12 —— 原因是 Wayland / keyd 层面做不到，见「与原版 Capslock+ 的差异」 |
 
 上游项目与本仓**没有从属关系**（不是 fork，也没有在 Linux 上跑它的任何 `.ahk` 文件）；
@@ -862,7 +934,7 @@ CI（`.github/workflows/tests.yml`）跑的是 `python3 -m unittest discover -s 
 "没有 gi 也必须能过收集阶段"由 `tests/test_no_gi_smoke.py` 守着（顶层裸写 `import gi` 会被它判红，
 判据自己有反例具型，不是摆设）。
 
-`tests/test_settings_window.py` 是**真起窗**的界面测试（会断言窗口真的 `mapped`、四页控件与
+`tests/test_settings_window.py` 是**真起窗**的界面测试（会断言窗口真的 `mapped`、五页控件与
 表格行数、"单击第 N 行 → 编辑条显示的就是第 N 行"、双击后焦点在编辑条的输入框、
 表格无可编辑 renderer、以及"编辑→校验→写盘→恢复默认→试渲染"整条链）：它把两个配置路径与
 state 目录都指到临时目录，所以不碰 `~/.config/capsplus/`；连不上显示服务器时整个模块自动 skip
